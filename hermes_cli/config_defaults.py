@@ -1691,6 +1691,32 @@ DEFAULT_CONFIG = {
     # a plugin in plugins/context_engine/<name>/ or ~/.hermes/plugins/.
     "context": {
         "engine": "compressor",
+        # Local, opt-in context telemetry.  The sink is a local file only;
+        # no network exporter is registered by this feature.
+        "telemetry": {
+            "enabled": False,
+            "path": "",
+            "min_write_interval_seconds": 1,
+            "smart_zone_tokens": 120000,
+            "smart_zone_context_pct": 45,
+            "compression_threshold": 0.85,
+        },
+        # Synchronous safety boundary evaluated before every provider call.
+        # Disabled by default; CMM-managed launches opt in and provide the
+        # wrapper-owned panel/request paths.
+        "fresh_session_before_compression": {
+            "enabled": False,
+            "threshold_tokens": 120000,
+            "threshold_context_pct": 45,
+            "panel_config_path": "",
+            "rollover_request_path": "",
+            "soft_rollover": False,
+            "soft_rollover_marker_path": "",
+            "soft_rollover_prefill_path": "",
+            "soft_rollover_state_path": "",
+            "soft_rollover_timeout_seconds": 15,
+            "emergency_compression_fallback": True,
+        },
         # Return freed glibc allocator pages after long-running agent/TUI
         # cleanup boundaries. Unsupported platforms are safe no-ops.
         "memory_trim": {
