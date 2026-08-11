@@ -72,6 +72,41 @@ from agent.redact import redact_sensitive_text
 # DEFAULT_DB_PATH = get_hermes_home() / "state.db" breaks tests that
 # monkeypatch get_hermes_home to return a str).
 _STALE_MARKER_RE = re.compile(r"^\[[A-Za-z_][A-Za-z0-9_.-]*\]$")
+_CMM_MID_TURN_PREFIX = (
+    "CMM private mid-turn continuation. This is the same active user task, "
+    "not a new task."
+)
+_CMM_ACTIVE_REQUEST_HEADING = "Authoritative active user request:\n"
+_CMM_COMPLETED_CALLS_HEADING = (
+    "Completed tool calls in this turn before the rollover; their results "
+    "were already returned, so do not repeat them:\n"
+)
+_CMM_CONTINUE_HEADING = "Continue only the unfinished remainder of the active user request."
+
+
+def _unwrap_fresh_context_continuation(value: str) -> tuple[str, list[str]]:
+    """Recover the original request and prior tool ledger from our envelope."""
+    if not value.startswith(_CMM_MID_TURN_PREFIX):
+        return value, []
+    try:
+        request_and_rest = value.split(_CMM_ACTIVE_REQUEST_HEADING, 1)[1]
+        request_text, completed_and_rest = request_and_rest.split(
+            "\n\n" + _CMM_COMPLETED_CALLS_HEADING,
+            1,
+        )
+        completed_text = completed_and_rest.split(
+            "\n\n" + _CMM_CONTINUE_HEADING,
+            1,
+        )[0]
+    except (IndexError, ValueError):
+        return value, []
+    prior_calls = [
+        line
+        for line in completed_text.splitlines()
+        if line.startswith("- ")
+        and "No completed tool call was recorded" not in line
+    ]
+    return request_text, prior_calls
 
 
 def _fresh_context_mid_turn_continuation(
@@ -87,8 +122,11 @@ def _fresh_context_mid_turn_continuation(
     turn when older Todo/session-title state exists.
     """
 
+    prior_completed_calls: list[str] = []
     if isinstance(user_message, str):
-        request_text = user_message
+        request_text, prior_completed_calls = _unwrap_fresh_context_continuation(
+            user_message
+        )
     elif isinstance(user_message, list):
         text_parts: list[str] = []
         for part in user_message:
@@ -109,7 +147,7 @@ def _fresh_context_mid_turn_continuation(
         for message in turn_messages
         if isinstance(message, dict) and message.get("role") == "tool"
     }
-    completed_calls: list[str] = []
+    completed_calls: list[str] = list(prior_completed_calls)
     for message in turn_messages:
         if not isinstance(message, dict) or message.get("role") != "assistant":
             continue
@@ -141,7 +179,12 @@ def _fresh_context_mid_turn_continuation(
             argument_text = redact_sensitive_text(argument_text, force=True)
             if len(argument_text) > 2000:
                 argument_text = argument_text[:1997] + "..."
-            completed_calls.append(f"- {name}({argument_text})")
+            completed_entry = f"- {name}({argument_text})"
+            if (
+                completed_entry not in completed_calls
+                and len(completed_calls) < 32
+            ):
+                completed_calls.append(completed_entry)
             if len(completed_calls) >= 32:
                 break
         if len(completed_calls) >= 32:
@@ -153,14 +196,12 @@ def _fresh_context_mid_turn_continuation(
         else "- No completed tool call was recorded before the rollover."
     )
     return (
-        "CMM private mid-turn continuation. This is the same active user task, "
-        "not a new task.\n\n"
-        "Authoritative active user request:\n"
+        f"{_CMM_MID_TURN_PREFIX}\n\n"
+        f"{_CMM_ACTIVE_REQUEST_HEADING}"
         f"{request_text}\n\n"
-        "Completed tool calls in this turn before the rollover; their results "
-        "were already returned, so do not repeat them:\n"
+        f"{_CMM_COMPLETED_CALLS_HEADING}"
         f"{completed_section}\n\n"
-        "Continue only the unfinished remainder of the active user request. "
+        f"{_CMM_CONTINUE_HEADING} "
         "Do not inspect or adopt unrelated Todo, repository, report, or task "
         "state from older handoff material. Do not repeat completed tool calls "
         "or side effects. If the request is already complete, answer it directly."
@@ -2384,7 +2425,9 @@ def run_conversation(
                     if _mid_turn:
                         result["rollover_continuation_message"] = (
                             _fresh_context_mid_turn_continuation(
-                                original_user_message,
+                                original_user_message
+                                if original_user_message not in (None, "", [])
+                                else user_message,
                                 messages,
                                 current_turn_user_idx,
                             )
