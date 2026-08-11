@@ -44,6 +44,7 @@ from agent.fresh_context_gate import (
     fresh_context_rollover_requested_message,
     request_fresh_context_rollover,
     resolve_fresh_context_gate_policy,
+    select_fresh_context_gate_pressure,
 )
 from agent.turn_context import (
     _compression_warrants_another_preflight_pass,
@@ -2209,11 +2210,22 @@ def run_conversation(
             _fresh_context_length = int(
                 getattr(agent.context_compressor, "context_length", 0) or 0
             )
+            _fresh_tokens, _fresh_token_source = select_fresh_context_gate_pressure(
+                request_pressure_tokens,
+                int(
+                    getattr(
+                        agent.context_compressor,
+                        "last_real_prompt_tokens",
+                        0,
+                    )
+                    or 0
+                ),
+            )
             _fresh_decision = evaluate_fresh_context_gate(
                 _fresh_policy,
-                prompt_tokens=request_pressure_tokens,
+                prompt_tokens=_fresh_tokens,
                 context_length=_fresh_context_length,
-                token_source="estimated",
+                token_source=_fresh_token_source,
             )
             if _fresh_decision.should_block:
                 _fresh_request = request_fresh_context_rollover(
@@ -2223,6 +2235,7 @@ def run_conversation(
                     turn_id=turn_id,
                     gate_position="pre_provider_call",
                     api_call_index=api_call_count,
+                    prompt_tokens_estimate=request_pressure_tokens,
                 )
                 api_call_count -= 1
                 agent._api_call_count = api_call_count

@@ -213,12 +213,14 @@ def request_fresh_context_rollover(
     turn_id: str,
     gate_position: str = "turn_start",
     api_call_index: Optional[int] = None,
+    prompt_tokens_estimate: Optional[int] = None,
 ) -> FreshContextRolloverRequest:
     """Atomically create a content-free request for an external rollover owner.
 
     This file is a request, never transition authorization.  In particular,
-    the estimated prompt count is labelled as an estimate and must not be
-    consumed as provider-confirmed telemetry by an external transition guard.
+    estimated and provider-reported prompt counts remain separately labelled.
+    An external transition guard must still bind either value to authoritative
+    same-session runtime telemetry before authorizing a transition.
     The configured parent directory must already exist; Hermes neither creates
     wrapper-owned directories nor overwrites an existing request.
     """
@@ -236,6 +238,17 @@ def request_fresh_context_rollover(
     if not request_path.parent.is_dir():
         return FreshContextRolloverRequest(False, "request_parent_missing")
 
+    estimate = (
+        decision.prompt_tokens
+        if prompt_tokens_estimate is None
+        else max(0, int(prompt_tokens_estimate or 0))
+    )
+    estimate_context_pct = (
+        estimate / decision.context_length * 100.0
+        if decision.context_length
+        else 0.0
+    )
+    token_source = "actual" if decision.token_source == "actual" else "estimated"
     payload = {
         "schema_version": ROLLOVER_REQUEST_SCHEMA,
         "status": "requested",
@@ -244,15 +257,18 @@ def request_fresh_context_rollover(
         "turn_id": str(turn_id or ""),
         "gate_position": str(gate_position or "turn_start"),
         "gate_reason": decision.reason,
-        "prompt_tokens_estimate": decision.prompt_tokens,
-        "token_source": "estimated",
+        "prompt_tokens_estimate": estimate,
+        "token_source": token_source,
         "context_length": decision.context_length,
-        "context_percent_estimate": decision.context_pct,
+        "context_percent_estimate": estimate_context_pct,
         "threshold_tokens": decision.threshold_tokens,
         "threshold_context_percent": decision.threshold_context_pct,
         "native_compression_requested": False,
         "external_authorization_required": True,
     }
+    if token_source == "actual":
+        payload["prompt_tokens_actual"] = decision.prompt_tokens
+        payload["context_percent_actual"] = decision.context_pct
     if api_call_index is not None:
         payload["api_call_index"] = int(api_call_index)
     encoded = (json.dumps(payload, sort_keys=True) + "\n").encode("utf-8")
@@ -290,6 +306,24 @@ def request_fresh_context_rollover(
             str(request_path),
         )
     return FreshContextRolloverRequest(True, "rollover_requested", str(request_path))
+
+
+def select_fresh_context_gate_pressure(
+    estimated_prompt_tokens: int,
+    actual_prompt_tokens: int,
+) -> tuple[int, str]:
+    """Choose the strongest trustworthy same-session pressure signal.
+
+    Rough estimation remains the fallback because no provider sample exists
+    before the first request.  Once Hermes has a positive provider-reported
+    prompt count, it wins only when it is higher; this prevents an
+    under-estimate from silently bypassing the configured boundary.
+    """
+    estimated = max(0, int(estimated_prompt_tokens or 0))
+    actual = max(0, int(actual_prompt_tokens or 0))
+    if actual > estimated:
+        return actual, "actual"
+    return estimated, "estimated"
 
 
 def evaluate_fresh_context_gate(
@@ -384,4 +418,5 @@ __all__ = [
     "fresh_context_rollover_requested_message",
     "request_fresh_context_rollover",
     "resolve_fresh_context_gate_policy",
+    "select_fresh_context_gate_pressure",
 ]
