@@ -8935,6 +8935,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self,
         continuation_message: Any,
         continuation_images: Optional[list] = None,
+        *,
+        preserve_continuation_message: bool = False,
     ) -> tuple[bool, str]:
         """Rotate the live CLI session after a validated external CMM handoff."""
         if not self.agent or not hasattr(self, "_pending_input"):
@@ -8981,7 +8983,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         stop_stalled_chain = (
             progress_changed is False and progress_repeat_count >= 2
         )
-        if stop_stalled_chain:
+        if stop_stalled_chain and not preserve_continuation_message:
             continuation_message = (
                 "CMM opened this fresh context automatically, but the semantic "
                 "task state repeated across two context transitions. Do not use "
@@ -8990,7 +8992,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 "recorded, name the current next action from the validated handoff, "
                 "and then stop at the prompt."
             )
-        elif progress_changed is False:
+        elif progress_changed is False and not preserve_continuation_message:
             continuation_message = (
                 "Continue the current task from the validated CMM handoff, but the "
                 "semantic task state did not advance in the previous context. Do not "
@@ -9071,7 +9073,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         return (
             True,
             "soft_rollover_stall_finalization_queued"
-            if stop_stalled_chain
+            if stop_stalled_chain and not preserve_continuation_message
             else "soft_rollover_completed",
         )
 
@@ -9079,6 +9081,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self,
         continuation_message: Any,
         continuation_images: Optional[list] = None,
+        *,
+        preserve_continuation_message: bool = False,
     ) -> tuple[bool, str]:
         """Consume a handoff bundle that became ready after the prior turn."""
         if not self.agent or not hasattr(self, "_pending_input"):
@@ -9100,6 +9104,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         return self._complete_soft_fresh_context_rollover(
             continuation_message,
             continuation_images=continuation_images,
+            preserve_continuation_message=preserve_continuation_message,
         )
 
 
@@ -14592,6 +14597,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._consume_prepared_soft_fresh_context_rollover(
                 message,
                 continuation_images=images,
+                preserve_continuation_message=not is_fresh_context_internal,
             )
         )
         if rollover_ok:
@@ -15120,6 +15126,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     continuation_message,
                     continuation_images=(
                         images if not result.get("rollover_mid_turn") else None
+                    ),
+                    preserve_continuation_message=(
+                        not is_fresh_context_internal
+                        and not result.get("rollover_mid_turn")
                     ),
                 )
                 if soft_ok:

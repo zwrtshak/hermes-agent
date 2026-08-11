@@ -204,6 +204,37 @@ def test_ready_bundle_left_after_previous_turn_is_consumed_before_next_provider_
     assert not prefill.exists()
 
 
+def test_ready_stalled_bundle_preserves_new_user_task_in_fresh_context(tmp_path):
+    policy, _handoff, _marker, _prefill, _state, _messages = _bundle(
+        tmp_path,
+        progress_changed=False,
+        progress_repeat_count=2,
+    )
+    cli_obj = HermesCLI.__new__(HermesCLI)
+    cli_obj.session_id = "session-old"
+    cli_obj.agent = SimpleNamespace(_fresh_context_gate_config={}, prefill_messages=[])
+    cli_obj._pending_input = queue.Queue()
+    cli_obj._session_db = None
+
+    def rotate(**_kwargs):
+        cli_obj.session_id = "session-new"
+
+    cli_obj.new_session = rotate
+    new_user_task = "Review PR 97, validate it, and report any improvements."
+    with patch(
+        "agent.fresh_context_gate.resolve_fresh_context_gate_policy",
+        return_value=policy,
+    ):
+        ok, reason = cli_obj._consume_prepared_soft_fresh_context_rollover(
+            new_user_task,
+            preserve_continuation_message=True,
+        )
+
+    assert (ok, reason) == (True, "soft_rollover_completed")
+    queued = cli_obj._pending_input.get_nowait()
+    assert queued.message == new_user_task
+
+
 def test_task_scope_keeps_identity_across_internal_continuations_and_resets_for_user_task():
     cli_obj = HermesCLI.__new__(HermesCLI)
     cli_obj.agent = SimpleNamespace()
