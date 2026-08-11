@@ -651,6 +651,112 @@ def test_mid_turn_continuation_keeps_only_completed_calls_and_redacts_arguments(
     assert "secret-value-1234567890" not in continuation
 
 
+def test_mid_turn_continuation_preserves_task_and_cumulative_progress_across_rollovers():
+    first_messages = [
+        {"role": "user", "content": "read the five requested chunks"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "first-done",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": '{"path":"/tmp/input.py","offset":1,"limit":2000}',
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "first-done", "content": "large result"},
+    ]
+    first = _fresh_context_mid_turn_continuation(
+        "read the five requested chunks",
+        first_messages,
+        0,
+    )
+    second_messages = [
+        {"role": "user", "content": ""},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "second-done",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": '{"path":"/tmp/input.py","offset":2001,"limit":2000}',
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "second-done", "content": "large result"},
+    ]
+
+    second = _fresh_context_mid_turn_continuation(first, second_messages, 0)
+
+    assert second.count("Authoritative active user request:") == 1
+    assert "read the five requested chunks" in second
+    assert '"offset":1' in second
+    assert '"offset":2001' in second
+
+
+def test_second_mid_turn_rollover_uses_api_continuation_when_persisted_content_is_empty(
+    agent, tmp_path
+):
+    request_path = tmp_path / "rollover.json"
+    agent._fresh_context_gate_config = {
+        "enabled": True,
+        "threshold_tokens": 120_000,
+        "threshold_context_pct": 45,
+        "rollover_request_path": str(request_path),
+    }
+    agent.context_compressor.should_compress = MagicMock(return_value=False)
+    agent.client.chat.completions.create.return_value = _tool_response()
+
+    def execute_tool(_assistant_message, messages, *_args):
+        messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": "call-1",
+                "name": "web_search",
+                "content": "completed result",
+            }
+        )
+
+    prior = _fresh_context_mid_turn_continuation(
+        "finish the original task",
+        [{"role": "user", "content": "finish the original task"}],
+        0,
+    )
+    with (
+        patch("agent.turn_context.estimate_request_tokens_rough", return_value=100_000),
+        patch(
+            "agent.conversation_loop.estimate_messages_tokens_rough",
+            side_effect=lambda messages: (
+                131_000
+                if any(message.get("role") == "tool" for message in messages)
+                else 100_000
+            ),
+        ),
+        patch("agent.conversation_loop._estimate_tools_tokens_rough", return_value=0),
+        patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+        patch("hermes_cli.plugins.has_hook", return_value=False),
+        patch.object(agent, "_execute_tool_calls", side_effect=execute_tool),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_flush_messages_to_session_db"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation(prior, persist_user_message="")
+
+    continuation = result["rollover_continuation_message"]
+    assert continuation.count("Authoritative active user request:") == 1
+    assert "finish the original task" in continuation
+    assert "web_search({})" in continuation
+
+
 def test_legacy_auto_continuation_flag_cannot_block_next_context_request(
     agent, tmp_path
 ):
