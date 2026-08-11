@@ -8,15 +8,69 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Mapping
 
 from hermes_constants import get_hermes_home
 
 _SCHEMA_VERSION = 1
 _LAST_WRITE: dict[str, tuple[float, str]] = {}
+_HEARTBEATS: dict[str, "_ContextTelemetryHeartbeat"] = {}
+_HEARTBEATS_LOCK = threading.Lock()
+_DEFAULT_IDLE_HEARTBEAT_SECONDS = 60.0
+
+
+class _ContextTelemetryHeartbeat:
+    """Refresh target-scoped telemetry while the owning Hermes process idles."""
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self.agent: Any = None
+        self.config: Mapping[str, Any] | None = None
+        self.interval = _DEFAULT_IDLE_HEARTBEAT_SECONDS
+        self.min_write_interval = 0.0
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def update(
+        self,
+        *,
+        agent: Any,
+        config: Mapping[str, Any] | None,
+        interval: float,
+        min_write_interval: float,
+    ) -> None:
+        with self._lock:
+            self.agent = agent
+            self.config = config
+            self.interval = max(1.0, float(interval))
+            self.min_write_interval = max(0.0, float(min_write_interval))
+            if self._thread is None:
+                self._thread = threading.Thread(
+                    target=self._run,
+                    name="context-telemetry-heartbeat",
+                    daemon=True,
+                )
+                self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval):
+            with self._lock:
+                agent = self.agent
+                config = self.config
+                min_write_interval = self.min_write_interval
+            if agent is None:
+                continue
+            _write_idle_context_telemetry(
+                agent,
+                config=config,
+                min_write_interval_seconds=min_write_interval,
+            )
 
 
 def _truthy(value: Any) -> bool:
@@ -57,6 +111,44 @@ def _profile_name() -> str:
     return os.environ.get("HERMES_PROFILE") or "default"
 
 
+def _clean_env_text(name: str) -> str:
+    return str(os.environ.get(name) or "").strip()
+
+
+def _target_identity_from_env() -> dict[str, str] | None:
+    """Return target-scoped CMM terminal identity from wrapper env, if present."""
+    if not _clean_env_text("HERMES_CONTEXT_TELEMETRY_PATH"):
+        return None
+
+    tmux_session = _clean_env_text("TMUX_SESSION")
+    cmux_workspace_id = _clean_env_text("CMUX_WORKSPACE_ID")
+    cmux_surface_id = _clean_env_text("CMUX_SURFACE_ID")
+    backend = _clean_env_text("CONTEXT_TARGET_BACKEND")
+    if backend in {"", "auto"}:
+        if cmux_surface_id or cmux_workspace_id:
+            backend = "cmux"
+        elif tmux_session:
+            backend = "tmux"
+        else:
+            backend = ""
+
+    identity = {
+        "backend": backend,
+        "tmux_session": tmux_session,
+        "cmux_workspace_id": cmux_workspace_id,
+        "cmux_surface_id": cmux_surface_id,
+        "terminal_title": _clean_env_text("CMM_TERMINAL_TITLE"),
+        "terminal_tty": _clean_env_text("CMM_TERMINAL_TTY"),
+    }
+    identity = {key: value for key, value in identity.items() if value}
+    if not any(
+        identity.get(key)
+        for key in ("backend", "tmux_session", "cmux_workspace_id", "cmux_surface_id")
+    ):
+        return None
+    return identity
+
+
 def _telemetry_config(config: Mapping[str, Any] | None = None) -> dict[str, Any]:
     if config is None:
         try:
@@ -69,7 +161,11 @@ def _telemetry_config(config: Mapping[str, Any] | None = None) -> dict[str, Any]
     telemetry = context_cfg.get("telemetry", {}) if isinstance(context_cfg, Mapping) else {}
     if not isinstance(telemetry, Mapping):
         return {}
-    return dict(telemetry)
+    cfg = dict(telemetry)
+    runtime_path = os.environ.get("HERMES_CONTEXT_TELEMETRY_PATH", "").strip()
+    if runtime_path:
+        cfg["path"] = runtime_path
+    return cfg
 
 
 def telemetry_enabled(config: Mapping[str, Any] | None = None) -> bool:
@@ -149,7 +245,7 @@ def build_context_telemetry_payload(
         "smart_zone_context_pct": _number(cfg.get("smart_zone_context_pct"), 45),
         "compression_threshold": _float(cfg.get("compression_threshold"), _float((config or {}).get("compression", {}).get("threshold") if isinstance((config or {}).get("compression"), Mapping) else None, 0.85)),
     }
-    return {
+    payload = {
         "schema_version": _SCHEMA_VERSION,
         "source": "hermes_runtime",
         "source_kind": "native_context_telemetry",
@@ -168,6 +264,10 @@ def build_context_telemetry_payload(
         "session_usage": session_usage,
         "thresholds": thresholds,
     }
+    target_identity = _target_identity_from_env()
+    if target_identity:
+        payload["target_identity"] = target_identity
+    return payload
 
 
 def write_context_telemetry(
@@ -196,6 +296,77 @@ def write_context_telemetry(
     return True
 
 
+def _heartbeat_interval_seconds(cfg: Mapping[str, Any]) -> float:
+    explicit = _float(
+        os.environ.get("HERMES_CONTEXT_TELEMETRY_IDLE_HEARTBEAT_SECONDS")
+        or cfg.get("idle_heartbeat_seconds")
+        or cfg.get("heartbeat_interval_seconds"),
+        0.0,
+    )
+    if explicit > 0:
+        return explicit
+    max_age = _float(os.environ.get("CONTEXT_TELEMETRY_MAX_AGE_SECONDS"), 0.0)
+    if max_age > 0:
+        return max(1.0, min(_DEFAULT_IDLE_HEARTBEAT_SECONDS, max_age / 2.0))
+    return _DEFAULT_IDLE_HEARTBEAT_SECONDS
+
+
+def _write_idle_context_telemetry(
+    agent: Any,
+    *,
+    config: Mapping[str, Any] | None = None,
+    min_write_interval_seconds: float = 0.0,
+) -> bool:
+    """Rewrite the current payload timestamp from this live Hermes process."""
+    cfg = _telemetry_config(config)
+    path = str(cfg.get("path") or "").strip()
+    if not (_truthy(cfg.get("enabled")) and path):
+        return False
+    try:
+        payload = build_context_telemetry_payload(agent, config=config)
+        return write_context_telemetry(
+            payload,
+            path,
+            min_write_interval_seconds=min_write_interval_seconds,
+            force=True,
+        )
+    except Exception:
+        return False
+
+
+def _ensure_idle_context_telemetry_heartbeat(
+    agent: Any,
+    *,
+    config: Mapping[str, Any] | None,
+    cfg: Mapping[str, Any],
+) -> None:
+    path = str(cfg.get("path") or "").strip()
+    if not path or not _truthy(cfg.get("enabled")):
+        return
+    if _truthy(
+        cfg.get("idle_heartbeat_enabled")
+        if "idle_heartbeat_enabled" in cfg
+        else True
+    ) is False:
+        return
+    interval = _heartbeat_interval_seconds(cfg)
+    min_write_interval = min(
+        interval,
+        _float(cfg.get("min_write_interval_seconds"), 1.0),
+    )
+    with _HEARTBEATS_LOCK:
+        heartbeat = _HEARTBEATS.get(path)
+        if heartbeat is None:
+            heartbeat = _ContextTelemetryHeartbeat(path)
+            _HEARTBEATS[path] = heartbeat
+        heartbeat.update(
+            agent=agent,
+            config=config,
+            interval=interval,
+            min_write_interval=min_write_interval,
+        )
+
+
 def emit_context_telemetry(
     agent: Any,
     *,
@@ -218,3 +389,32 @@ def emit_context_telemetry(
         )
     except Exception:
         return False
+    finally:
+        try:
+            _ensure_idle_context_telemetry_heartbeat(agent, config=config, cfg=cfg)
+        except Exception:
+            pass
+
+
+def emit_startup_context_telemetry(
+    *,
+    session_id: str,
+    model: str = "",
+    provider: str = "",
+    config: Mapping[str, Any] | None = None,
+) -> bool:
+    """Publish native pending telemetry before the lazy agent is initialized."""
+    startup_agent = SimpleNamespace(
+        session_id=str(session_id or ""),
+        model=str(model or ""),
+        provider=str(provider or ""),
+        session_input_tokens=0,
+        session_output_tokens=0,
+        session_reasoning_tokens=0,
+        session_prompt_tokens=0,
+        session_completion_tokens=0,
+        session_total_tokens=0,
+        session_api_calls=0,
+        context_compressor=None,
+    )
+    return emit_context_telemetry(startup_agent, config=config, force=True)

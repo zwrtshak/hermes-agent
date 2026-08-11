@@ -38,6 +38,13 @@ from agent.conversation_compression import (
 from agent.context_engine import automatic_compaction_status_message
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
+from agent.fresh_context_gate import (
+    evaluate_fresh_context_gate,
+    fresh_context_rollover_failed_message,
+    fresh_context_rollover_requested_message,
+    request_fresh_context_rollover,
+    resolve_fresh_context_gate_policy,
+)
 from agent.turn_context import (
     _compression_warrants_another_preflight_pass,
     build_turn_context,
@@ -1555,6 +1562,24 @@ def run_conversation(
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
 
+    # The synchronous core gate owns this terminal decision.  Returning here
+    # makes the boundary authoritative: no transport, hook, request builder or
+    # provider client can run after the gate fires.
+    if _ctx.fresh_context_gate_terminal_message:
+        result = {
+            "final_response": _ctx.fresh_context_gate_terminal_message,
+            "messages": messages,
+            "api_calls": 0,
+            "completed": False,
+            "failed": _ctx.fresh_context_gate_terminal_failed,
+            "turn_exit_reason": _ctx.fresh_context_gate_terminal_reason,
+        }
+        if _ctx.fresh_context_gate_terminal_failed:
+            result["error"] = _ctx.fresh_context_gate_terminal_reason
+        else:
+            result["rollover_requested"] = True
+        return result
+
     # Commentary deduplication spans all provider continuations and tool calls
     # within one user turn, but must not suppress the same phrase next turn.
     agent._delivered_interim_texts = set()
@@ -2167,6 +2192,97 @@ def run_conversation(
         )
         if callable(_note_rough):
             _note_rough(request_pressure_tokens)
+
+        # Hard Fresh Context boundary before EVERY provider dispatch.  The
+        # turn prologue cannot see tool output appended later in the same task;
+        # without this sibling check, a long tool loop can cross 120K and enter
+        # native compression before the next user prompt.
+        _fresh_skip_provider_once = bool(
+            getattr(agent, "_fresh_context_gate_skip_provider_once", False)
+        )
+        if _fresh_skip_provider_once:
+            agent._fresh_context_gate_skip_provider_once = False
+        _fresh_policy = resolve_fresh_context_gate_policy(
+            getattr(agent, "_fresh_context_gate_config", None)
+        )
+        if _fresh_policy.enabled and not _fresh_skip_provider_once:
+            _fresh_context_length = int(
+                getattr(agent.context_compressor, "context_length", 0) or 0
+            )
+            _fresh_decision = evaluate_fresh_context_gate(
+                _fresh_policy,
+                prompt_tokens=request_pressure_tokens,
+                context_length=_fresh_context_length,
+                token_source="estimated",
+            )
+            if _fresh_decision.should_block:
+                _fresh_request = request_fresh_context_rollover(
+                    _fresh_policy,
+                    _fresh_decision,
+                    session_id=agent.session_id or "",
+                    turn_id=turn_id,
+                    gate_position="pre_provider_call",
+                    api_call_index=api_call_count,
+                )
+                api_call_count -= 1
+                agent._api_call_count = api_call_count
+                try:
+                    agent.iteration_budget.refund()
+                except Exception:
+                    pass
+                try:
+                    agent._persist_session(messages, conversation_history)
+                except Exception:
+                    logger.warning(
+                        "Mid-turn Fresh Context persistence failed for session=%s",
+                        agent.session_id or "none",
+                        exc_info=True,
+                    )
+                if _fresh_request.requested:
+                    _terminal_message = fresh_context_rollover_requested_message(
+                        _fresh_decision
+                    )
+                    _terminal_reason = "fresh_context_rollover_requested_mid_turn"
+                    _failed = False
+                else:
+                    _terminal_message = fresh_context_rollover_failed_message(
+                        _fresh_decision,
+                        _fresh_request,
+                    )
+                    _terminal_reason = "fresh_context_gate_blocked_mid_turn"
+                    _failed = True
+                    agent._emit_status(f"⛔ {_terminal_message}")
+                logger.log(
+                    logging.ERROR if _failed else logging.INFO,
+                    "Fresh Context pre-provider gate result=%s request_result=%s "
+                    "session=%s next_api_call=%s at ~%s tokens; no provider request",
+                    _terminal_reason,
+                    _fresh_request.reason,
+                    agent.session_id or "none",
+                    api_call_count + 1,
+                    f"{_fresh_decision.prompt_tokens:,}",
+                )
+                _mid_turn = api_call_count > 0
+                result = {
+                    "final_response": _terminal_message,
+                    "messages": messages,
+                    "api_calls": api_call_count,
+                    "completed": False,
+                    "failed": _failed,
+                    "turn_exit_reason": _terminal_reason,
+                    "rollover_mid_turn": _mid_turn,
+                }
+                if _fresh_request.requested:
+                    result["rollover_requested"] = True
+                    if _mid_turn:
+                        result["rollover_continuation_message"] = (
+                            "Continue the current task from the validated CMM handoff. "
+                            "Do not repeat completed tool calls or side effects. Inspect "
+                            "the current Todo and task state, then continue only unfinished work."
+                        )
+                else:
+                    result["error"] = _fresh_request.reason
+                return result
 
         _runtime_context_error = _ollama_context_limit_error(
             agent, request_pressure_tokens
