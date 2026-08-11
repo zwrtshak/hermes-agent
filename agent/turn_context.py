@@ -45,6 +45,7 @@ from agent.fresh_context_gate import (
     fresh_context_rollover_requested_message,
     request_fresh_context_rollover,
     resolve_fresh_context_gate_policy,
+    select_fresh_context_gate_pressure,
 )
 from agent.iteration_budget import IterationBudget
 from agent.memory_manager import build_memory_context_block
@@ -779,12 +780,16 @@ def build_turn_context(
         # can establish the first authoritative provider telemetry sample.
         agent._fresh_context_gate_skip_provider_once = True
     if _fresh_policy.enabled and not _fresh_skip_once:
-        _fresh_tokens = estimate_request_tokens_rough(
+        _fresh_tokens_estimate = estimate_request_tokens_rough(
             messages,
             system_prompt=active_system_prompt or "",
             tools=agent.tools or None,
         )
         _fresh_compressor = getattr(agent, "context_compressor", None)
+        _fresh_tokens, _fresh_token_source = select_fresh_context_gate_pressure(
+            _fresh_tokens_estimate,
+            int(getattr(_fresh_compressor, "last_real_prompt_tokens", 0) or 0),
+        )
         _fresh_context_length = int(
             getattr(_fresh_compressor, "context_length", 0) or 0
         )
@@ -792,7 +797,7 @@ def build_turn_context(
             _fresh_policy,
             prompt_tokens=_fresh_tokens,
             context_length=_fresh_context_length,
-            token_source="estimated",
+            token_source=_fresh_token_source,
         )
         if _fresh_decision.should_block:
             _fresh_request = request_fresh_context_rollover(
@@ -800,6 +805,7 @@ def build_turn_context(
                 _fresh_decision,
                 session_id=agent.session_id or "",
                 turn_id=turn_id,
+                prompt_tokens_estimate=_fresh_tokens_estimate,
             )
             if _fresh_request.requested:
                 _terminal_reason = "fresh_context_rollover_requested"

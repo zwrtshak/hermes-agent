@@ -16,6 +16,7 @@ from agent.fresh_context_gate import (
     evaluate_fresh_context_gate,
     request_fresh_context_rollover,
     resolve_fresh_context_gate_policy,
+    select_fresh_context_gate_pressure,
 )
 from run_agent import AIAgent
 
@@ -284,6 +285,53 @@ def test_context_percentage_boundary_uses_inclusive_or_semantics():
     assert decision.reason == "context_pct_threshold"
 
 
+@pytest.mark.parametrize(
+    ("estimated", "actual", "expected_tokens", "expected_source"),
+    [
+        (118_038, 152_159, 152_159, "actual"),
+        (131_000, 120_000, 131_000, "estimated"),
+        (118_038, 0, 118_038, "estimated"),
+        (118_038, -1, 118_038, "estimated"),
+    ],
+)
+def test_gate_pressure_prefers_only_a_higher_positive_provider_actual(
+    estimated, actual, expected_tokens, expected_source
+):
+    assert select_fresh_context_gate_pressure(estimated, actual) == (
+        expected_tokens,
+        expected_source,
+    )
+
+
+def test_actual_pressure_request_keeps_estimate_and_labels_actual_separately(tmp_path):
+    request_path = tmp_path / "rollover.json"
+    policy = resolve_fresh_context_gate_policy(
+        {"enabled": True, "rollover_request_path": str(request_path)}
+    )
+    decision = evaluate_fresh_context_gate(
+        policy,
+        prompt_tokens=152_159,
+        context_length=272_000,
+        token_source="actual",
+    )
+
+    result = request_fresh_context_rollover(
+        policy,
+        decision,
+        session_id="session-actual",
+        turn_id="turn-actual",
+        prompt_tokens_estimate=118_038,
+    )
+
+    assert result.requested is True
+    payload = json.loads(request_path.read_text(encoding="utf-8"))
+    assert payload["token_source"] == "actual"
+    assert payload["prompt_tokens_estimate"] == 118_038
+    assert payload["prompt_tokens_actual"] == 152_159
+    assert payload["context_percent_estimate"] == pytest.approx(43.3963, rel=1e-4)
+    assert payload["context_percent_actual"] == pytest.approx(55.9408, rel=1e-4)
+
+
 def test_request_file_is_atomic_machine_readable_and_not_actual_telemetry(tmp_path):
     request_path = tmp_path / "rollover.json"
     policy = resolve_fresh_context_gate_policy(
@@ -424,6 +472,37 @@ def test_below_threshold_does_not_request_block_or_compress(agent, tmp_path):
     assert request_path.exists() is False
     agent._compress_context.assert_not_called()
     agent.client.chat.completions.create.assert_called_once()
+
+
+def test_turn_start_uses_higher_provider_actual_when_rough_estimate_is_below_gate(
+    agent, tmp_path
+):
+    request_path = tmp_path / "rollover.json"
+    agent._fresh_context_gate_config = {
+        "enabled": True,
+        "threshold_tokens": 120_000,
+        "threshold_context_pct": 45,
+        "rollover_request_path": str(request_path),
+    }
+    agent.context_compressor.last_real_prompt_tokens = 152_159
+
+    with (
+        patch("agent.turn_context.estimate_request_tokens_rough", return_value=118_038),
+        patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+        patch("hermes_cli.plugins.has_hook", return_value=False),
+        patch.object(agent, "_persist_session"),
+    ):
+        result = agent.run_conversation("continue")
+
+    assert result["failed"] is False
+    assert result["rollover_requested"] is True
+    assert result["turn_exit_reason"] == "fresh_context_rollover_requested"
+    assert result["api_calls"] == 0
+    payload = json.loads(request_path.read_text(encoding="utf-8"))
+    assert payload["token_source"] == "actual"
+    assert payload["prompt_tokens_actual"] == 152_159
+    assert payload["prompt_tokens_estimate"] == 118_038
+    agent.client.chat.completions.create.assert_not_called()
 
 
 def test_soft_rollover_retry_skips_gate_once_then_rearms(agent, tmp_path):
