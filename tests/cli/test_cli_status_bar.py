@@ -3,6 +3,8 @@ from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 import cli as cli_mod
 from cli import HermesCLI
 
@@ -53,6 +55,13 @@ def _attach_agent(
     return cli_obj
 
 
+@pytest.fixture(autouse=True)
+def _clear_cmm_status_env(monkeypatch):
+    monkeypatch.delenv("CMM_STATUS_BAR", raising=False)
+    monkeypatch.delenv("SMART_ZONE_CONTEXT_PCT", raising=False)
+    monkeypatch.delenv("SMART_ZONE_TOKENS", raising=False)
+
+
 class TestCLIStatusBar:
     def test_session_title_is_right_aligned_after_it_is_queued(self):
         cli_obj = _make_cli()
@@ -101,6 +110,63 @@ class TestCLIStatusBar:
         assert "6%" in text
         assert "$0.06" not in text  # cost hidden by default
         assert "15m" in text
+
+    def test_cmm_status_bar_shows_live_context_before_threshold(self, monkeypatch):
+        monkeypatch.setenv("CMM_STATUS_BAR", "on")
+        monkeypatch.setenv("SMART_ZONE_CONTEXT_PCT", "45")
+        monkeypatch.setenv("SMART_ZONE_TOKENS", "120000")
+        cli_obj = _attach_agent(
+            _make_cli(),
+            prompt_tokens=10_230,
+            completion_tokens=2_220,
+            total_tokens=12_450,
+            api_calls=7,
+            context_tokens=119_213,
+            context_length=272_000,
+        )
+
+        label = cli_obj._build_cmm_status_label(
+            cli_obj._get_status_bar_snapshot()
+        )
+        text = cli_obj._build_status_bar_text(width=120)
+
+        assert label == "CMM / 44% / 119K/272K - handoff @45% or 120K"
+        assert text.startswith(
+            "CMM / 44% / 119K/272K - handoff @45% or 120K"
+        )
+
+    def test_cmm_status_bar_marks_startup_telemetry_pending(self, monkeypatch):
+        monkeypatch.setenv("CMM_STATUS_BAR", "on")
+        monkeypatch.setenv("SMART_ZONE_TOKENS", "120000")
+        cli_obj = _make_cli()
+
+        text = cli_obj._build_status_bar_text(width=120)
+
+        assert text.startswith(
+            "CMM READY / telemetry pending - handoff @45% or 120K"
+        )
+
+    def test_cmm_status_bar_marks_missing_context_degraded_after_api_call(
+        self,
+        monkeypatch,
+    ):
+        monkeypatch.setenv("CMM_STATUS_BAR", "on")
+        monkeypatch.setenv("SMART_ZONE_TOKENS", "120000")
+        cli_obj = _attach_agent(
+            _make_cli(),
+            prompt_tokens=0,
+            completion_tokens=0,
+            total_tokens=0,
+            api_calls=1,
+            context_tokens=0,
+            context_length=0,
+        )
+
+        text = cli_obj._build_status_bar_text(width=120)
+
+        assert text.startswith(
+            "CMM DEGRADED / telemetry unavailable - handoff @45% or 120K"
+        )
 
 
     def test_input_height_counts_prompt_only_on_first_wrapped_row(self):
@@ -350,5 +416,4 @@ class TestIdleSinceLastTurn:
         cli_obj._prompt_duration = 5.0
         snapshot = cli_obj._get_status_bar_snapshot()
         assert snapshot["idle_since"].startswith("✓ ")
-
 

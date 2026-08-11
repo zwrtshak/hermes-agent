@@ -29,6 +29,7 @@ import os
 import shutil
 import sys
 import json
+import hashlib
 import re
 import concurrent.futures
 import base64
@@ -39,6 +40,7 @@ import time
 import uuid
 import textwrap
 from collections import deque
+from dataclasses import dataclass
 from urllib.parse import unquote, urlparse
 from contextlib import contextmanager
 from pathlib import Path
@@ -46,6 +48,18 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _FreshContextContinuationInput:
+    """Private queue payload for one task-bound CMM continuation."""
+
+    message: Any
+    images: tuple[Any, ...]
+    task_id: str
+
+
+_CMM_DIRECTOR_CONTINUATION_PREFIX = "DIRECTOR_CONTINUATION: CMM "
 
 # Suppress startup messages for clean CLI experience
 os.environ["HERMES_QUIET"] = "1"  # Our own modules
@@ -362,6 +376,84 @@ def _load_prefill_messages(file_path: str) -> List[Dict[str, Any]]:
     except Exception as e:
         logger.warning("Failed to load prefill messages from %s: %s", path, e)
         return []
+
+
+def _load_soft_rollover_bundle(
+    policy,
+    expected_session_id: str,
+) -> tuple[Optional[dict], str]:
+    """Validate a wrapper-prepared CMM bundle without trusting terminal text."""
+    raw_paths = {
+        "marker": getattr(policy, "soft_rollover_marker_path", None),
+        "prefill": getattr(policy, "soft_rollover_prefill_path", None),
+        "state": getattr(policy, "soft_rollover_state_path", None),
+    }
+    paths: dict[str, Path] = {}
+    for name, raw in raw_paths.items():
+        value = str(raw or "").strip()
+        if not value:
+            return None, f"soft_rollover_{name}_path_missing"
+        path = Path(value).expanduser()
+        if not path.is_absolute():
+            return None, f"soft_rollover_{name}_path_not_absolute"
+        if path.is_symlink():
+            return None, f"soft_rollover_{name}_path_is_symlink"
+        paths[name] = path
+    if not all(path.is_file() for path in paths.values()):
+        return None, "soft_rollover_bundle_pending"
+    try:
+        marker_text = paths["marker"].read_text(encoding="utf-8").strip()
+        if not marker_text or "\n" in marker_text:
+            return None, "soft_rollover_marker_invalid"
+        handoff = Path(marker_text).expanduser()
+        if not handoff.is_absolute() or handoff.is_symlink() or not handoff.is_file():
+            return None, "soft_rollover_handoff_invalid"
+        state = json.loads(paths["state"].read_text(encoding="utf-8"))
+        if not isinstance(state, dict):
+            return None, "soft_rollover_state_invalid"
+        if state.get("status") == "failed":
+            return None, (
+                "soft_rollover_transition_failed:"
+                f"{state.get('failure') or 'unknown'}"
+            )
+        if state.get("status") != "prefill_prepared":
+            return None, "soft_rollover_bundle_pending"
+        if str(state.get("source_session_id") or "") != str(expected_session_id or ""):
+            return None, "soft_rollover_source_session_mismatch"
+        state_handoff = Path(str(state.get("handoff_path") or "")).expanduser()
+        if str(handoff.resolve()) != str(state_handoff.resolve()):
+            return None, "soft_rollover_handoff_path_mismatch"
+        handoff_sha = hashlib.sha256(handoff.read_bytes()).hexdigest()
+        if (
+            handoff_sha != state.get("handoff_sha256")
+            or state.get("handoff_smoke") != "passed"
+        ):
+            return None, "soft_rollover_handoff_integrity_failed"
+        prefill_sha = hashlib.sha256(paths["prefill"].read_bytes()).hexdigest()
+        if prefill_sha != state.get("prefill_sha256"):
+            return None, "soft_rollover_prefill_integrity_failed"
+        messages = json.loads(paths["prefill"].read_text(encoding="utf-8"))
+        if not isinstance(messages, list) or not messages:
+            return None, "soft_rollover_prefill_invalid"
+        for item in messages:
+            if (
+                not isinstance(item, dict)
+                or item.get("role") != "user"
+                or not str(item.get("content") or "").strip()
+            ):
+                return None, "soft_rollover_prefill_invalid"
+        combined = "\n".join(str(item.get("content") or "") for item in messages)
+        if marker_text not in combined and str(handoff.resolve()) not in combined:
+            return None, "soft_rollover_prefill_missing_handoff"
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+        return None, f"soft_rollover_bundle_unreadable:{type(exc).__name__}"
+    return {
+        "handoff": handoff,
+        "marker": paths["marker"],
+        "prefill": paths["prefill"],
+        "messages": messages,
+        "state": state,
+    }, "soft_rollover_bundle_ready"
 
 
 def _resolve_prefill_messages_file(config: Dict[str, Any]) -> str:
@@ -4689,6 +4781,21 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             timestamp_str = self.session_start.strftime("%Y%m%d_%H%M%S")
             short_uuid = uuid.uuid4().hex[:6]
             self.session_id = f"{timestamp_str}_{short_uuid}"
+
+        # The full agent is lazy, but CMM needs a fresh process-bound identity
+        # immediately after startup. The first real turn replaces this API-free
+        # pending snapshot with authoritative token telemetry.
+        try:
+            from agent.context_telemetry import emit_startup_context_telemetry
+
+            emit_startup_context_telemetry(
+                session_id=self.session_id,
+                model=self.model,
+                provider=self.provider,
+                config=self.config,
+            )
+        except Exception:
+            pass
         
         # History file for persistent input recall across sessions
         self._history_file = _hermes_home / ".hermes_history"
@@ -4701,6 +4808,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._agent_running = False
         self._pending_input = queue.Queue()
         self._interrupt_queue = queue.Queue()
+        # Depth is a restart identity marker, not a continuation limit. Keep
+        # generated continuations bound to the same submitted task.
+        try:
+            bootstrap_depth = int(
+                os.environ.get("CMM_AUTO_CONTINUATION_DEPTH", "0") or "0"
+            )
+        except (TypeError, ValueError):
+            bootstrap_depth = 0
+        self._fresh_context_auto_continuations = 1 if bootstrap_depth > 0 else 0
+        self._fresh_context_task_id = (
+            uuid.uuid4().hex if bootstrap_depth > 0 else None
+        )
+        self._fresh_context_bootstrap_internal_pending = bootstrap_depth > 0
         # Tracks whether the turn that just finished was interrupted via
         # Ctrl+C. Consumed by _maybe_continue_goal_after_turn so /goal loops
         # don't auto-queue another continuation on top of a user-cancelled
@@ -5246,6 +5366,58 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         return f"[{('█' * filled) + ('░' * max(0, width - filled))}]"
 
     @staticmethod
+    def _cmm_status_enabled() -> bool:
+        value = os.getenv("CMM_STATUS_BAR", "").strip().lower()
+        return value in {"1", "true", "yes", "on", "enabled"}
+
+    @staticmethod
+    def _cmm_env_int(name: str, default: int) -> int:
+        try:
+            return int(float(os.getenv(name, "") or default))
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _cmm_format_k(tokens: Optional[int]) -> str:
+        if tokens is None:
+            return "--K"
+        try:
+            value = max(0, int(tokens))
+        except (TypeError, ValueError):
+            return "--K"
+        return f"{round(value / 1000)}K"
+
+    def _build_cmm_status_label(self, snapshot: Dict[str, Any]) -> str:
+        if not self._cmm_status_enabled():
+            return ""
+        threshold_pct = self._cmm_env_int("SMART_ZONE_CONTEXT_PCT", 45)
+        threshold_tokens = self._cmm_env_int("SMART_ZONE_TOKENS", 120000)
+        context_length = snapshot.get("context_length")
+        if not context_length:
+            if int(snapshot.get("session_api_calls") or 0) == 0:
+                return (
+                    "CMM READY / telemetry pending - handoff "
+                    f"@{threshold_pct}% or {self._cmm_format_k(threshold_tokens)}"
+                )
+            return (
+                "CMM DEGRADED / telemetry unavailable - handoff "
+                f"@{threshold_pct}% or {self._cmm_format_k(threshold_tokens)}"
+            )
+        used = snapshot.get("context_tokens")
+        percent_used = snapshot.get("context_percent")
+        try:
+            live_pct = max(0, min(100, int(percent_used)))
+        except (TypeError, ValueError):
+            live_pct = None
+        live_pct_label = "--%" if live_pct is None else f"{live_pct}%"
+        return (
+            f"CMM / {live_pct_label} / "
+            f"{self._cmm_format_k(used)}/{self._cmm_format_k(context_length)} "
+            f"- handoff @{threshold_pct}% or "
+            f"{self._cmm_format_k(threshold_tokens)}"
+        )
+
+    @staticmethod
     def _format_prompt_elapsed(prompt_start_time: Optional[float], prompt_duration: float, live: bool = False) -> str:
         """Format per-prompt elapsed time for the status bar.
 
@@ -5458,6 +5630,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             snapshot["compressions"] = getattr(compressor, "compression_count", 0) or 0
             if context_length:
                 snapshot["context_percent"] = max(0, min(100, round((context_tokens / context_length) * 100)))
+
+        try:
+            from agent.context_telemetry import emit_context_telemetry
+
+            emit_context_telemetry(agent, snapshot=snapshot)
+        except Exception:
+            pass
 
         return snapshot
 
@@ -6071,6 +6250,22 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
             yolo_active = self._is_session_yolo_active()
             goal_segment = self._status_bar_goal_segment(snapshot)
+            cmm_label = self._build_cmm_status_label(snapshot)
+            if cmm_label:
+                parts = [f"{battery_prefix}{cmm_label}"]
+                if width >= 76:
+                    parts.extend([snapshot["model_short"], duration_label])
+                    if goal_segment:
+                        parts.append(goal_segment)
+                    if focus_label:
+                        parts.append(focus_label)
+                    if yolo_active:
+                        parts.append("⚠ YOLO")
+                return self._right_align_status_title(
+                    " │ ".join(parts),
+                    session_title,
+                    width,
+                )
             if width < 52:
                 text = f"{battery_prefix}⚕ {snapshot['model_short']} · {duration_label}"
                 if goal_segment:
@@ -6163,7 +6358,50 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             focus_label = snapshot.get("focus_label") or ""
             session_title = snapshot.get("session_title") or ""
 
-            if width < 52:
+            cmm_label = self._build_cmm_status_label(snapshot)
+            if cmm_label:
+                percent = snapshot["context_percent"]
+                cmm_style = (
+                    "class:status-bar-bad"
+                    if "DEGRADED" in cmm_label
+                    else self._status_bar_context_style(percent)
+                )
+                frags = [
+                    ("class:status-bar", " "),
+                    (cmm_style, cmm_label),
+                ]
+                if width >= 76:
+                    frags.extend(
+                        [
+                            ("class:status-bar-dim", " │ "),
+                            ("class:status-bar-strong", snapshot["model_short"]),
+                            ("class:status-bar-dim", " │ "),
+                            ("class:status-bar-dim", duration_label),
+                        ]
+                    )
+                    if goal_segment:
+                        frags.extend(
+                            [
+                                ("class:status-bar-dim", " │ "),
+                                ("class:status-bar-strong", goal_segment),
+                            ]
+                        )
+                    if focus_label:
+                        frags.extend(
+                            [
+                                ("class:status-bar-dim", " │ "),
+                                ("class:status-bar-strong", focus_label),
+                            ]
+                        )
+                    if yolo_active:
+                        frags.extend(
+                            [
+                                ("class:status-bar-dim", " │ "),
+                                ("class:status-bar-yolo", "⚠ YOLO"),
+                            ]
+                        )
+                frags.append(("class:status-bar", " "))
+            elif width < 52:
                 frags = [
                     ("class:status-bar", " ⚕ "),
                     ("class:status-bar-strong", snapshot["model_short"]),
@@ -6716,6 +6954,25 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             ChatConsole().print(self._format_submitted_user_message_preview(text))
         else:
             ChatConsole().print(f"[bold {_accent_hex()}]●[/] [bold]{_escape(text)}[/]")
+
+    def _print_submitted_input_preview(
+        self,
+        user_input: Any,
+        submit_images: list,
+        *,
+        internal: bool,
+    ) -> None:
+        """Render real user input while keeping CMM control input private."""
+        if internal:
+            return
+        print()
+        self._print_user_message_preview(user_input)
+        if submit_images:
+            count = len(submit_images)
+            _cprint(
+                f"  {_DIM}📎 {count} image"
+                f"{'s' if count > 1 else ''} attached{_RST}"
+            )
 
     def _stream_reasoning_delta(self, text: str) -> None:
         """Stream reasoning/thinking tokens into a dim box above the response.
@@ -8411,7 +8668,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             return None
         return history_snapshot
 
-    def new_session(self, silent=False, title=None):
+    def new_session(self, silent=False, title=None, parent_session_id=None):
         """Start a fresh session with a new session ID and cleared agent state."""
         old_session_id = self.session_id
         _boundary_snapshot = None
@@ -8552,6 +8809,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             "max_iterations": self.max_turns,
                             "reasoning_config": self.reasoning_config,
                         },
+                        parent_session_id=parent_session_id,
                     )
                     self.agent._session_db_created = True
                 except Exception:
@@ -8616,6 +8874,233 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 print(f"(^_^)v New session started: {title}")
             else:
                 print("(^_^)v New session started!")
+
+    def _bind_fresh_context_task_scope(
+        self,
+        *,
+        internal: bool,
+        task_id: Optional[str] = None,
+    ) -> tuple[bool, str]:
+        """Bind every generated continuation to its originating user task."""
+        if not self.agent:
+            return False, "fresh_context_agent_missing"
+        if internal:
+            current_task_id = str(
+                getattr(self, "_fresh_context_task_id", "") or ""
+            )
+            supplied_task_id = str(task_id or "")
+            if (
+                supplied_task_id
+                and current_task_id
+                and supplied_task_id != current_task_id
+            ):
+                return False, "fresh_context_task_id_mismatch"
+            if not current_task_id:
+                current_task_id = supplied_task_id or uuid.uuid4().hex
+                self._fresh_context_task_id = current_task_id
+            self._fresh_context_auto_continuations = max(
+                1,
+                int(
+                    getattr(self, "_fresh_context_auto_continuations", 0) or 0
+                ),
+            )
+            return True, "fresh_context_continuation_bound"
+
+        self._fresh_context_task_id = uuid.uuid4().hex
+        self._fresh_context_auto_continuations = 0
+        return True, "fresh_context_new_task_bound"
+
+    def _queue_hidden_fresh_context_bootstrap(self) -> bool:
+        """Queue a wrapper-recovery continuation without terminal key injection."""
+        if not getattr(self, "_fresh_context_bootstrap_internal_pending", False):
+            return False
+        query = str(os.environ.get("HERMES_TUI_QUERY", "") or "").strip()
+        if not query.startswith(_CMM_DIRECTOR_CONTINUATION_PREFIX):
+            return False
+        task_id = str(getattr(self, "_fresh_context_task_id", "") or "")
+        if not task_id:
+            task_id = uuid.uuid4().hex
+            self._fresh_context_task_id = task_id
+        self._pending_input.put(
+            _FreshContextContinuationInput(
+                message=query,
+                images=(),
+                task_id=task_id,
+            )
+        )
+        self._fresh_context_bootstrap_internal_pending = False
+        return True
+
+    def _complete_soft_fresh_context_rollover(
+        self,
+        continuation_message: Any,
+        continuation_images: Optional[list] = None,
+    ) -> tuple[bool, str]:
+        """Rotate the live CLI session after a validated external CMM handoff."""
+        if not self.agent or not hasattr(self, "_pending_input"):
+            return False, "soft_rollover_interactive_cli_required"
+        continuation_count = int(
+            getattr(self, "_fresh_context_auto_continuations", 0) or 0
+        )
+        task_id = str(getattr(self, "_fresh_context_task_id", "") or "")
+        if not task_id:
+            task_id = uuid.uuid4().hex
+            self._fresh_context_task_id = task_id
+        try:
+            from agent.fresh_context_gate import resolve_fresh_context_gate_policy
+
+            policy = resolve_fresh_context_gate_policy(
+                getattr(self.agent, "_fresh_context_gate_config", None)
+            )
+        except Exception as exc:
+            return False, f"soft_rollover_policy_unavailable:{type(exc).__name__}"
+        if not policy.soft_rollover_enabled:
+            return False, "soft_rollover_disabled"
+
+        old_session_id = self.session_id
+        timeout = max(1, min(policy.soft_rollover_timeout_seconds, 60))
+        deadline = time.monotonic() + timeout
+        bundle = None
+        reason = "soft_rollover_bundle_pending"
+        while time.monotonic() < deadline:
+            bundle, reason = _load_soft_rollover_bundle(policy, old_session_id)
+            if bundle is not None or reason.startswith(
+                "soft_rollover_transition_failed:"
+            ):
+                break
+            if reason != "soft_rollover_bundle_pending":
+                break
+            time.sleep(0.05)
+        if bundle is None:
+            return False, reason
+
+        progress_changed = bundle["state"].get("task_progress_changed")
+        progress_repeat_count = int(
+            bundle["state"].get("task_progress_repeat_count") or 0
+        )
+        stop_stalled_chain = (
+            progress_changed is False and progress_repeat_count >= 2
+        )
+        if stop_stalled_chain:
+            continuation_message = (
+                "CMM opened this fresh context automatically, but the semantic "
+                "task state repeated across two context transitions. Do not use "
+                "tools and do not continue the repeated work. Briefly report that "
+                "automatic continuation stopped because no material progress was "
+                "recorded, name the current next action from the validated handoff, "
+                "and then stop at the prompt."
+            )
+        elif progress_changed is False:
+            continuation_message = (
+                "Continue the current task from the validated CMM handoff, but the "
+                "semantic task state did not advance in the previous context. Do not "
+                "repeat completed reads, tests, tool calls, or side effects. Take a "
+                "materially different action that advances the Todo, or finish with a "
+                "clear completed or blocked result."
+            )
+
+        continuation_title = None
+        if self._session_db and old_session_id:
+            try:
+                old_title = self._session_db.get_session_title(old_session_id)
+                if old_title:
+                    continuation_title = self._session_db.get_next_title_in_lineage(
+                        old_title
+                    )
+            except Exception:
+                continuation_title = None
+
+        try:
+            self.new_session(
+                silent=True,
+                title=continuation_title,
+                parent_session_id=old_session_id,
+            )
+            self.agent.prefill_messages = [
+                dict(item) for item in bundle["messages"]
+            ]
+            self.agent._fresh_context_gate_skip_once = True
+            self._fresh_context_auto_continuations = continuation_count + 1
+            try:
+                from hermes_cli.goals import migrate_goal_to_session
+
+                migrate_goal_to_session(
+                    old_session_id,
+                    self.session_id,
+                    reason="fresh_context_rollover",
+                )
+            except Exception:
+                logger.debug(
+                    "Could not migrate goal during soft rollover",
+                    exc_info=True,
+                )
+            self._pending_input.put(
+                _FreshContextContinuationInput(
+                    message=continuation_message,
+                    images=tuple(continuation_images or ()),
+                    task_id=task_id,
+                )
+            )
+        except Exception as exc:
+            return False, (
+                "soft_rollover_session_rotation_failed:"
+                f"{type(exc).__name__}"
+            )
+
+        # These are exact, hash-validated generated bundle files. Transition
+        # state remains until fresh-session telemetry is observed.
+        for path in (bundle["marker"], bundle["prefill"]):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                logger.warning(
+                    "Soft rollover could not remove generated file %s",
+                    path,
+                )
+        logger.info(
+            "Soft Fresh Context rollover completed in-process "
+            "old_session=%s new_session=%s progress_changed=%s "
+            "progress_repeat_count=%s",
+            old_session_id,
+            self.session_id,
+            progress_changed,
+            progress_repeat_count,
+        )
+        return (
+            True,
+            "soft_rollover_stall_finalization_queued"
+            if stop_stalled_chain
+            else "soft_rollover_completed",
+        )
+
+    def _consume_prepared_soft_fresh_context_rollover(
+        self,
+        continuation_message: Any,
+        continuation_images: Optional[list] = None,
+    ) -> tuple[bool, str]:
+        """Consume a handoff bundle that became ready after the prior turn."""
+        if not self.agent or not hasattr(self, "_pending_input"):
+            return False, "soft_rollover_interactive_cli_required"
+        try:
+            from agent.fresh_context_gate import resolve_fresh_context_gate_policy
+
+            policy = resolve_fresh_context_gate_policy(
+                getattr(self.agent, "_fresh_context_gate_config", None)
+            )
+        except Exception as exc:
+            return False, f"soft_rollover_policy_unavailable:{type(exc).__name__}"
+        if not policy.soft_rollover_enabled:
+            return False, "soft_rollover_disabled"
+
+        bundle, reason = _load_soft_rollover_bundle(policy, self.session_id)
+        if bundle is None:
+            return False, reason
+        return self._complete_soft_fresh_context_rollover(
+            continuation_message,
+            continuation_images=continuation_images,
+        )
 
 
     def _consume_pending_resume_selection(self, text: str) -> bool:
@@ -14021,7 +14506,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             except Exception:
                 pass
 
-    def chat(self, message, images: list = None, voice_input: bool = False) -> Optional[str]:
+    def chat(
+        self,
+        message,
+        images: list = None,
+        voice_input: bool = False,
+        *,
+        _fresh_context_internal: bool = False,
+        _fresh_context_task_id: Optional[str] = None,
+    ) -> Optional[str]:
         """
         Send a message to the agent and get a response.
         
@@ -14042,6 +14535,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         Returns:
             The agent's response, or None on error
         """
+        bootstrap_internal = bool(
+            getattr(self, "_fresh_context_bootstrap_internal_pending", False)
+            and isinstance(message, str)
+            and message.startswith(_CMM_DIRECTOR_CONTINUATION_PREFIX)
+        )
+        if bootstrap_internal:
+            self._fresh_context_bootstrap_internal_pending = False
+        is_fresh_context_internal = bool(
+            _fresh_context_internal or bootstrap_internal
+        )
+
         # Single-query and direct chat callers do not go through run(), so
         # register secure secret capture here as well.
         set_secret_capture_callback(self._secret_capture_callback)
@@ -14061,7 +14565,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self.agent = None
 
         # Initialize agent if needed
-        if self.agent is None:
+        if self.agent is None and not is_fresh_context_internal:
             _cprint(f"{_DIM}Initializing agent...{_RST}")
         if not self._init_agent(
             model_override=turn_route["model"],
@@ -14071,6 +14575,32 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             return None
         agent = self.agent
         if agent is None:
+            return None
+
+        task_scope_ok, task_scope_reason = self._bind_fresh_context_task_scope(
+            internal=is_fresh_context_internal,
+            task_id=_fresh_context_task_id,
+        )
+        if not task_scope_ok:
+            logger.error(
+                "Fresh Context task scope rejected: %s",
+                task_scope_reason,
+            )
+            return None
+
+        rollover_ok, rollover_reason = (
+            self._consume_prepared_soft_fresh_context_rollover(
+                message,
+                continuation_images=images,
+            )
+        )
+        if rollover_ok:
+            return ""
+        if rollover_reason.startswith("soft_rollover_transition_failed:"):
+            logger.error(
+                "Prepared Fresh Context rollover failed closed: %s",
+                rollover_reason,
+            )
             return None
 
         # Route image attachments based on the active model's vision capability.
@@ -14188,8 +14718,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             with persist_lock:
                 _stage_user_message()
 
-        ChatConsole().print(f"[{_accent_hex()}]{'─' * 40}[/]")
-        print(flush=True)
+        if not is_fresh_context_internal:
+            ChatConsole().print(f"[{_accent_hex()}]{'─' * 40}[/]")
+            print(flush=True)
         
         try:
             # Run the conversation with interrupt monitoring
@@ -14356,7 +14887,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 # close-path marker follows the same dict into turn setup rather
                 # than producing a second noted user row (#63766).
                 _persist_clean_user_message = (
-                    message if (_voice_prefix or agent_message != message) else None
+                    ""
+                    if is_fresh_context_internal
+                    else message if (_voice_prefix or agent_message != message) else None
                 )
                 _one_turn_model_restore = getattr(
                     self, "_pending_one_turn_model_restore", None
@@ -14576,6 +15109,38 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
             # Update history with full conversation
             self.conversation_history = result.get("messages", self.conversation_history) if result else self.conversation_history
+
+            # The core gate stopped before any provider request. Rotate the
+            # live session and retry privately from the validated CMM bundle.
+            if result and result.get("rollover_requested"):
+                continuation_message = (
+                    result.get("rollover_continuation_message") or message
+                )
+                soft_ok, soft_reason = self._complete_soft_fresh_context_rollover(
+                    continuation_message,
+                    continuation_images=(
+                        images if not result.get("rollover_mid_turn") else None
+                    ),
+                )
+                if soft_ok:
+                    return ""
+                try:
+                    from agent.fresh_context_gate import (
+                        resolve_fresh_context_gate_policy,
+                    )
+
+                    soft_policy = resolve_fresh_context_gate_policy(
+                        getattr(self.agent, "_fresh_context_gate_config", None)
+                    )
+                except Exception:
+                    soft_policy = None
+                if soft_policy is not None and soft_policy.soft_rollover_enabled:
+                    result["failed"] = True
+                    result["error"] = soft_reason
+                    result["final_response"] = (
+                        "Fresh Context soft rollover failed closed "
+                        f"({soft_reason}). No provider request was sent."
+                    )
 
             # If auto-compression fired mid-turn, the agent created a new
             # continuation session and mutated self.agent.session_id. Sync
@@ -15461,6 +16026,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._agent_running = False
         self._pending_input = queue.Queue()     # For normal input (commands + new queries)
         self._interrupt_queue = queue.Queue()   # For messages typed while agent is running
+        # A wrapper-recovery query is internal CMM control input. Queue a
+        # private payload so it never enters the prompt editor or scrollback.
+        self._queue_hidden_fresh_context_bootstrap()
         # See constructor note. Mirrored here for the run() path that skips
         # the earlier __init__ branch.
         self._last_turn_interrupted = False
@@ -17682,6 +18250,38 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     except queue.Empty:
                         # Periodic config watcher — auto-reload MCP on mcp_servers change
                         if not self._agent_running:
+                            # The guard can finish just after chat() returned.
+                            # Poll for at most one minute, no more than once per
+                            # second, and consume only a validated ready bundle.
+                            finished_at = float(
+                                getattr(self, "_last_turn_finished_at", 0.0) or 0.0
+                            )
+                            now_wall = time.time()
+                            now_mono = time.monotonic()
+                            last_check = float(
+                                getattr(
+                                    self,
+                                    "_last_soft_rollover_idle_check",
+                                    0.0,
+                                )
+                                or 0.0
+                            )
+                            if (
+                                finished_at > 0
+                                and 0 <= now_wall - finished_at <= 60
+                                and now_mono - last_check >= 1.0
+                            ):
+                                self._last_soft_rollover_idle_check = now_mono
+                                rollover_ok, _ = (
+                                    self._consume_prepared_soft_fresh_context_rollover(
+                                        "Continue the current task from the validated "
+                                        "CMM handoff. Do not repeat completed tool calls "
+                                        "or side effects. Inspect the current Todo and "
+                                        "task state, then continue only unfinished work."
+                                    )
+                                )
+                                if rollover_ok:
+                                    continue
                             self._check_config_mcp_changes()
                             # Check for background process notifications (completions
                             # and watch pattern matches) while agent is idle.
@@ -17690,6 +18290,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             except Exception:
                                 pass
                         continue
+
+                    fresh_context_internal = False
+                    fresh_context_task_id = None
+                    if isinstance(user_input, _FreshContextContinuationInput):
+                        fresh_context_internal = True
+                        fresh_context_task_id = user_input.task_id
+                        submit_images = list(user_input.images)
+                        user_input = user_input.message
+                    else:
+                        submit_images = []
 
                     # Voice-transcribed messages arrive wrapped in a sentinel
                     # so only genuine STT output gets the voice prefix (#65827).
@@ -17705,7 +18315,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     self._status_bar_suppressed_after_resize = False
 
                     # Unpack image payload: (text, [Path, ...]) or plain str
-                    submit_images = []
                     if isinstance(user_input, tuple):
                         user_input, submit_images = user_input
 
@@ -17794,13 +18403,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     paste_refs = list(_paste_ref_re.finditer(user_input)) if isinstance(user_input, str) else []
                     if paste_refs:
                         user_input = self._expand_paste_references(user_input)
-                    print()
-                    self._print_user_message_preview(user_input)
-                    
-                    # Show image attachment count
-                    if submit_images:
-                        n = len(submit_images)
-                        _cprint(f"  {_DIM}📎 {n} image{'s' if n > 1 else ''} attached{_RST}")
+                    self._print_submitted_input_preview(
+                        user_input,
+                        submit_images,
+                        internal=fresh_context_internal,
+                    )
 
                     # Regular chat - run agent
                     self._agent_running = True
@@ -17811,7 +18418,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     app.invalidate()  # Refresh status line
 
                     try:
-                        self.chat(user_input, images=submit_images or None, voice_input=is_voice_input)
+                        self.chat(
+                            user_input,
+                            images=submit_images or None,
+                            voice_input=is_voice_input,
+                            _fresh_context_internal=fresh_context_internal,
+                            _fresh_context_task_id=fresh_context_task_id,
+                        )
                     finally:
                         self._agent_running = False
                         self._spinner_text = ""

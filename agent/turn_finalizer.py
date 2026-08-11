@@ -29,6 +29,51 @@ from agent.message_content import flatten_message_text
 from agent.message_sanitization import _sanitize_surrogates
 
 
+def _emit_core_context_telemetry(agent, result) -> None:
+    """Best-effort native context telemetry for completed core turns."""
+    if not result.get("completed") or not result.get("api_calls"):
+        return
+    try:
+        from agent.context_telemetry import emit_context_telemetry
+
+        usage = {
+            "input": result.get("input_tokens", 0),
+            "output": result.get("output_tokens", 0),
+            "reasoning": result.get("reasoning_tokens", 0),
+            "prompt": result.get("prompt_tokens", 0),
+            "completion": result.get("completion_tokens", 0),
+            "total": result.get("total_tokens", 0),
+            "calls": result.get("api_calls", 0),
+        }
+        compressor = getattr(agent, "context_compressor", None)
+        if compressor is not None:
+            last_prompt = getattr(compressor, "last_prompt_tokens", 0) or 0
+            context_length = getattr(compressor, "context_length", 0) or 0
+            if last_prompt < 0:
+                last_prompt = 0
+            if context_length < 0:
+                context_length = 0
+            if last_prompt and context_length:
+                usage["context_used"] = last_prompt
+                usage["context_max"] = context_length
+                usage["context_percent"] = max(
+                    0,
+                    min(100, round(last_prompt / context_length * 100)),
+                )
+            usage["compressions"] = (
+                getattr(compressor, "compression_count", 0) or 0
+            )
+
+        emit_context_telemetry(agent, usage=usage)
+    except Exception:
+        try:
+            from agent.conversation_loop import logger
+
+            logger.debug("core context telemetry emission failed", exc_info=True)
+        except Exception:
+            pass
+
+
 def _is_pure_tool_call_tail(msg: dict) -> bool:
     """An assistant row with ``tool_calls`` but no visible text content of its own.
 
@@ -722,6 +767,8 @@ def finalize_turn(
     # Include interrupt message if one triggered the interrupt
     if interrupted and agent._interrupt_message:
         result["interrupt_message"] = agent._interrupt_message
+
+    _emit_core_context_telemetry(agent, result)
 
     # Clear interrupt state after handling
     agent.clear_interrupt()

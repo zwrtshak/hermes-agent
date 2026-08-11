@@ -1645,6 +1645,13 @@ def init_agent(
     except Exception:
         _agent_cfg = {}
 
+    # Keep only the narrow Fresh Context gate section on the agent.  The core
+    # resolves it per turn so panel threshold edits apply to long-lived
+    # sessions without exposing the full profile config on ``agent``.
+    from agent.fresh_context_gate import fresh_context_gate_config
+
+    agent._fresh_context_gate_config = fresh_context_gate_config(_agent_cfg)
+
     # Codex commentary visibility (display.show_commentary, default true).
     # When true, completed Codex phase=commentary messages are delivered as
     # visible mid-turn updates through the interim message path. When false,

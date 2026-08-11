@@ -39,6 +39,13 @@ from agent.conversation_compression import (
     recover_rotated_compression_session,
 )
 from agent.context_engine import automatic_compaction_status_message
+from agent.fresh_context_gate import (
+    evaluate_fresh_context_gate,
+    fresh_context_rollover_failed_message,
+    fresh_context_rollover_requested_message,
+    request_fresh_context_rollover,
+    resolve_fresh_context_gate_policy,
+)
 from agent.iteration_budget import IterationBudget
 from agent.memory_manager import build_memory_context_block
 from agent.memory_provider import is_trivial_prompt
@@ -425,6 +432,10 @@ class TurnContext:
     ext_prefetch_cache: str = ""
     # Turn-start preflight already proved an immediate retry ineffective.
     preflight_compression_blocked: bool = False
+    # Non-empty only when the synchronous Fresh Context gate ended the turn.
+    fresh_context_gate_terminal_message: str = ""
+    fresh_context_gate_terminal_reason: str = ""
+    fresh_context_gate_terminal_failed: bool = False
 
 
 def build_turn_context(
@@ -750,6 +761,107 @@ def build_turn_context(
         # fresh staged input.
         if not isinstance(pending_cli_message, dict) or pending_cli_message.get("_db_persisted"):
             agent._pending_cli_user_message = None
+
+    # ── Hermes-core Fresh Context Gate ──
+    # This is the first context-pressure action in the turn.  In particular it
+    # runs before both idle-triggered and threshold-triggered compression, so
+    # the configured CMM boundary remains authoritative on current main.
+    _fresh_policy = resolve_fresh_context_gate_policy(
+        getattr(agent, "_fresh_context_gate_config", None)
+    )
+    _fresh_skip_once = bool(
+        getattr(agent, "_fresh_context_gate_skip_once", False)
+    )
+    if _fresh_skip_once:
+        agent._fresh_context_gate_skip_once = False
+        # The prologue and the per-provider gate are one boundary.  A newly
+        # rotated session may bypass both exactly once so its small CMM prefill
+        # can establish the first authoritative provider telemetry sample.
+        agent._fresh_context_gate_skip_provider_once = True
+    if _fresh_policy.enabled and not _fresh_skip_once:
+        _fresh_tokens = estimate_request_tokens_rough(
+            messages,
+            system_prompt=active_system_prompt or "",
+            tools=agent.tools or None,
+        )
+        _fresh_compressor = getattr(agent, "context_compressor", None)
+        _fresh_context_length = int(
+            getattr(_fresh_compressor, "context_length", 0) or 0
+        )
+        _fresh_decision = evaluate_fresh_context_gate(
+            _fresh_policy,
+            prompt_tokens=_fresh_tokens,
+            context_length=_fresh_context_length,
+            token_source="estimated",
+        )
+        if _fresh_decision.should_block:
+            _fresh_request = request_fresh_context_rollover(
+                _fresh_policy,
+                _fresh_decision,
+                session_id=agent.session_id or "",
+                turn_id=turn_id,
+            )
+            if _fresh_request.requested:
+                _terminal_reason = "fresh_context_rollover_requested"
+                _terminal_failed = False
+                _terminal_message = fresh_context_rollover_requested_message(
+                    _fresh_decision
+                )
+                _status_prefix = "🔄"
+                _log_level = logging.INFO
+            else:
+                _terminal_reason = "fresh_context_gate_blocked"
+                _terminal_failed = True
+                _terminal_message = fresh_context_rollover_failed_message(
+                    _fresh_decision,
+                    _fresh_request,
+                )
+                _status_prefix = "⛔"
+                _log_level = logging.ERROR
+            logger.log(
+                _log_level,
+                "Fresh Context Gate terminal result=%s request_result=%s "
+                "session=%s at ~%s tokens (%.1f%%; thresholds=%s/%s%%); "
+                "no compression or API request",
+                _terminal_reason,
+                _fresh_request.reason,
+                agent.session_id or "none",
+                f"{_fresh_decision.prompt_tokens:,}",
+                _fresh_decision.context_pct,
+                f"{_fresh_decision.threshold_tokens:,}",
+                f"{_fresh_decision.threshold_context_pct:g}",
+            )
+            if not (
+                _fresh_request.requested
+                and _fresh_policy.soft_rollover_enabled
+            ):
+                agent._emit_status(f"{_status_prefix} {_terminal_message}")
+            # Close the role sequence and persist only the operator-facing
+            # result.  Estimated counts must never masquerade as actual-token
+            # telemetry for the external transition guard.
+            messages.append({"role": "assistant", "content": _terminal_message})
+            try:
+                agent._persist_session(messages, conversation_history)
+            except Exception:
+                logger.warning(
+                    "Fresh Context Gate result persistence failed for session=%s",
+                    agent.session_id or "none",
+                    exc_info=True,
+                )
+            return TurnContext(
+                user_message=user_message,
+                original_user_message=original_user_message,
+                messages=messages,
+                conversation_history=conversation_history,
+                active_system_prompt=active_system_prompt,
+                effective_task_id=effective_task_id,
+                turn_id=turn_id,
+                current_turn_user_idx=current_turn_user_idx,
+                should_review_memory=False,
+                fresh_context_gate_terminal_message=_terminal_message,
+                fresh_context_gate_terminal_reason=_terminal_reason,
+                fresh_context_gate_terminal_failed=_terminal_failed,
+            )
 
     # ── Idle-triggered compaction (opt-in; ``idle_compact_after_seconds``) ──
     # When a session resumes after a long idle gap, compact the accumulated
