@@ -18,6 +18,7 @@ from agent.fresh_context_gate import (
     resolve_fresh_context_gate_policy,
     select_fresh_context_gate_pressure,
 )
+from agent.conversation_loop import _fresh_context_mid_turn_continuation
 from run_agent import AIAgent
 
 
@@ -585,13 +586,69 @@ def test_same_turn_tool_growth_is_blocked_before_second_provider_call(
     assert result["rollover_mid_turn"] is True
     assert result["turn_exit_reason"] == "fresh_context_rollover_requested_mid_turn"
     assert result["api_calls"] == 1
-    assert "Do not repeat completed tool calls" in result["rollover_continuation_message"]
+    continuation = result["rollover_continuation_message"]
+    assert "finish the long task" in continuation
+    assert "web_search({})" in continuation
+    assert "Do not repeat completed tool calls" in continuation
+    assert "Inspect the current Todo and task state" not in continuation
     assert executed.call_count == 1
     agent.client.chat.completions.create.assert_called_once()
     payload = json.loads(request_path.read_text(encoding="utf-8"))
     assert payload["gate_position"] == "pre_provider_call"
     assert payload["api_call_index"] == 2
     assert payload["prompt_tokens_estimate"] == 131_000
+
+
+def test_mid_turn_continuation_keeps_only_completed_calls_and_redacts_arguments():
+    messages = [
+        {"role": "user", "content": "finish the exact active task"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "done-1",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": json.dumps(
+                            {
+                                "path": "/tmp/input.txt",
+                                "offset": 6001,
+                                "api_key": "secret-value-1234567890",
+                            }
+                        ),
+                    },
+                },
+                {
+                    "id": "pending-1",
+                    "type": "function",
+                    "function": {
+                        "name": "write_file",
+                        "arguments": '{"path":"/tmp/output.txt"}',
+                    },
+                },
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "done-1",
+            "content": "large output must not be copied",
+        },
+    ]
+
+    continuation = _fresh_context_mid_turn_continuation(
+        "finish the exact active task",
+        messages,
+        0,
+    )
+
+    assert "finish the exact active task" in continuation
+    assert "read_file(" in continuation
+    assert '"offset": 6001' in continuation
+    assert "write_file(" not in continuation
+    assert "large output must not be copied" not in continuation
+    assert "secret-value-1234567890" not in continuation
 
 
 def test_legacy_auto_continuation_flag_cannot_block_next_context_request(

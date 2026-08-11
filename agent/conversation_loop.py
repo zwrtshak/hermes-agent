@@ -66,11 +66,105 @@ from agent.message_sanitization import (
     _strip_images_from_messages,
     _strip_non_ascii,
 )
+from agent.redact import redact_sensitive_text
 # Must mirror _STALE_TOOL_CALL_MARKER_RE in hermes_state.py — kept local
 # to avoid importing hermes_state at module load time (its module-level
 # DEFAULT_DB_PATH = get_hermes_home() / "state.db" breaks tests that
 # monkeypatch get_hermes_home to return a str).
 _STALE_MARKER_RE = re.compile(r"^\[[A-Za-z_][A-Za-z0-9_.-]*\]$")
+
+
+def _fresh_context_mid_turn_continuation(
+    user_message: Any,
+    messages: List[Dict[str, Any]],
+    current_turn_user_idx: int,
+) -> str:
+    """Build a private, task-bound continuation without carrying tool output.
+
+    A fresh CMM session must retain the live user request and the tool calls
+    that already completed in the interrupted turn.  The external handoff is
+    durable task metadata; it is not authoritative for the exact in-memory
+    turn when older Todo/session-title state exists.
+    """
+
+    if isinstance(user_message, str):
+        request_text = user_message
+    elif isinstance(user_message, list):
+        text_parts: list[str] = []
+        for part in user_message:
+            if isinstance(part, dict) and part.get("type") == "text":
+                text_parts.append(str(part.get("text") or ""))
+            elif isinstance(part, str):
+                text_parts.append(part)
+        request_text = "\n".join(part for part in text_parts if part)
+        if not request_text:
+            request_text = "[The active request contains non-text input already supplied in the source turn.]"
+    else:
+        request_text = str(user_message)
+    request_text = redact_sensitive_text(request_text, force=True)
+
+    turn_messages = messages[max(0, current_turn_user_idx + 1) :]
+    completed_ids = {
+        str(message.get("tool_call_id") or "")
+        for message in turn_messages
+        if isinstance(message, dict) and message.get("role") == "tool"
+    }
+    completed_calls: list[str] = []
+    for message in turn_messages:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        calls = message.get("tool_calls")
+        if not isinstance(calls, list):
+            continue
+        for call in calls:
+            if not isinstance(call, dict):
+                continue
+            call_id = str(call.get("id") or "")
+            if not call_id or call_id not in completed_ids:
+                continue
+            function = call.get("function")
+            if not isinstance(function, dict):
+                continue
+            name = str(function.get("name") or "unknown_tool")
+            arguments = function.get("arguments")
+            if isinstance(arguments, str):
+                argument_text = arguments
+            else:
+                try:
+                    argument_text = json.dumps(
+                        arguments if arguments is not None else {},
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                except (TypeError, ValueError):
+                    argument_text = "{}"
+            argument_text = redact_sensitive_text(argument_text, force=True)
+            if len(argument_text) > 2000:
+                argument_text = argument_text[:1997] + "..."
+            completed_calls.append(f"- {name}({argument_text})")
+            if len(completed_calls) >= 32:
+                break
+        if len(completed_calls) >= 32:
+            break
+
+    completed_section = (
+        "\n".join(completed_calls)
+        if completed_calls
+        else "- No completed tool call was recorded before the rollover."
+    )
+    return (
+        "CMM private mid-turn continuation. This is the same active user task, "
+        "not a new task.\n\n"
+        "Authoritative active user request:\n"
+        f"{request_text}\n\n"
+        "Completed tool calls in this turn before the rollover; their results "
+        "were already returned, so do not repeat them:\n"
+        f"{completed_section}\n\n"
+        "Continue only the unfinished remainder of the active user request. "
+        "Do not inspect or adopt unrelated Todo, repository, report, or task "
+        "state from older handoff material. Do not repeat completed tool calls "
+        "or side effects. If the request is already complete, answer it directly."
+    )
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
     _estimate_tools_tokens_rough,
@@ -2289,9 +2383,11 @@ def run_conversation(
                     result["rollover_requested"] = True
                     if _mid_turn:
                         result["rollover_continuation_message"] = (
-                            "Continue the current task from the validated CMM handoff. "
-                            "Do not repeat completed tool calls or side effects. Inspect "
-                            "the current Todo and task state, then continue only unfinished work."
+                            _fresh_context_mid_turn_continuation(
+                                original_user_message,
+                                messages,
+                                current_turn_user_idx,
+                            )
                         )
                 else:
                     result["error"] = _fresh_request.reason
