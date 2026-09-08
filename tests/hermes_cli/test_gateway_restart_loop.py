@@ -568,6 +568,16 @@ class TestTerminalToolGatewayLifecycleGuard:
 class TestLifecycleGuardModule:
     """Direct tests for cron.lifecycle_guard.check_gateway_lifecycle."""
 
+    def test_skill_documentation_is_not_a_kill_command(self, tmp_path):
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        command = 'python3 -c \'print("skill references in hermes gateway documentation")\''
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            command, cwd=str(tmp_path)
+        ) is False
+
     def test_prompt_with_command_raises(self):
         from cron.lifecycle_guard import GatewayLifecycleBlocked, check_gateway_lifecycle
         with pytest.raises(GatewayLifecycleBlocked) as exc:
