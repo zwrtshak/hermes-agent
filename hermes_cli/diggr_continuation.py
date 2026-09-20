@@ -25,16 +25,16 @@ class Guard:
     @contextmanager
     def transaction(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with open(str(self.path) + '.lock', 'a') as lock:
+        with open(str(self.path) + '.lock', 'a', encoding='utf-8') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            state = json.loads(self.path.read_text()) if self.path.exists() else {}
+            state = json.loads(self.path.read_text(encoding='utf-8')) if self.path.exists() else {}
             before = json.dumps(state, sort_keys=True)
             yield state
             after = json.dumps(state, sort_keys=True)
             if before != after:
                 fd, name = tempfile.mkstemp(dir=self.path.parent)
                 try:
-                    with os.fdopen(fd, 'w') as out:
+                    with os.fdopen(fd, 'w', encoding='utf-8') as out:
                         out.write(after + '\n')
                         out.flush()
                         os.fsync(out.fileno())
@@ -356,7 +356,7 @@ def route_check(row, route, seal=False):
     if digest(bound['packet']) != bound['packet_sha256']:
         raise ValueError('routing packet changed since authorization')
     if seal or row.get('receipt_sha256'):
-        receipt = json.loads(Path(bound['receipt']).read_text())
+        receipt = json.loads(Path(bound['receipt']).read_text(encoding='utf-8'))
         contract = receipt.get('coding_route_contract', {})
         if (receipt.get('verdict') != 'allowed' or contract.get('operator_scope_authorized') is not True or
                 contract.get('plane_id') != bound['plane_id'] or
@@ -391,7 +391,7 @@ def register_native(task):
                 not Path(route['worktree']).is_absolute() or
                 not Path(route['receipt']).is_absolute()):
             raise ValueError('explicit authorized worker argv and absolute route paths required')
-        packet = json.loads(Path(route['packet']).read_text())
+        packet = json.loads(Path(route['packet']).read_text(encoding='utf-8'))
         if packet.get('operator_scope_authorized') is not True or packet.get('plane_id') != route['plane_id']:
             raise ValueError('packet scope authorization missing')
         argv = route['argv']
@@ -413,9 +413,8 @@ def observe_processes(guard):
         rows = [dict(r) for r in tasks.values() if r['status'] == 'running']
     for row in rows:
         if row.get('worker_pid'):
-            try:
-                os.kill(row['worker_pid'], 0)
-            except ProcessLookupError:
+            import psutil
+            if not psutil.pid_exists(row['worker_pid']):
                 guard.observe(row['task'], row['generation'], 'unknown')
             continue
         if row.get('visible_sent_at') and time.time() - row['visible_sent_at'] > 30:
@@ -538,7 +537,7 @@ def main(argv=None):
         raise ValueError('unexpected command arguments')
     import base64
     payload = json.loads(base64.urlsafe_b64decode(args.payload_b64) if args.payload_b64 is not None
-                         else args.payload_json if args.payload_json is not None else Path(args.payload).read_text())
+                         else args.payload_json if args.payload_json is not None else Path(args.payload).read_text(encoding='utf-8'))
     guard = runtime_guard(args.home)
     if guard is None:
         raise ValueError('candidate inactive')
