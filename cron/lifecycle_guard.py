@@ -442,6 +442,65 @@ def _iter_referenced_shell_scripts(
                     yield resolved
 
 
+def _iter_shell_substitution_payloads(command: str) -> Iterator[str]:
+    """Expose executable substitutions without unquoting inert argument data.
+
+    Only outer bodies are emitted; the existing bounded recursive scan handles
+    their commands, nested substitutions and referenced scripts. This lexical
+    walk does not evaluate shell text or expand variables.
+    """
+    stack = []
+    end, start, quote, parentheses = None, 0, None, 0
+    outer_start = 0
+    index = 0
+    while index < len(command):
+        char = command[index]
+        if char == '\\' and quote != "'":
+            index += 2
+            continue
+        if quote == "'":
+            if char == "'":
+                quote = None
+        elif char == '#' and quote is None and (
+            index == 0 or command[index - 1] in ' \t\n;|&('
+        ):
+            newline = command.find('\n', index)
+            index = len(command) if newline < 0 else newline
+            continue
+        elif char == '`' and end == '`':
+            if len(stack) == 1:
+                # Backtick substitution removes these escapes before its body
+                # is interpreted (including escaped nested backticks).
+                yield re.sub(r'\\([$`\\])', r'\1', command[start:index])
+            end, start, quote, parentheses = stack.pop()
+        elif char == '`' or command.startswith('$(', index):
+            stack.append((end, start, quote, parentheses))
+            end = '`' if char == '`' else ')'
+            index += 1 if char == '`' else 2
+            start, quote, parentheses = index, None, 0
+            if len(stack) == 1:
+                outer_start = start
+            continue
+        elif char == quote:
+            quote = None
+        elif quote is None:
+            if char in "\"'":
+                quote = char
+            elif end == ')' and char == '(':
+                parentheses += 1
+            elif end == ')' and char == ')':
+                if parentheses:
+                    parentheses -= 1
+                else:
+                    if len(stack) == 1:
+                        yield command[start:index]
+                    end, start, quote, parentheses = stack.pop()
+        index += 1
+    if stack:
+        # An incomplete body must not hide a command already present in it.
+        yield command[outer_start:]
+
+
 def _iter_shell_command_payloads(command: str) -> Iterator[str]:
     """Yield code passed through ``sh|bash|... -c`` for recursive scanning."""
     for segment in _iter_command_segments(command):
@@ -554,6 +613,16 @@ def _contains_unsafe_gateway_action(
         return True
     if depth >= _MAX_REFERENCED_SCRIPT_DEPTH:
         return True
+
+    for payload in _iter_shell_substitution_payloads(command):
+        if _contains_unsafe_gateway_action(
+            payload,
+            cwd=cwd,
+            depth=depth + 1,
+            visited=visited,
+            read_remote_script=read_remote_script,
+        ):
+            return True
 
     for payload in _iter_shell_command_payloads(command):
         if _contains_unsafe_gateway_action(

@@ -48,3 +48,102 @@ def test_nested_shell_payload(tmp_path):
     script = tmp_path/'real.sh'
     script.write_text('hermes gateway restart\n')
     assert classify('sh -c ' + shlex.quote('echo safe\nbash '+str(script)))
+
+
+@pytest.mark.parametrize('case', ['dollar_submit', 'dollar_script', 'backtick_submit'])
+def test_executable_multiline_substitution(tmp_path, case):
+    script = tmp_path/'real.sh'
+    script.write_text('hermes gateway stop\n')
+    body = ('bash ' + shlex.quote(str(script)) if case == 'dollar_script'
+            else 'launchctl submit -l neutral -- /bin/true')
+    substitution = ('`\n' + body + '\n`' if case == 'backtick_submit'
+                    else '$(\n' + body + '\n)')
+    # Classify text only: never execute launchctl or the lifecycle fixture.
+    assert classify('printf "%s" "' + substitution + '"', cwd=str(tmp_path))
+
+
+@pytest.mark.parametrize('substitution', ['$(\nBODY\n)', '`\nBODY\n`'])
+@pytest.mark.parametrize('consumer', ['printf %s', 'python3 -c', 'node -e'])
+def test_single_quoted_substitution_is_inert(tmp_path, substitution, consumer):
+    script = tmp_path/'real.sh'
+    script.write_text('hermes gateway stop\n')
+    data = substitution.replace('BODY', 'bash ' + str(script))
+    assert not classify(consumer + ' ' + shlex.quote(data), cwd=str(tmp_path))
+
+
+@pytest.mark.parametrize('data', [
+    '\\$(\nlaunchctl submit -l neutral -- /bin/true\n)',
+    '\\`\nlaunchctl submit -l neutral -- /bin/true\n\\`',
+    'ordinary\nmultiline data',
+])
+def test_double_quoted_inert_data(data):
+    assert not classify('printf "%s" "' + data + '"')
+
+
+@pytest.mark.parametrize('body', [
+    'printf "%s" "$(\nbash SCRIPT\n)"',
+    'printf "%s" "`\nbash SCRIPT\n`"',
+    'printf ")"\n# ignored ) and quote "\nbash SCRIPT',
+    '(printf safe)\nbash SCRIPT',
+])
+def test_substitution_quote_comment_and_nested_boundaries(tmp_path, body):
+    script = tmp_path/'real.sh'
+    script.write_text('hermes gateway stop\n')
+    body = body.replace('SCRIPT', shlex.quote(str(script)))
+    assert classify('printf "%s" "$(\n' + body + '\n)"', cwd=str(tmp_path))
+
+
+def test_substitution_referenced_script_recursion(tmp_path):
+    scripts = tmp_path/'scripts'
+    scripts.mkdir()
+    (scripts/'outer.sh').write_text('bash inner.sh\n')
+    (scripts/'inner.sh').write_text('hermes gateway stop\n')
+    assert classify('printf "%s" "$(\nbash scripts/outer.sh\n)"', cwd=str(tmp_path))
+
+
+def test_substitution_remote_script_scan():
+    reads = []
+
+    def read_remote(path):
+        reads.append(path)
+        return 'hermes gateway stop\n'
+
+    assert classify('printf "%s" "$(\nbash /missing-review-fixture/real.sh\n)"',
+                    read_remote_script=read_remote)
+    assert reads == ['/missing-review-fixture/real.sh']
+
+
+def test_substitution_uses_existing_depth_bound():
+    from cron.lifecycle_guard import _MAX_REFERENCED_SCRIPT_DEPTH
+    body = 'printf safe'
+    assert not classify('printf "%s" "$(\n' + body + '\n)"')
+    for _ in range(_MAX_REFERENCED_SCRIPT_DEPTH):
+        body = 'printf "%s" "$(\n' + body + '\n)"'
+    assert classify(body)
+
+
+def test_comment_does_not_open_substitution():
+    assert not classify('printf safe # $( ` "\nprintf done')
+
+
+@pytest.mark.parametrize('substitution', [
+    '`\nbash SCRIPT\n`',
+    '`printf "%s" \\`\nbash SCRIPT\n\\``',
+    '$(\nprintf safe\n)$(\nbash SCRIPT\n)',
+])
+def test_substitution_sibling_and_backtick_scripts(tmp_path, substitution):
+    script = tmp_path/'real.sh'
+    script.write_text('hermes gateway stop\n')
+    command = 'printf "%s" "' + substitution.replace('SCRIPT', str(script)) + '"'
+    assert classify(command, cwd=str(tmp_path))
+
+
+def test_substitution_script_cycle_uses_visited_paths(tmp_path):
+    (tmp_path/'cycle.sh').write_text('bash cycle.sh\n')
+    assert not classify('printf "%s" "$(\nbash cycle.sh\n)"', cwd=str(tmp_path))
+
+
+def test_substitution_preserves_script_size_bound(tmp_path):
+    from cron.lifecycle_guard import _MAX_REFERENCED_SCRIPT_BYTES
+    (tmp_path/'large.sh').write_text('#' * (_MAX_REFERENCED_SCRIPT_BYTES + 1))
+    assert classify('printf "%s" "$(\nbash large.sh\n)"', cwd=str(tmp_path))
