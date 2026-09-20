@@ -151,10 +151,51 @@ _BINARY_SNIFF_BYTES = 4096
 _ReadRemoteScriptFn = Callable[[str], Optional[str]]
 
 
+def _logical_shell_lines(command: str) -> Iterator[str]:
+    """Split only unquoted newlines; shlex still owns token interpretation.
+
+    A fresh lexer per physical line loses the enclosing quote of multiline
+    interpreter data. Keep that quote boundary without treating quoted newlines
+    as command separators. Comments cannot open quotes; escaped quotes cannot
+    close them. This is a lexical boundary, not an interpreter exemption.
+    """
+    start = 0
+    quote = None
+    escaped = False
+    comment = False
+    for index, char in enumerate(command):
+        if comment:
+            if char != '\n':
+                continue
+            comment = False
+        elif escaped:
+            escaped = False
+            continue
+        elif char == '\\' and quote != "'":
+            escaped = True
+            continue
+        elif quote:
+            if char == quote:
+                quote = None
+            continue
+        elif char in "\"'":
+            quote = char
+            continue
+        elif char == '#':
+            # Match shlex.commenters even when '#' follows an unquoted word.
+            comment = True
+            continue
+        if char == '\n':
+            yield command[start:index]
+            start = index + 1
+    if start < len(command):
+        yield command[start:]
+
+
 def _iter_command_segments(command: str) -> Iterator[list[str]]:
     """Yield shell-tokenized command segments, honoring quotes and comments."""
     normalized = command.replace("\\\n", "")
-    for line in normalized.splitlines() or [normalized]:
+    for line in _logical_shell_lines(normalized):
         try:
             lexer = shlex.shlex(
                 line,
@@ -401,6 +442,74 @@ def _iter_referenced_shell_scripts(
                     yield resolved
 
 
+def _iter_shell_substitution_payloads(command: str) -> Iterator[Optional[str]]:
+    """Expose executable substitutions without unquoting inert argument data.
+
+    Only outer bodies are emitted; the existing bounded recursive scan handles
+    their commands, nested substitutions and referenced scripts. This lexical
+    walk does not evaluate shell text or expand variables. None signals syntax
+    whose executable extent cannot be determined safely: callers fail closed.
+    """
+    command = command.replace("\\\n", "")
+    stack = []
+    end, start, quote, parentheses = None, 0, None, 0
+    index = 0
+    while index < len(command):
+        char = command[index]
+        if char == '\\' and quote != "'":
+            index += 2
+            continue
+        if quote == "'":
+            if char == "'":
+                quote = None
+        elif char == '#' and quote is None and (
+            index == 0 or command[index - 1] in ' \t\n;|&('
+        ):
+            newline = command.find('\n', index)
+            index = len(command) if newline < 0 else newline
+            continue
+        elif char == '`' and end == '`':
+            if len(stack) == 1:
+                # Backtick substitution removes these escapes before its body
+                # is interpreted (including escaped nested backticks).
+                yield re.sub(r'\\([$`\\])', r'\1', command[start:index])
+            end, start, quote, parentheses = stack.pop()
+        elif char == '`' or command.startswith('$(', index):
+            stack.append((end, start, quote, parentheses))
+            end = '`' if char == '`' else ')'
+            index += 1 if char == '`' else 2
+            start, quote, parentheses = index, None, 0
+            continue
+        elif char == quote:
+            quote = None
+        elif quote is None:
+            if stack and (command.startswith('<<', index) or (
+                    command.startswith('case', index) and
+                    (index == start or command[index - 1] in ' \t\r\n;|&()<>') and
+                    (index + 4 == len(command) or command[index + 4] in ' \t\r\n;|&()<>'))):
+                # case patterns and heredoc data can contain unpaired ')'. Do
+                # not guess the close and silently drop executable remainder.
+                # Conservatively reject even an unquoted literal case word in
+                # a substitution; quoted data and comments never reach here.
+                yield None
+                return
+            if char in "\"'":
+                quote = char
+            elif end == ')' and char == '(':
+                parentheses += 1
+            elif end == ')' and char == ')':
+                if parentheses:
+                    parentheses -= 1
+                else:
+                    if len(stack) == 1:
+                        yield command[start:index]
+                    end, start, quote, parentheses = stack.pop()
+        index += 1
+    if stack:
+        # An incomplete body has no trustworthy executable boundary either.
+        yield None
+
+
 def _iter_shell_command_payloads(command: str) -> Iterator[str]:
     """Yield code passed through ``sh|bash|... -c`` for recursive scanning."""
     for segment in _iter_command_segments(command):
@@ -513,6 +622,16 @@ def _contains_unsafe_gateway_action(
         return True
     if depth >= _MAX_REFERENCED_SCRIPT_DEPTH:
         return True
+
+    for payload in _iter_shell_substitution_payloads(command):
+        if payload is None or _contains_unsafe_gateway_action(
+            payload,
+            cwd=cwd,
+            depth=depth + 1,
+            visited=visited,
+            read_remote_script=read_remote_script,
+        ):
+            return True
 
     for payload in _iter_shell_command_payloads(command):
         if _contains_unsafe_gateway_action(

@@ -349,6 +349,100 @@ def validate_ticket(tasks, ticket):
     return row
 
 
+def _git_route_identity(worktree):
+    """Read only: never fetch, switch branches or change the index."""
+    import subprocess
+
+    def git(*args):
+        return subprocess.check_output(
+            ['git', '--no-optional-locks', '-C', worktree, *args],
+            text=True, timeout=10, stderr=subprocess.PIPE,
+        ).strip()
+
+    return (git('rev-parse', '--show-toplevel'),
+            git('symbolic-ref', '--quiet', '--short', 'HEAD'),
+            git('rev-parse', 'HEAD'), git('status', '--porcelain'))
+
+
+def preflight_non_cmm(row, route, *, check_idle=True):
+    """Validate a native-ticket-bound route without CMM or context measurement.
+
+    Returns evidence, not authority: only route-preflight under validate_ticket
+    writes/seals it. Dispatch still requires the native visible claim.
+    """
+    bound = row['worker_route']
+    fields = ('packet', 'receipt', 'worktree', 'branch', 'plane_id', 'argv', 'visible_target')
+    if any(route.get(k) != bound.get(k) for k in fields):
+        raise ValueError('non-CMM route differs from native ticket')
+    if not row.get('authorization') or time.time() >= row['deadline']:
+        raise ValueError('non-CMM authorization missing or expired')
+    for field in ('packet', 'receipt', 'worktree'):
+        path = Path(bound[field])
+        if not path.is_absolute() or path.is_symlink() or str(path.resolve()) != str(path):
+            raise ValueError('canonical non-symlink route paths required')
+    packet_path = Path(bound['packet'])
+    if not packet_path.is_file() or digest(packet_path) != bound['packet_sha256']:
+        raise ValueError('packet integrity mismatch')
+    packet = json.loads(packet_path.read_text(encoding='utf-8'))
+    if (packet.get('routing_mode') != 'non_cmm' or
+            packet.get('operator_scope_authorized') is not True or
+            any(packet.get(k) != bound['plane_id'] for k in ('plane_id', 'task_id', 'scope_id')) or
+            packet.get('worktree') != bound['worktree'] or packet.get('branch') != bound['branch']):
+        raise ValueError('explicit non-CMM scope/Plane/worktree binding required')
+    contract = packet.get('coding_route', {})
+    safe = {'inspect', 'edit', 'test', 'review', 'document_work_item', 'commit', 'push', 'pr_update'}
+    requested = packet.get('requested_actions')
+    allowed = contract.get('routine_actions_authorized')
+    if (not isinstance(requested, list) or not requested or
+            not isinstance(allowed, list) or not allowed or
+            any(not isinstance(a, str) or a not in safe for a in requested + allowed) or
+            not set(requested) <= set(allowed) or contract.get('merge_authorized') is not False or
+            contract.get('executor') != 'codex' or
+            contract.get('required_model') != 'gpt-6-astra' or
+            contract.get('fallback_models_allowed') != []):
+        raise ValueError('non-CMM action/model authorization rejected')
+    argv = bound['argv']
+    if (not isinstance(argv, list) or len(argv) < 4 or
+            any(not isinstance(a, str) or not a or '\x00' in a for a in argv) or
+            not Path(argv[0]).is_absolute() or Path(argv[0]).name != 'codex' or argv[1] != 'exec'):
+        raise ValueError('explicit Codex exec argv required')
+    # Deliberately narrow supported CLI grammar. No later model/config/profile
+    # override, resume, full-auto or sandbox bypass can shadow the pinned flags.
+    options = {}
+    args = argv[2:-1]
+    if len(args) % 2 or argv[-1].startswith('-'):
+        raise ValueError('unsupported Codex argv')
+    for key, value in zip(args[::2], args[1::2]):
+        if key in options or key not in {'--model', '--sandbox', '--cd', '--output-last-message', '--color', '-c'}:
+            raise ValueError('duplicate or unsupported Codex option')
+        options[key] = value
+    if (options.get('--model') != 'gpt-6-astra' or options.get('--sandbox') != 'workspace-write' or
+            options.get('--cd') != bound['worktree'] or options.get('--output-last-message') != row['artifact'] or
+            options.get('--color', 'never') != 'never' or
+            options.get('-c', 'approval_policy="never"') != 'approval_policy="never"'):
+        raise ValueError('Codex model/worktree/output/sandbox mismatch')
+    actual_root, branch, head, dirty = _git_route_identity(bound['worktree'])
+    if (actual_root != bound['worktree'] or branch != bound['branch'] or
+            branch in {'main', 'master'} or head != packet.get('base') or dirty):
+        raise ValueError('clean exact-base feature worktree required')
+    if bound['visible_target'] != row['visible_binding']['target']:
+        raise ValueError('visible target differs from registered binding')
+    verify_visible_target(row['visible_binding'], idle=check_idle)
+    proof = dict(task=row['task'], generation=row['generation'],
+                 authorization=row['authorization'], identity=row['identity'],
+                 artifact=row['artifact'], argv=argv, binding=row['visible_binding'],
+                 packet_sha256=bound['packet_sha256'], worktree=actual_root,
+                 branch=branch, head=head, expires_at=row['deadline'])
+    fingerprint = hashlib.sha256(json.dumps(proof, sort_keys=True).encode()).hexdigest()
+    return dict(schema_version='diggr.native.non_cmm_route.v1', mode='non_cmm',
+                verdict='allowed', route_packet=bound['packet'],
+                packet_sha256=bound['packet_sha256'], task=row['task'],
+                generation=row['generation'], expires_at=row['deadline'],
+                binding_sha256=fingerprint,
+                coding_route_contract=dict(contract, plane_id=bound['plane_id'],
+                                           operator_scope_authorized=True))
+
+
 def route_check(row, route, seal=False):
     bound = row['worker_route']
     if any(route.get(k) != bound[k] for k in ('packet', 'receipt', 'worktree', 'branch', 'plane_id')):
@@ -356,7 +450,17 @@ def route_check(row, route, seal=False):
     if digest(bound['packet']) != bound['packet_sha256']:
         raise ValueError('routing packet changed since authorization')
     if seal or row.get('receipt_sha256'):
-        receipt = json.loads(Path(bound['receipt']).read_text(encoding='utf-8'))
+        receipt_path = Path(bound['receipt'])
+        if receipt_path.is_symlink():
+            raise ValueError('symlink receipt refused')
+        receipt = json.loads(receipt_path.read_text(encoding='utf-8'))
+        packet = json.loads(Path(bound['packet']).read_text(encoding='utf-8'))
+        if packet.get('routing_mode') == 'non_cmm':
+            if row.get('non_cmm_receipt_sha256') != digest(receipt_path):
+                raise ValueError('non-CMM receipt not issued by native preflight')
+            expected = preflight_non_cmm(row, bound, check_idle=False)
+            if receipt != expected:
+                raise ValueError('non-CMM receipt stale or mismatched')
         contract = receipt.get('coding_route_contract', {})
         if (receipt.get('verdict') != 'allowed' or contract.get('operator_scope_authorized') is not True or
                 contract.get('plane_id') != bound['plane_id'] or
@@ -526,7 +630,7 @@ def main(argv=None):
     import argparse
     parser = argparse.ArgumentParser(description='Evidence-bound native Main receipts')
     parser.add_argument('--home', required=True)
-    parser.add_argument('operation', choices=['register', 'route-check', 'route-bind', 'worker', 'ack', 'complete', 'status'])
+    parser.add_argument('operation', choices=['register', 'route-check', 'route-bind', 'route-preflight', 'worker', 'ack', 'complete', 'status'])
     payload_options = parser.add_mutually_exclusive_group(required=True)
     payload_options.add_argument('--payload', help='JSON file')
     payload_options.add_argument('--payload-json', help='Inline machine-readable JSON')
@@ -557,6 +661,23 @@ def main(argv=None):
         if registered_guard.path != guard.path:
             raise ValueError('native registration home mismatch')
         result = row
+    elif args.operation == 'route-preflight':
+        # No dispatch and no CMM. The native ticket is authority; this operation
+        # only validates its route and writes a fresh evidence receipt.
+        with guard.transaction() as tasks:
+            row = validate_ticket(tasks, payload['ticket'])
+            if row.get('receipt_sha256'):
+                raise ValueError('route already sealed; preflight replay refused')
+            receipt = preflight_non_cmm(row, payload['route'])
+            receipt_path = Path(row['worker_route']['receipt'])
+            # Exclusive creation: never replace stale evidence or follow a link.
+            with receipt_path.open('x', encoding='utf-8') as output:
+                json.dump(receipt, output, sort_keys=True)
+                output.flush()
+                os.fsync(output.fileno())
+            row['non_cmm_receipt_sha256'] = digest(receipt_path)
+            route_check(row, payload['route'], seal=True)
+        result = worker_ticket(row)
     elif args.operation in {'route-check', 'route-bind'}:
         with guard.transaction() as tasks:
             row = validate_ticket(tasks, payload['ticket'])
