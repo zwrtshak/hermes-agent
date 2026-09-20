@@ -147,3 +147,58 @@ def test_substitution_preserves_script_size_bound(tmp_path):
     from cron.lifecycle_guard import _MAX_REFERENCED_SCRIPT_BYTES
     (tmp_path/'large.sh').write_text('#' * (_MAX_REFERENCED_SCRIPT_BYTES + 1))
     assert classify('printf "%s" "$(\nbash large.sh\n)"', cwd=str(tmp_path))
+
+
+@pytest.mark.parametrize('action', [
+    'launchctl submit -l neutral -- /bin/true',
+    'bash /nonexistent-review-fixture/real.sh',
+])
+def test_case_arm_must_not_truncate_substitution(action):
+    command = 'printf "%s" "$(\ncase x in\nx) printf safe ;;\nesac\n' + action + '\n)"'
+
+    def read_remote(path):
+        if path == '/nonexistent-review-fixture/real.sh':
+            return 'hermes gateway stop\n'
+        return None
+
+    # Exact review reproductions: classify only, never run the shell text.
+    assert classify(command, read_remote_script=read_remote)
+
+
+@pytest.mark.parametrize('body', [
+    "cat <<'END'\n)\nEND\nlaunchctl submit -l neutral -- /bin/true",
+    'printf "%s" "$(printf safe',
+])
+def test_ambiguous_or_incomplete_substitution_fails_closed(body):
+    assert classify('printf "%s" "$(' + body + ')"')
+
+
+@pytest.mark.parametrize('body', [
+    'case x in x) printf safe ;; esac',
+    'case x in (x) printf safe ;; esac',
+    'ca\\\nse x in x) printf safe ;; esac',
+    'printf safe;case x in x|y) printf safe ;; esac',
+    'printf %s "$(case x in x) printf safe ;; esac)"',
+    'printf %s "`case x in x) printf safe ;; esac`"',
+    'case x in x) case y in y) printf safe ;; esac ;; esac',
+])
+def test_case_substitution_conservatively_rejected(body):
+    assert classify('printf "%s" "$(' + body + ')"')
+
+
+@pytest.mark.parametrize('consumer', ['python3 -c', 'node -e', 'printf %s'])
+def test_ambiguous_substitution_single_quoted_data_is_inert(consumer):
+    data = '$(case x in x) printf safe ;; esac\ncat <<END\n)\nEND\n)'
+    assert not classify(consumer + ' ' + shlex.quote(data))
+
+
+@pytest.mark.parametrize('body', [
+    "printf %s 'case x in x) printf safe ;; esac'",
+    'printf %s "case"',
+    'printf showcase',
+    'printf case_name',
+    'printf safe # case x in x)\nprintf done',
+    "printf %s '<<END'",
+])
+def test_substitution_quoted_comment_and_word_controls(body):
+    assert not classify('printf "%s" "$(' + body + ')"')

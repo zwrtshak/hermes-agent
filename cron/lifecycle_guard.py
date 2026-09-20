@@ -442,16 +442,17 @@ def _iter_referenced_shell_scripts(
                     yield resolved
 
 
-def _iter_shell_substitution_payloads(command: str) -> Iterator[str]:
+def _iter_shell_substitution_payloads(command: str) -> Iterator[Optional[str]]:
     """Expose executable substitutions without unquoting inert argument data.
 
     Only outer bodies are emitted; the existing bounded recursive scan handles
     their commands, nested substitutions and referenced scripts. This lexical
-    walk does not evaluate shell text or expand variables.
+    walk does not evaluate shell text or expand variables. None signals syntax
+    whose executable extent cannot be determined safely: callers fail closed.
     """
+    command = command.replace("\\\n", "")
     stack = []
     end, start, quote, parentheses = None, 0, None, 0
-    outer_start = 0
     index = 0
     while index < len(command):
         char = command[index]
@@ -478,12 +479,20 @@ def _iter_shell_substitution_payloads(command: str) -> Iterator[str]:
             end = '`' if char == '`' else ')'
             index += 1 if char == '`' else 2
             start, quote, parentheses = index, None, 0
-            if len(stack) == 1:
-                outer_start = start
             continue
         elif char == quote:
             quote = None
         elif quote is None:
+            if stack and (command.startswith('<<', index) or (
+                    command.startswith('case', index) and
+                    (index == start or command[index - 1] in ' \t\r\n;|&()<>') and
+                    (index + 4 == len(command) or command[index + 4] in ' \t\r\n;|&()<>'))):
+                # case patterns and heredoc data can contain unpaired ')'. Do
+                # not guess the close and silently drop executable remainder.
+                # Conservatively reject even an unquoted literal case word in
+                # a substitution; quoted data and comments never reach here.
+                yield None
+                return
             if char in "\"'":
                 quote = char
             elif end == ')' and char == '(':
@@ -497,8 +506,8 @@ def _iter_shell_substitution_payloads(command: str) -> Iterator[str]:
                     end, start, quote, parentheses = stack.pop()
         index += 1
     if stack:
-        # An incomplete body must not hide a command already present in it.
-        yield command[outer_start:]
+        # An incomplete body has no trustworthy executable boundary either.
+        yield None
 
 
 def _iter_shell_command_payloads(command: str) -> Iterator[str]:
@@ -615,7 +624,7 @@ def _contains_unsafe_gateway_action(
         return True
 
     for payload in _iter_shell_substitution_payloads(command):
-        if _contains_unsafe_gateway_action(
+        if payload is None or _contains_unsafe_gateway_action(
             payload,
             cwd=cwd,
             depth=depth + 1,
