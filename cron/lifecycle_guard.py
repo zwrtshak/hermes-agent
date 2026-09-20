@@ -151,10 +151,51 @@ _BINARY_SNIFF_BYTES = 4096
 _ReadRemoteScriptFn = Callable[[str], Optional[str]]
 
 
+def _logical_shell_lines(command: str) -> Iterator[str]:
+    """Split only unquoted newlines; shlex still owns token interpretation.
+
+    A fresh lexer per physical line loses the enclosing quote of multiline
+    interpreter data. Keep that quote boundary without treating quoted newlines
+    as command separators. Comments cannot open quotes; escaped quotes cannot
+    close them. This is a lexical boundary, not an interpreter exemption.
+    """
+    start = 0
+    quote = None
+    escaped = False
+    comment = False
+    for index, char in enumerate(command):
+        if comment:
+            if char != '\n':
+                continue
+            comment = False
+        elif escaped:
+            escaped = False
+            continue
+        elif char == '\\' and quote != "'":
+            escaped = True
+            continue
+        elif quote:
+            if char == quote:
+                quote = None
+            continue
+        elif char in "\"'":
+            quote = char
+            continue
+        elif char == '#':
+            # Match shlex.commenters even when '#' follows an unquoted word.
+            comment = True
+            continue
+        if char == '\n':
+            yield command[start:index]
+            start = index + 1
+    if start < len(command):
+        yield command[start:]
+
+
 def _iter_command_segments(command: str) -> Iterator[list[str]]:
     """Yield shell-tokenized command segments, honoring quotes and comments."""
     normalized = command.replace("\\\n", "")
-    for line in normalized.splitlines() or [normalized]:
+    for line in _logical_shell_lines(normalized):
         try:
             lexer = shlex.shlex(
                 line,
