@@ -3,7 +3,6 @@
 No scheduler or CMM state. One ticket-bound foreground worker via existing cmux;
 all transitions serialized across processes. One active task per target session.
 """
-import fcntl
 import hashlib
 import json
 import os
@@ -24,6 +23,7 @@ class Guard:
 
     @contextmanager
     def transaction(self):
+        import fcntl  # POSIX-only locking is loaded only for an active guard.
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with open(str(self.path) + '.lock', 'a', encoding='utf-8') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
