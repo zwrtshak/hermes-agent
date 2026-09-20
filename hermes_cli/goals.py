@@ -1727,6 +1727,17 @@ class GoalManager:
                 "message": "",
             }
 
+        from hermes_cli.diggr_continuation import runtime_guard, TERMINAL
+        from hermes_constants import get_hermes_home
+        _guard = runtime_guard()
+        if _guard is not None:
+            with _guard.transaction() as _tasks:
+                if any(r['status'] not in TERMINAL and r['identity']['session'] == self.session_id and
+                       r['identity']['home'] == str(get_hermes_home().resolve())
+                       for r in _tasks.values()):
+                    return dict(status='active', should_continue=False, continuation_prompt=None,
+                                verdict='evidence_gate', reason='Main evidence gate owns continuation', message='')
+
         # Wait barrier: if the loop is parked (on a live process OR a time
         # deadline that hasn't passed), quiesce — do NOT burn a turn or call
         # the judge. Resumes automatically once the barrier clears.
