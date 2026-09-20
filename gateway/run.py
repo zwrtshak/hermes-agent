@@ -7962,7 +7962,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         suppressing them.
         """
         text = getattr(event_or_text, "text", event_or_text) or ""
-        return str(text).startswith("[Continuing toward your standing goal]\nGoal:")
+        return str(text).startswith(("[Continuing toward your standing goal]\nGoal:", "[DIGGR evidence continuation] "))
 
     def _clear_goal_pending_continuations(self, session_key: str, adapter: Any) -> int:
         """Remove queued synthetic /goal continuations for one session.
@@ -14710,6 +14710,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             from gateway.session_context import reset_session_vars
             reset_session_vars()
+            from hermes_cli.diggr_continuation import EVENT_CONTEXT
+            EVENT_CONTEXT.set(None)
         except Exception:
             logger.debug("reset_session_vars failed at handler entry", exc_info=True)
 
@@ -14864,6 +14866,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                     # Record rate limit so subsequent messages are silently ignored
                     pairing_store._record_rate_limit(platform_name, source.user_id)
+            return None
+
+        if not await self._diggr_accept(event):
             return None
 
         # Global emergency stop (`hermes pause`): give new turns a brief
@@ -16936,6 +16941,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         
         # Set session context variables for tools (task-local, concurrency-safe)
         _session_env_tokens = self._set_session_env(context)
+        from hermes_cli.diggr_continuation import EVENT_CONTEXT, runtime_guard
+        _diggr_home = self._resolve_profile_home_for_source(source).resolve()
+        _diggr_guard = runtime_guard(_diggr_home)
+        if _diggr_guard is not None:
+            self._diggr_homes = getattr(self, '_diggr_homes', set()) | {str(_diggr_home)}
+            EVENT_CONTEXT.set(dict(identity=self._diggr_identity(source, session_entry.session_id)))
+        else:
+            EVENT_CONTEXT.set(None)
         
         # Read privacy.redact_pii from config (re-read per message)
         _redact_pii = False
@@ -19419,6 +19432,94 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         await _deliver()
 
+    def _diggr_identity(self, source, session_id):
+        return dict(home=str(self._resolve_profile_home_for_source(source).resolve()),
+                    profile=source.profile or 'diggr-main', session=session_id,
+                    session_key=self._session_key_for_source(source),
+                    platform=source.platform.value, chat_id=str(source.chat_id),
+                    user_id=str(source.user_id or ''), thread_id=str(source.thread_id or ''))
+
+    async def _diggr_accept(self, event):
+        from hermes_cli.diggr_continuation import runtime_guard, token
+        guard = runtime_guard(self._resolve_profile_home_for_source(event.source))
+        wake = token(event.text)
+        if guard is None:
+            return wake is None
+        session = await self.async_session_store.get_or_create_session(event.source)
+        identity = self._diggr_identity(event.source, session.session_id)
+        command = (event.text or '').strip().casefold()
+        controls = {'/stop': 'paused', 'stop': 'paused', 'stopp': 'paused',
+                    '/goal pause': 'paused', 'pause': 'paused', '/goal clear': 'cancelled',
+                    '/goal stop': 'cancelled', 'cancel': 'cancelled', 'abbrechen': 'cancelled',
+                    '/new': 'superseded', '/reset': 'superseded'}
+        if command in controls:
+            guard.control(identity, controls[command])
+            adapter = self._adapter_for_source(event.source)
+            key = identity['session_key']
+            self._clear_goal_pending_continuations(key, adapter)
+            if adapter is not None and key not in getattr(adapter, '_pending_messages', {}):
+                promoted = self._promote_queued_event(key, adapter, None)
+                if promoted is not None:
+                    adapter._pending_messages[key] = promoted
+        return wake is None or guard.begin(identity, wake)
+
+    async def _diggr_tick(self, source, session_id, idle=False):
+        from hermes_cli.diggr_continuation import runtime_guard, prompt, token, observe_processes
+        guard = runtime_guard(self._resolve_profile_home_for_source(source))
+        if guard is None:
+            return False
+        identity = self._diggr_identity(source, session_id)
+        observe_processes(guard)
+        if not guard.blocks(identity):
+            return False
+        adapter = self._adapter_for_source(source)
+        key = identity['session_key']
+        if adapter is None or not hasattr(adapter, '_pending_messages'):
+            raise ValueError('SYSTEM167 unsupported native adapter target')
+        busy = key in self._running_agents or key in getattr(adapter, '_active_sessions', {})
+        if idle and busy:
+            guard.tick(identity, busy=True)
+            return True
+        wake = guard.tick(identity, busy=False)
+        if wake:
+            event = MessageEvent(text=prompt(wake), message_type=MessageType.TEXT,
+                                 source=source, message_id=None, channel_prompt=None)
+            self._enqueue_fifo(key, event, adapter)
+        # Reuse the native adapter consumer, never launch a Coding worker.
+        if idle and not busy:
+            head = adapter._pending_messages.get(key)
+            if head:
+                event = adapter.get_pending_message(key)
+                self._promote_queued_event(key, adapter, event)
+                adapter._start_session_processing(event, key)
+        return True
+
+    async def _diggr_idle_tick(self):
+        from hermes_cli.diggr_continuation import runtime_guard, TERMINAL
+        from hermes_constants import get_hermes_home
+        homes = set(getattr(self, '_diggr_homes', set())) | {str(get_hermes_home().resolve())}
+        for home in homes:
+            try:
+                guard = runtime_guard(home)
+                if guard is None:
+                    continue
+                with guard.transaction() as tasks:
+                    identities = [r['identity'] for r in tasks.values() if r['status'] not in TERMINAL]
+                for identity in identities:
+                    try:
+                        if identity['platform'] != 'telegram':
+                            raise ValueError('unsupported Gateway continuation target')
+                        source = SessionSource(platform=Platform.TELEGRAM, profile=identity['profile'],
+                                               chat_id=identity['chat_id'], user_id=identity['user_id'],
+                                               thread_id=identity['thread_id'] or None)
+                        if str(self._resolve_profile_home_for_source(source).resolve()) != home:
+                            raise ValueError('stored target home no longer matches native routing')
+                        await self._diggr_tick(source, identity['session'], idle=True)
+                    except Exception:
+                        logger.exception('SYSTEM167 target failed locally')
+            except Exception:
+                logger.exception('SYSTEM167 profile state failed locally')
+
     async def _post_turn_goal_continuation(
         self,
         *,
@@ -19436,6 +19537,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         user message that arrives simultaneously is handled by the same
         queue and takes priority naturally.
         """
+        if await self._diggr_tick(source, getattr(session_entry, 'session_id', '') or ''):
+            return
+
         try:
             from hermes_cli.goals import GoalManager
         except Exception as exc:
@@ -22008,6 +22112,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Restore session context variables to their pre-handler values."""
         from gateway.session_context import clear_session_vars
         clear_session_vars(tokens)
+        from hermes_cli.diggr_continuation import EVENT_CONTEXT
+        EVENT_CONTEXT.set(None)
 
     async def _run_in_executor_with_context(self, func, *args):
         """Run blocking work in the thread pool while preserving session contextvars."""
@@ -22964,6 +23070,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         from tools.process_registry import process_registry as _pr
         while self._running:
             try:
+                try:
+                    await self._diggr_idle_tick()
+                except Exception:
+                    logger.exception("SYSTEM167 idle guard failure; native supervision continues")
                 # Peek the queue for async-delegation events. We must NOT
                 # consume watch/completion events here (other drains own them),
                 # so requeue anything that isn't ours.
@@ -26585,7 +26695,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 next_message_type = None
                 if pending_event is not None:
                     next_source = getattr(pending_event, "source", None) or source
-                    if self._is_goal_continuation_event(pending_event) and not self._goal_still_active_for_session(session_id):
+                    if not await self._diggr_accept(pending_event):
+                        return result
+                    if str(pending_event.text or "").startswith("[Continuing toward your standing goal]\nGoal:") and not self._goal_still_active_for_session(session_id):
                         logger.info(
                             "Discarding stale goal continuation for session %s — goal is no longer active",
                             session_key or "?",

@@ -1,0 +1,651 @@
+"""SYSTEM-167 candidate: evidence gate for native Hermes continuation queues.
+
+No scheduler or CMM state. One ticket-bound foreground worker via existing cmux;
+all transitions serialized across processes. One active task per target session.
+"""
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import tempfile
+import time
+from contextlib import contextmanager
+
+PREFIX = '[DIGGR evidence continuation] '
+TERMINAL = {'paused', 'cancelled', 'superseded', 'blocked', 'awaiting_user', 'done'}
+
+
+class Guard:
+    def __init__(self, path):
+        self.path = Path(path)
+        if not self.path.is_absolute():
+            raise ValueError('state path must be absolute')
+
+    @contextmanager
+    def transaction(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with open(str(self.path) + '.lock', 'a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            state = json.loads(self.path.read_text()) if self.path.exists() else {}
+            before = json.dumps(state, sort_keys=True)
+            yield state
+            after = json.dumps(state, sort_keys=True)
+            if before != after:
+                fd, name = tempfile.mkstemp(dir=self.path.parent)
+                try:
+                    with os.fdopen(fd, 'w') as out:
+                        out.write(after + '\n')
+                        out.flush()
+                        os.fsync(out.fileno())
+                    os.replace(name, self.path)
+                    directory = os.open(self.path.parent, os.O_RDONLY)
+                    try:
+                        os.fsync(directory)
+                    finally:
+                        os.close(directory)
+                finally:
+                    if os.path.exists(name):
+                        os.unlink(name)
+
+    def register(self, task, now=None):
+        now = time.time() if now is None else now
+        required = ('task', 'scope', 'identity', 'owner', 'gate', 'action', 'artifact', 'deadline', 'wake_budget')
+        if any(not task.get(key) for key in required):
+            raise ValueError('explicit scope, identity, owner, gate, action, evidence and budget required')
+        identity = task['identity']
+        fields = {'home', 'profile', 'session', 'session_key', 'platform', 'chat_id', 'user_id', 'thread_id'}
+        if set(identity) != fields or any(not identity[k] for k in fields - {'thread_id'}):
+            raise ValueError('incomplete target identity')
+        if identity['platform'] not in {'telegram', 'cli'} or identity['profile'] != 'diggr-main':
+            raise ValueError('unsupported responsible Main')
+        if str(Path(identity['home']).resolve()) != identity['home'] or not Path(task['artifact']).is_absolute():
+            raise ValueError('canonical absolute home and artifact required')
+        if task['deadline'] <= now or not 0 < task['wake_budget'] <= 10:
+            raise ValueError('invalid bounded budget')
+        if Path(task['artifact']).exists():
+            raise ValueError('worker artifact must be a new task-specific path')
+        with self.transaction() as state:
+            if any(Path(r['artifact']).resolve() == Path(task['artifact']).resolve() for r in state.values()):
+                raise ValueError('artifact path already bound to another task; never reuse')
+            if task['task'] in state or any(r['identity'] == identity and r['status'] not in TERMINAL for r in state.values()):
+                raise ValueError('task already registered or session owned; explicitly supersede first')
+            state[task['task']] = dict(task, generation=1, status='running', wakes=0, due=now, lease=0, evidence=None, registered_at=now)
+
+    def get(self, task):
+        with self.transaction() as state:
+            return state.get(task)
+
+    def blocks(self, identity):
+        with self.transaction() as state:
+            return any(r['identity'] == identity and r['status'] not in TERMINAL for r in state.values())
+
+    def control(self, identity, status):
+        if status not in {'paused', 'cancelled', 'superseded'}:
+            raise ValueError('invalid control')
+        with self.transaction() as state:
+            for row in state.values():
+                if row['identity'] == identity and row['status'] not in TERMINAL:
+                    row.update(status=status, generation=row['generation'] + 1)
+
+    @staticmethod
+    def evidence_matches(row, evidence):
+        if not isinstance(evidence, dict):
+            return False
+        if any(evidence.get(k) != row[k] for k in ('task', 'generation', 'action', 'artifact')):
+            return False
+        try:
+            path = Path(row['artifact'])
+            return path.is_file() and hashlib.sha256(path.read_bytes()).hexdigest() == evidence.get('sha256')
+        except OSError:
+            return False
+
+    def observe(self, task, generation, outcome, evidence=None, now=None):
+        now = time.time() if now is None else now
+        with self.transaction() as state:
+            row = state[task]
+            if row['generation'] != generation or row['status'] != 'running':
+                return False
+            if outcome == 'running':
+                return True
+            if outcome not in {'completed', 'unknown'}:
+                raise ValueError('unknown outcome')
+            valid = self.evidence_matches(row, evidence) and evidence.get('result') == 'ready_for_main_review'
+            row.update(owner='main', gate='main_validation' if valid else 'reconcile',
+                       action='validate coding evidence' if valid else 'read-only reconcile unknown outcome; do not repeat effects',
+                       evidence=evidence, generation=generation + 1, status='pending', due=now)
+            return True
+
+    def tick(self, identity, busy=False, now=None):
+        now = time.time() if now is None else now
+        with self.transaction() as state:
+            for row in state.values():
+                if row['identity'] != identity or row['status'] in TERMINAL:
+                    continue
+                if now >= row['deadline']:
+                    row.update(status='blocked', reason='shared deadline exhausted')
+                    continue
+                if busy or row['status'] == 'running':
+                    continue
+                if row['status'] in {'queued', 'executing'}:
+                    if now < row['lease']:
+                        continue
+                    row.update(status='pending', gate='reconcile', generation=row['generation'] + 1,
+                               action='read-only reconcile unknown outcome; do not repeat effects', due=now)
+                if now < row['due']:
+                    continue
+                if row['wakes'] >= row['wake_budget']:
+                    row.update(status='blocked', reason='shared wake budget exhausted')
+                    continue
+                row.update(status='queued', wakes=row['wakes'] + 1, lease=now + min(60, 15 * 2 ** row['wakes']))
+                return dict(row)
+        return None
+
+    def begin(self, identity, wake, now=None):
+        now = time.time() if now is None else now
+        with self.transaction() as state:
+            row = state.get(wake.get('task'))
+            if not row or row['identity'] != identity or row['generation'] != wake.get('generation'):
+                return False
+            if row['status'] != 'queued' or now >= row['deadline']:
+                return False
+            row.update(status='executing', lease=now + 60)
+            return True
+
+    def ack(self, identity, wake, evidence, next_gate, next_action, now=None):
+        now = time.time() if now is None else now
+        if next_gate not in {'main_live', 'awaiting_user', 'done'} or not next_action:
+            raise ValueError('no shipping or Coding dispatch authority')
+        with self.transaction() as state:
+            row = state.get(wake['task'])
+            if not row or row['identity'] != identity or row['status'] != 'executing' or now >= row['deadline']:
+                return False
+            if row['generation'] != wake['generation'] or not self.evidence_matches(row, evidence) or evidence.get('result') != 'validated':
+                return False
+            if next_gate == 'done' and (row['gate'] != 'main_live' or
+                    evidence.get('authorization') != row.get('authorization') or
+                    not row.get('authorization') or evidence.get('final_gate') != 'passed'):
+                return False
+            if next_gate == 'done':
+                try:
+                    final_path = Path(evidence['final_artifact'])
+                    final_bytes = final_path.read_bytes()
+                    final = json.loads(final_bytes)
+                    if (not final_path.is_absolute() or final_path == Path(row['artifact']) or
+                            hashlib.sha256(final_bytes).hexdigest() != evidence.get('final_sha256') or
+                            any(final.get(k) != row.get(k) for k in ('task', 'generation', 'action', 'authorization')) or
+                            final.get('result') != 'passed' or not final.get('checks')):
+                        return False
+                except (KeyError, ValueError, OSError, TypeError):
+                    return False
+            if next_gate == 'awaiting_user' and not evidence.get('human_decision'):
+                return False
+            row.update(generation=row['generation'] + 1, gate=next_gate, action=next_action,
+                       status=next_gate if next_gate in {'done', 'awaiting_user'} else 'pending',
+                       due=now + min(60, 2 ** row['wakes']), evidence=evidence)
+            return True
+
+
+# Native event binding: tools inherit this through the existing executor context.
+from contextvars import ContextVar
+EVENT_CONTEXT = ContextVar('diggr_continuation_event', default=None)
+
+
+def runtime_guard(home=None):
+    from hermes_constants import get_hermes_home, set_hermes_home_override, reset_hermes_home_override
+    from hermes_cli.config import load_config_readonly
+    home = Path(home or get_hermes_home()).resolve()
+    binding = set_hermes_home_override(home)
+    try:
+        cfg = load_config_readonly().get('diggr_continuation', {})
+    finally:
+        reset_hermes_home_override(binding)
+    if not isinstance(cfg, dict):
+        raise ValueError('diggr_continuation must be a mapping')
+    if cfg.get('enabled') is not True:
+        return None
+    if cfg.get('profile') != 'diggr-main' or cfg.get('home') != str(home):
+        raise ValueError('activation requires explicit matching Main profile and resolved home')
+    return Guard(home / 'state' / 'diggr-continuation.json')
+
+
+def digest(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def worker_ticket(row):
+    return {k: row[k] for k in ('task', 'generation', 'identity', 'authorization', 'ticket_nonce')}
+
+
+CMUX = '/Applications/cmux.app/Contents/Resources/bin/cmux'
+
+
+def cmux_snapshot(target):
+    import subprocess
+    # Fixed existing transport; never trust model/env-selected executables or titles.
+    return json.loads(subprocess.check_output([CMUX, '--json', '--id-format', 'both',
+        'top', '--workspace', target['workspace'], '--processes'], text=True, timeout=10))
+
+
+def process_identity(pid):
+    import subprocess
+    parts = subprocess.check_output(['/bin/ps', '-p', str(int(pid)), '-o',
+        'pid=,ppid=,pgid=,tpgid=,tty=,lstart=,comm='], text=True, timeout=5,
+        env={'LC_ALL': 'C', 'TZ': 'UTC'}).split(maxsplit=10)
+    # lstart is localized and timezone-dependent; comm may contain spaces.
+    # Compare the full stable identity, never display formatting from the caller.
+    if len(parts) != 11:
+        raise ValueError('missing/ambiguous OS process identity')
+    return dict(zip(('pid', 'ppid', 'pgid', 'tpgid'), map(int, parts[:4])),
+                tty=parts[4], start=' '.join(parts[5:10]), executable=parts[10].strip().lstrip('-'))
+
+
+def visible_surface(target):
+    from uuid import UUID
+    if set(target) != {'workspace', 'surface'}:
+        raise ValueError('explicit workspace and surface UUIDs required')
+    for value in target.values():
+        if str(UUID(value)).upper() != value.upper():
+            raise ValueError('canonical cmux UUID required')
+    found = []
+    def walk(node, workspace=None):
+        if isinstance(node, dict):
+            if node.get('kind') == 'workspace': workspace = node.get('id')
+            if node.get('kind') == 'surface' and node.get('id', '').upper() == target['surface'].upper():
+                if workspace and workspace.upper() == target['workspace'].upper(): found.append(node)
+            for child in node.values(): walk(child, workspace)
+        elif isinstance(node, list):
+            for child in node: walk(child, workspace)
+    walk(cmux_snapshot(target))
+    if len(found) != 1 or found[0].get('type') != 'terminal' or not found[0].get('tty'):
+        raise ValueError('missing, ambiguous or non-terminal cmux target')
+    return found[0]
+
+
+def bind_visible_target(target):
+    surface = visible_surface(target)
+    roots = surface.get('top_level_pids', [])
+    if len(roots) != 1:
+        raise ValueError('target must have one live root shell')
+    shell = process_identity(roots[0])
+    if (shell['executable'] not in ('/bin/zsh', '/bin/bash') or
+            shell['tty'] != surface['tty'] or shell['pgid'] != shell['pid'] or
+            shell['pid'] not in surface.get('root_pids', [])):
+        raise ValueError('target shell OS/TTY identity mismatch')
+    return dict(target=target, shell={k: shell[k] for k in
+                ('pid', 'ppid', 'pgid', 'tty', 'start', 'executable')})
+
+
+def verify_visible_target(binding, idle=False):
+    actual = bind_visible_target(binding['target'])
+    if actual != binding:
+        # Only registered target and OS binding fields; no environment/argv/state dump.
+        fields = ('pid', 'ppid', 'pgid', 'tty', 'start', 'executable')
+        expected = dict(target={k: binding['target'].get(k) for k in ('surface', 'workspace')},
+                        shell={k: binding['shell'].get(k) for k in fields})
+        raise ValueError('stale cmux shell binding: expected=' + json.dumps(expected, sort_keys=True)
+                         + ' actual=' + json.dumps(actual, sort_keys=True))
+    surface = visible_surface(binding['target'])
+    shell = process_identity(binding['shell']['pid'])
+    if idle and (shell['tpgid'] != shell['pgid'] or
+                 surface.get('foreground_pgids') != [shell['pgid']] or
+                 set(surface.get('tty_process_pids', [])) != {shell['pid']}):
+        raise ValueError('occupied terminal; idle root shell required')
+    return surface, shell
+
+
+def verify_visible_claim(row):
+    if not row.get('visible_sent'):
+        raise ValueError('worker was not sent through registered visible transport')
+    surface, shell = verify_visible_target(row['visible_binding'])
+    current = process_identity(os.getpid())
+    if (current['ppid'] != shell['pid'] or current['tty'] != shell['tty'] or
+            current['pgid'] != current['pid'] or current['tpgid'] != current['pgid'] or
+            shell['tpgid'] != current['pgid'] or
+            current['pid'] not in surface.get('tty_process_pids', []) or
+            surface.get('foreground_pgids') != [current['pgid']]):
+        raise ValueError('claim is not the bound foreground terminal process')
+    if any(not os.isatty(fd) or os.ttyname(fd) != '/dev/' + shell['tty'] for fd in (0, 1, 2)):
+        raise ValueError('worker stdio is not attached to target TTY')
+    if os.tcgetpgrp(0) != os.getpgrp():
+        raise ValueError('worker does not own foreground TTY')
+
+
+def visible_worker_command(ticket):
+    import base64
+    import shlex
+    import sys
+    payload = base64.urlsafe_b64encode(json.dumps(ticket).encode()).decode()
+    source = Path(__file__).resolve()
+    home = ticket['identity']['home']
+    if not Path(home).is_absolute() or str(Path(home).resolve()) != home:
+        raise ValueError('canonical absolute worker home required')
+    # Set before Python startup/native imports. The visible shell's profile and
+    # Python search path are never authority for this registered worker.
+    argv = ['/usr/bin/env', '-u', 'PYTHONHOME', 'HOME=' + home, 'HERMES_HOME=' + home,
+            'PYTHONPATH=' + str(source.parents[1]), 'PYTHONNOUSERSITE=1',
+            'PYTHONDONTWRITEBYTECODE=1', sys.executable, '-B', str(source), '--home', home,
+            'worker', '--payload-b64', payload]
+    # cmux send interprets backslash escapes. Refuse them and control bytes entirely.
+    if any('\\' in word or any(ord(ch) < 32 or ord(ch) == 127 for ch in word) for word in argv):
+        raise ValueError('unsafe terminal transport bytes')
+    return shlex.join(argv)
+
+
+def cmux_send(binding, command):
+    import subprocess
+    verify_visible_target(binding, idle=True)
+    target = binding['target']
+    # One write including Enter; no separate send-key and no hidden fallback.
+    subprocess.run([CMUX, 'send', '--workspace', target['workspace'], '--surface',
+                    target['surface'], '--', command + '\n'], check=True, capture_output=True, timeout=10)
+
+
+def validate_ticket(tasks, ticket):
+    row = tasks.get(ticket.get('task'))
+    if (not row or row['status'] != 'running' or row.get('worker_pid') or
+            time.time() >= row['deadline'] or worker_ticket(row) != ticket):
+        raise ValueError('UNREGISTERED, stale, paused, cancelled, expired or claimed worker ticket; never restart')
+    return row
+
+
+def route_check(row, route, seal=False):
+    bound = row['worker_route']
+    if any(route.get(k) != bound[k] for k in ('packet', 'receipt', 'worktree', 'branch', 'plane_id')):
+        raise ValueError('routing target differs from native authorized ticket')
+    if digest(bound['packet']) != bound['packet_sha256']:
+        raise ValueError('routing packet changed since authorization')
+    if seal or row.get('receipt_sha256'):
+        receipt = json.loads(Path(bound['receipt']).read_text())
+        contract = receipt.get('coding_route_contract', {})
+        if (receipt.get('verdict') != 'allowed' or contract.get('operator_scope_authorized') is not True or
+                contract.get('plane_id') != bound['plane_id'] or
+                receipt.get('route_packet') != bound['packet']):
+            raise ValueError('routing receipt has no authorized passing contract')
+        current = digest(bound['receipt'])
+        if row.get('receipt_sha256') and row['receipt_sha256'] != current:
+            raise ValueError('routing receipt changed after binding')
+        if seal:
+            row['receipt_sha256'] = current
+
+
+def register_native(task):
+    context = EVENT_CONTEXT.get()
+    if not context:
+        raise ValueError('registration requires native Main event context')
+    identity = context['identity']
+    if (identity['platform'], identity['chat_id'], identity['user_id'], identity['thread_id']) != (
+            'telegram', '564628210', '564628210', ''):
+        raise ValueError('unsupported authorized Main target')
+    guard = runtime_guard(identity['home'])
+    if guard is None:
+        raise ValueError('candidate is not activated in native profile config')
+    if not task.get('authorization'):
+        raise ValueError('explicit task authorization reference required')
+    task = dict(task, identity=identity)
+    if task.get('producer') == 'cmux':
+        import secrets
+        route = dict(task['worker_route'])
+        if (not isinstance(route.get('argv'), list) or not route['argv'] or
+                any(not isinstance(a, str) or not a or '\x00' in a for a in route['argv']) or
+                not Path(route['worktree']).is_absolute() or
+                not Path(route['receipt']).is_absolute()):
+            raise ValueError('explicit authorized worker argv and absolute route paths required')
+        packet = json.loads(Path(route['packet']).read_text())
+        if packet.get('operator_scope_authorized') is not True or packet.get('plane_id') != route['plane_id']:
+            raise ValueError('packet scope authorization missing')
+        argv = route['argv']
+        model = packet.get('coding_route', {}).get('required_model')
+        if (Path(argv[0]).name != 'codex' or argv[1:2] != ['exec'] or
+                '--model' not in argv or argv.index('--model') + 1 >= len(argv) or
+                argv[argv.index('--model') + 1] != model):
+            raise ValueError('registered Codex argv must match route executor and model')
+        route['packet_sha256'] = digest(route['packet'])
+        task.update(worker_route=route, ticket_nonce=secrets.token_hex(32),
+                    visible_binding=bind_visible_target(route['visible_target']))
+    guard.register(task)
+    return guard, guard.get(task['task'])
+
+
+def observe_processes(guard):
+    # Existing native registry owns the process; never launch/relaunch here.
+    with guard.transaction() as tasks:
+        rows = [dict(r) for r in tasks.values() if r['status'] == 'running']
+    for row in rows:
+        if row.get('worker_pid'):
+            try:
+                os.kill(row['worker_pid'], 0)
+            except ProcessLookupError:
+                guard.observe(row['task'], row['generation'], 'unknown')
+            continue
+        if row.get('visible_sent_at') and time.time() - row['visible_sent_at'] > 30:
+            guard.observe(row['task'], row['generation'], 'unknown')
+            continue
+        process_id = row.get('process_id')
+        if not process_id:
+            # A launcher that died before binding has unknown outcome, not success.
+            if time.time() > row.get('registered_at', time.time()) + 30:
+                guard.observe(row['task'], row['generation'], 'unknown')
+            continue
+        from tools.process_registry import process_registry
+        session = process_registry.get(process_id)
+        if session is None:
+            guard.observe(row['task'], row['generation'], 'unknown')
+            continue
+        if session.session_key != row['identity']['session_key'] or session.started_at != row['process_started_at']:
+            raise ValueError('native process owner mismatch')
+        process_registry._reconcile_local_exit(session)
+        if not session.exited:
+            continue
+        if row.get('producer') == 'cmux' and session.exit_code == 0:
+            # The actual Coding worker must claim the issued ticket on its visible surface.
+            continue
+        evidence = None
+        artifact = Path(row['artifact'])
+        # A cmux send exit is dispatch evidence only, never Coding completion.
+        if row.get('producer') != 'cmux' and session.exit_code == 0 and artifact.is_file():
+            evidence = {k: row[k] for k in ('task', 'generation', 'action', 'artifact')}
+            evidence.update(sha256=hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                            result='ready_for_main_review', exit_code=session.exit_code,
+                            process_id=process_id)
+        guard.observe(row['task'], row['generation'], 'completed' if evidence else 'unknown', evidence)
+
+
+def terminal_dispatch(args, invoke):
+    if args.get('continuation_ticket') is not None:
+        ticket = args['continuation_ticket']
+        if args.get('command') != 'SYSTEM167_REGISTERED_WORKER' or args.get('continuation'):
+            raise ValueError('structured worker launch accepts no freeform command')
+        guard = runtime_guard(ticket['identity']['home'])
+        if guard is None:
+            raise ValueError('worker candidate inactive')
+        generation = None
+        try:
+            with guard.transaction() as tasks:
+                row = validate_ticket(tasks, ticket)
+                if row.get('visible_sent'):
+                    raise ValueError('visible worker already sent; never resend')
+                generation = row['generation']
+                route_check(row, row['worker_route'])
+                if not row.get('receipt_sha256'):
+                    raise ValueError('worker route receipt not sealed')
+                verify_visible_target(row['visible_binding'], idle=True)
+                command = visible_worker_command(ticket)
+                # Durable reservation before I/O: uncertain delivery is never retried.
+                row.update(visible_sent=True, visible_sent_at=time.time())
+            cmux_send(row['visible_binding'], command)
+            return dict(sent=True, task=row['task'], target=row['visible_binding']['target'])
+        except Exception:
+            if generation is not None:
+                guard.observe(ticket['task'], generation, 'unknown')
+            raise
+    task = args.get('continuation')
+    if task is None:
+        return invoke(args)
+    if not isinstance(task, dict) or task.get('producer') not in {'codex', 'cmux', 'pilot'}:
+        raise ValueError('explicit continuation producer required')
+    if not args.get('background'):
+        raise ValueError('guarded terminal launch requires native background supervision')
+    guard, row = register_native(task)
+    with guard.transaction() as tasks:
+        tasks[row['task']]['registered_at'] = time.time()
+    try:
+        launch = dict(args, notify_on_complete=False)
+        if row.get('producer') == 'cmux':
+            import shlex
+            import sys
+            # Quoted data only. Existing native terminal guards still inspect the command.
+            launch['command'] = ' '.join([
+                'LOOP_CONTROL_CONTINUATION_TICKET=' + shlex.quote(json.dumps(worker_ticket(row))),
+                'LOOP_CONTROL_CONTINUATION_PYTHON=' + shlex.quote(sys.executable), args['command']])
+        result = invoke(launch)
+        data = json.loads(result) if isinstance(result, str) else result
+        process_id = data.get('session_id')
+        if not process_id:
+            raise ValueError('terminal did not return native process identity')
+        from tools.process_registry import process_registry
+        session = process_registry.get(process_id)
+        if session is None or session.session_key != row['identity']['session_key']:
+            raise ValueError('terminal process is not owned by registered native event')
+        with guard.transaction() as tasks:
+            current = tasks[row['task']]
+            current.update(process_id=process_id, process_started_at=session.started_at)
+        observe_processes(guard)
+        data.pop('hint', None)
+        data['continuation'] = dict(task=row['task'], generation=row['generation'],
+                                    state=str(guard.path), automatic_outcome_observation=True)
+        if row.get('producer') == 'cmux':
+            import shlex
+            data['continuation']['worker_ticket'] = worker_ticket(row)
+        return json.dumps(data) if isinstance(result, str) else data
+    except Exception:
+        guard.observe(row['task'], row['generation'], 'unknown')
+        raise
+
+
+def main(argv=None):
+    import argparse
+    parser = argparse.ArgumentParser(description='Evidence-bound native Main receipts')
+    parser.add_argument('--home', required=True)
+    parser.add_argument('operation', choices=['register', 'route-check', 'route-bind', 'worker', 'ack', 'complete', 'status'])
+    payload_options = parser.add_mutually_exclusive_group(required=True)
+    payload_options.add_argument('--payload', help='JSON file')
+    payload_options.add_argument('--payload-json', help='Inline machine-readable JSON')
+    payload_options.add_argument('--payload-b64', help='Trusted terminal transport JSON')
+    args, command = parser.parse_known_args(argv)
+    args.command = command
+    if command and args.operation != 'worker':
+        raise ValueError('unexpected command arguments')
+    import base64
+    payload = json.loads(base64.urlsafe_b64decode(args.payload_b64) if args.payload_b64 is not None
+                         else args.payload_json if args.payload_json is not None else Path(args.payload).read_text())
+    guard = runtime_guard(args.home)
+    if guard is None:
+        raise ValueError('candidate inactive')
+    if args.operation == 'register':
+        # Native terminal subprocess bridge uses existing Hermes session variables.
+        from gateway.session_context import get_session_env
+        keys = dict(platform='PLATFORM', chat_id='CHAT_ID', user_id='USER_ID',
+                    thread_id='THREAD_ID', session='ID', session_key='KEY', profile='PROFILE')
+        identity = {k: get_session_env('HERMES_SESSION_' + v) for k, v in keys.items()}
+        from hermes_constants import get_hermes_home
+        identity['home'] = str(get_hermes_home().resolve())
+        if identity['home'] != str(Path(args.home).resolve()):
+            raise ValueError('CLI registration home differs from native subprocess home')
+        if not EVENT_CONTEXT.get() and all(identity[k] for k in keys if k != 'thread_id'):
+            EVENT_CONTEXT.set(dict(identity=identity))
+        registered_guard, row = register_native(payload)
+        if registered_guard.path != guard.path:
+            raise ValueError('native registration home mismatch')
+        result = row
+    elif args.operation in {'route-check', 'route-bind'}:
+        with guard.transaction() as tasks:
+            row = validate_ticket(tasks, payload['ticket'])
+            route_check(row, payload['route'], seal=args.operation == 'route-bind')
+        result = worker_ticket(row)
+    elif args.operation == 'worker':
+        import subprocess
+        command = args.command[1:] if args.command[:1] == ['--'] else args.command
+        generation = None
+        try:
+            with guard.transaction() as tasks:
+                row = validate_ticket(tasks, payload)
+                route_check(row, row['worker_route'])
+                if not row.get('receipt_sha256'):
+                    raise ValueError('worker route receipt not sealed')
+                authorized = row['worker_route']['argv']
+                if command and command != authorized:
+                    raise ValueError('worker argv differs from authorized scope')
+                command = authorized
+                artifact = Path(row['artifact'])
+                if artifact.exists() or artifact.is_symlink():
+                    raise ValueError('worker artifact already exists; stale evidence refused')
+                generation = row['generation']
+                verify_visible_claim(row)
+                row.update(worker_pid=os.getpid(), worker_started_ns=time.time_ns())
+        except Exception:
+            if generation is not None:
+                guard.observe(payload['task'], generation, 'unknown')
+            raise
+        try:
+            print('SYSTEM167_VISIBLE_WORKER_START ' + json.dumps(dict(task=row['task'], pid=os.getpid(),
+                  binding=row['visible_binding'])), flush=True)
+            completed = subprocess.run(command, check=False, cwd=row['worker_route']['worktree'])
+            artifact = Path(row['artifact'])
+            evidence = None
+            if (completed.returncode == 0 and artifact.is_file() and not artifact.is_symlink() and
+                    artifact.stat().st_mtime_ns >= row['worker_started_ns']):
+                evidence = {k: row[k] for k in ('task', 'generation', 'action', 'artifact')}
+                evidence.update(sha256=hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                                result='ready_for_main_review', exit_code=completed.returncode)
+            guard.observe(row['task'], row['generation'], 'completed' if evidence else 'unknown', evidence)
+            result = dict(exit_code=completed.returncode, task=row['task'], outcome='completed' if evidence else 'unknown')
+            print('SYSTEM167_VISIBLE_WORKER_END ' + json.dumps(result), flush=True)
+        except BaseException:
+            guard.observe(row['task'], row['generation'], 'unknown')
+            raise
+    elif args.operation == 'status':
+        result = guard.get(payload['task'])
+    else:
+        row = guard.get(payload['task'])
+        result = guard.ack(payload['identity'], payload, payload['evidence'],
+                           'done' if args.operation == 'complete' else payload['next_gate'],
+                           payload.get('next_action', 'technical work complete'))
+        if not result:
+            raise ValueError('receipt rejected: stale, unbound, unauthorized or gate incomplete')
+    print(json.dumps({'ok': True, 'result': result}, sort_keys=True))
+    if args.operation == 'worker':
+        return (result['exit_code'] if result['exit_code'] > 0 else 2) if result['outcome'] == 'unknown' else 0
+    return 0
+
+
+def prompt(wake):
+    return PREFIX + json.dumps({'task': wake['task'], 'generation': wake['generation']}) + '\n' + (
+        f"Scope: {wake['scope']}\nOwner/gate: {wake['owner']}/{wake['gate']}\n"
+        f"Pending action: {wake['action']}\nEvidence: {wake['artifact']}\n"
+        'Perform only the authorized action. Notification is not completion. '
+        f'Receipt command: python -m hermes_cli.diggr_continuation --home {__import__("shlex").quote(wake["identity"]["home"])} ack --payload /absolute/receipt.json. '
+        f'Final command: python -m hermes_cli.diggr_continuation --home {__import__("shlex").quote(wake["identity"]["home"])} complete --payload /absolute/final-receipt.json. '
+        'Receipts bind task, generation, identity, evidence(task/generation/action/artifact/sha256/result), next_gate and next_action. '
+        'DONE additionally requires final_gate=passed, registered authorization, final_artifact and final_sha256 in evidence. The separate final JSON binds task/generation/action/authorization, result=passed and nonempty checks; no shipping authority. '
+        'Reconciliation is read-only: inspect recorded state and artifacts; never launch a worker or repeat effects.'
+    )
+
+
+def token(text):
+    if not isinstance(text, str) or not text.startswith(PREFIX):
+        return None
+    try:
+        return json.loads(text[len(PREFIX):].split('\n', 1)[0])
+    except (ValueError, TypeError):
+        return {}  # malformed synthetic input must fail closed
+
+
+if __name__ == '__main__':
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    try:
+        raise SystemExit(main())
+    except (ValueError, KeyError, OSError) as exc:
+        print(json.dumps({'ok': False, 'error': str(exc)}))
+        raise SystemExit(2)

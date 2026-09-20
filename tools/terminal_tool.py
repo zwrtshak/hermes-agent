@@ -3775,7 +3775,22 @@ TERMINAL_SCHEMA = {
 }
 
 
+TERMINAL_SCHEMA['parameters']['properties']['continuation_ticket'] = {
+    'type': 'object',
+    'description': 'Immutable registered Coding ticket from routing prompt. command must be SYSTEM167_REGISTERED_WORKER; trusted cmux transport sends the registered worker to its bound idle terminal; no native background worker.'
+}
+TERMINAL_SCHEMA['parameters']['properties']['continuation'] = {
+    'type': 'object',
+    'description': 'Explicit authorized Main task: task, scope, owner, gate, action, artifact (new absolute output), deadline, wake_budget, authorization, producer (codex/cmux/pilot). Native event binds identity; background=true required. cmux requires worker_route with absolute packet, receipt, worktree, branch, plane_id, visible_target (exact workspace and surface UUIDs) and authorized argv (codex exec --model matching packet). cmux send exit is never worker completion.'
+}
+
+
 def _handle_terminal(args, **kw):
+    from hermes_cli.diggr_continuation import terminal_dispatch
+    return terminal_dispatch(args, lambda bound: _diggr_terminal_native(bound, **kw))
+
+
+def _diggr_terminal_native(args, **kw):
     return terminal_tool(
         command=args.get("command"),
         background=args.get("background", False),
