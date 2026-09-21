@@ -14,8 +14,8 @@ def registered(tmp_path, **overrides):
                 wake_budget=1, authorization='fixture-only')
     task.update(overrides)
     guard = dc.Guard(tmp_path / 'state.json')
-    guard.register(task, now=1)
-    guard.observe('test', 1, 'unknown', now=2)
+    guard.register(task, now=-9)
+    guard.observe('test', 1, 'unknown', now=-8)
     return guard, identity
 
 
@@ -223,7 +223,7 @@ class RenewableEpochTests(unittest.TestCase):
         row=guard.get('test')
         self.assertLessEqual(row['epoch_seconds'],3600)
         self.assertEqual(row['epoch_wakes'],0)
-        self.assertEqual(row['recovery_attempt'],0)
+        self.assertEqual(row['recovery_attempt'],1)
         self.assertNotEqual(row['action_id'],'supplied')
         self.assertNotEqual(row['effect_id'],'supplied')
 

@@ -108,7 +108,8 @@ class Guard:
             'scope', 'task', 'gate', 'action', 'owner', 'identity', 'authorization',
             'generation', 'epoch', 'epoch_wakes', 'wakes', 'evidence',
             'progress_fingerprint', 'effect_status', 'recovery_attempt', 'due',
-            'action_id', 'effect_id', 'worker_route', 'visible_binding', 'worker_identity')}
+            'action_id', 'effect_id', 'worker_route', 'visible_binding', 'worker_identity',
+            'launcher_identity', 'visible_shell_identity')}
 
     @classmethod
     def renew(cls, row, now):
@@ -160,14 +161,20 @@ class Guard:
             row = state[task]
             if row['generation'] != generation or row['status'] != 'running':
                 return False
+            if not self.renew(row, now):
+                return False
             if outcome == 'running':
                 return True
             if outcome not in {'completed', 'unknown'}:
                 raise ValueError('unknown outcome')
             valid = self.evidence_matches(row, evidence) and evidence.get('result') == 'ready_for_main_review'
+            if not valid:
+                row['evidence'] = evidence
+                self.schedule_recovery(row, now, 'unknown or invalid worker outcome')
+                return True
             self.checkpoint(row)
-            row.update(owner='main', gate='main_validation' if valid else 'reconcile',
-                       action='validate coding evidence' if valid else 'read-only reconcile unknown outcome; do not repeat effects',
+            row.update(owner='main', gate='main_validation',
+                       action='validate coding evidence',
                        evidence=evidence, generation=generation + 1, status='pending', due=now)
             return True
 
@@ -316,7 +323,7 @@ class Guard:
                 raise ValueError('prior actual process exit not reconciled')
             if not row.get('visible_binding') or not row.get('worker_route'):
                 raise ValueError('fresh strategy requires the registered visible worker route')
-            verify_visible_target(row['visible_binding'], idle=True)
+            visible_binding = recovery_visible_binding(row)
             route = copy.deepcopy(strategy['worker_route'])
             previous = row['worker_route']
             if route.get('plane_id') != previous['plane_id'] or route.get('visible_target') != previous['visible_target']:
@@ -342,11 +349,14 @@ class Guard:
             fresh = copy.deepcopy(row)
             fresh.update(generation=row['generation'] + 1, status='running', owner='coding', gate='coding',
                          action=strategy['action'], artifact=strategy['artifact'], worker_route=route,
+                         visible_binding=visible_binding,
+                         visible_shell_identity=bound_shell_identity(visible_binding),
                          action_id=uuid.uuid4().hex, effect_id=uuid.uuid4().hex,
                          ticket_nonce=uuid.uuid4().hex, evidence=None, effect_status='unknown',
                          registered_at=now, due=now, lease=0)
             for key in ('worker_pid', 'worker_identity', 'worker_started_ns', 'visible_sent', 'visible_sent_at',
-                        'process_id', 'process_started_at', 'launcher_expected', 'receipt_sha256', 'non_cmm_receipt_sha256'):
+                        'process_id', 'process_started_at', 'launcher_expected', 'launcher_identity',
+                        'receipt_sha256', 'non_cmm_receipt_sha256'):
                 fresh.pop(key, None)
             # Full real route validation before committing new authority.
             preflight_non_cmm(fresh, route)
@@ -376,32 +386,75 @@ def verified_bytes(path, sha256):
     return data
 
 
-def prior_process_exited(row):
+def launcher_identity(session):
+    """Capture native local ownership while the launcher handle is available.
+
+    A short-lived child may already be reaped: its waitable handle still proves
+    exit. A registry flag or a bare PID, including a recovered legacy PID, does
+    not supply that proof. Never inspect a sandbox PID as a host PID.
+    """
     import psutil
+    if session.pid_scope != 'host' or not session.pid:
+        return None
+    handle = session.process or session._pty
+    if handle is None or handle.pid != session.pid:
+        return None
+
+    def exited():
+        return handle.poll() is not None if session.process is not None else not handle.isalive()
+
+    proof = dict(process_id=session.id, session_key=session.session_key,
+                 started_at=session.started_at, pid=session.pid)
+    if exited():
+        return dict(proof, exited=True)
+    try:
+        created = psutil.Process(session.pid).create_time()
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return dict(proof, exited=True) if exited() else None
+    # Recheck the owning handle: don't capture a recycled PID after reaping.
+    return dict(proof, exited=True) if exited() else dict(proof, created=created)
+
+
+def identity_exited(binding):
+    import psutil
+    if (not isinstance(binding, dict) or type(binding.get('pid')) is not int or
+            binding['pid'] <= 0 or type(binding.get('created')) not in (float, int) or
+            not math.isfinite(binding['created']) or binding['created'] <= 0):
+        return False
+    try:
+        return psutil.Process(binding['pid']).create_time() != binding['created']
+    except psutil.NoSuchProcess:
+        return True
+    except psutil.AccessDenied:
+        return False
+
+
+def prior_process_exited(row):
     binding = row.get('worker_identity')
-    if row.get('worker_pid'):
-        if not binding or binding['pid'] != row['worker_pid']:
-            return False  # Legacy PID alone is not identity proof.
-        try:
-            process = psutil.Process(binding['pid'])
-            if process.create_time() == binding['created']:
-                return False
-        except psutil.NoSuchProcess:
-            pass
-        except psutil.AccessDenied:
-            return False
+    if row.get('worker_pid') and (not binding or binding.get('pid') != row['worker_pid'] or
+                                  not identity_exited(binding)):
+        return False  # Legacy PID alone is not identity proof.
     process_id = row.get('process_id')
     if row.get('launcher_expected') and not process_id:
         return False
     if process_id:
         from tools.process_registry import process_registry
         session = process_registry.get(process_id)
-        if (session is None or session.session_key != row['identity']['session_key'] or
-                session.started_at != row['process_started_at']):
-            return False
-        process_registry._reconcile_local_exit(session)
-        if not session.exited:
-            return False
+        if session is not None:
+            if (session.session_key != row['identity']['session_key'] or
+                    session.started_at != row['process_started_at']):
+                return False
+            process_registry._reconcile_local_exit(session)
+        proof = row.get('launcher_identity')
+        if proof:
+            if (proof.get('process_id') != process_id or
+                    proof.get('session_key') != row['identity']['session_key'] or
+                    proof.get('started_at') != row['process_started_at']):
+                return False
+            if proof.get('exited') is not True and not identity_exited(proof):
+                return False
+        elif session is None or not session.exited:
+            return False  # Missing in-memory state is never exit evidence.
     # If no worker claimed, the old generation has already been fenced by
     # observe(). Any delayed terminal command can no longer acquire a claim.
     return True
@@ -513,6 +566,47 @@ def verify_visible_target(binding, idle=False):
                  set(surface.get('tty_process_pids', [])) != {shell['pid']}):
         raise ValueError('occupied terminal; idle root shell required')
     return surface, shell
+
+
+def bound_shell_identity(binding):
+    import psutil
+    pid = binding['shell']['pid']
+    proof = dict(pid=pid, created=psutil.Process(pid).create_time())
+    verify_visible_target(binding, idle=True)
+    return proof
+
+
+def recovery_visible_binding(row):
+    """Rebind only the same authorized surface after the old shell is gone.
+
+    Called only after hashed effect reconciliation and launcher/worker exit.
+    No killing, target discovery, dispatch or reuse of the old route seal.
+    """
+    import psutil
+    binding = row['visible_binding']
+    try:
+        verify_visible_target(binding, idle=True)
+        return binding
+    except ValueError:
+        shell = binding['shell']
+        proof = row.get('visible_shell_identity')
+        if proof:
+            if proof.get('pid') != shell['pid'] or not identity_exited(proof):
+                raise ValueError('prior cmux shell exit not reconciled')
+        else:
+            # Legacy bindings have a full OS start identity, never just a PID.
+            if not shell.get('start'):
+                raise ValueError('prior cmux shell identity missing')
+            try:
+                psutil.Process(shell['pid'])
+                actual = process_identity(shell['pid'])
+                if actual['pid'] != shell['pid'] or actual['start'] == shell['start']:
+                    raise ValueError('prior cmux shell exit not reconciled')
+            except psutil.NoSuchProcess:
+                pass
+        current = bind_visible_target(binding['target'])
+        verify_visible_target(current, idle=True)
+        return current
 
 
 def verify_visible_claim(row):
@@ -737,6 +831,7 @@ def register_native(task):
         route['packet_sha256'] = digest(route['packet'])
         task.update(worker_route=route, ticket_nonce=secrets.token_hex(32),
                     visible_binding=bind_visible_target(route['visible_target']))
+        task['visible_shell_identity'] = bound_shell_identity(task['visible_binding'])
     guard.register(task)
     return guard, guard.get(task['task'])
 
@@ -842,7 +937,8 @@ def terminal_dispatch(args, invoke):
             raise ValueError('terminal process is not owned by registered native event')
         with guard.transaction() as tasks:
             current = tasks[row['task']]
-            current.update(process_id=process_id, process_started_at=session.started_at)
+            current.update(process_id=process_id, process_started_at=session.started_at,
+                           launcher_identity=launcher_identity(session))
         observe_processes(guard)
         data.pop('hint', None)
         data['continuation'] = dict(task=row['task'], generation=row['generation'],

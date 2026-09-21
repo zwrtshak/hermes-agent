@@ -29,7 +29,7 @@ async def test_native_fifo_multiple_epochs_busy_and_control(tmp_path, monkeypatc
     guard.register(dict(task='fixture',scope='temp file only',identity=identity,owner='coding',
         gate='coding',action='verify',artifact=str(home/'artifact'),deadline=1000,wake_budget=1),now=1)
     guard.observe('fixture',1,'unknown',now=2)
-    clock=[3]
+    clock=[guard.get('fixture')['due']]
     monkeypatch.setattr(dc.time,'time',lambda: clock[0])
     seen=[]
     async def consume(event):
@@ -71,7 +71,9 @@ def test_real_cli_retry_receipt_on_temporary_home(tmp_path,monkeypatch):
     guard.register(dict(task='fixture',scope='temp only',identity=identity,owner='coding',
         gate='coding',action='verify',artifact=str(home/'artifact'),deadline=time.time()+60,wake_budget=1))
     guard.observe('fixture',1,'unknown')
-    wake=guard.tick(identity);assert guard.begin(identity,wake)
+    due=guard.get('fixture')['due']
+    assert guard.tick(identity,now=due-1) is None
+    wake=guard.tick(identity,now=due);assert guard.begin(identity,wake,now=due)
     payload=dict(task='fixture',generation=wake['generation'],identity=identity,
                  report=dict(reason='rate_limit',detail='fixture reset',retry_at=time.time()+120))
     result=subprocess.run([sys.executable,'-m','hermes_cli.diggr_continuation','--home',str(home),

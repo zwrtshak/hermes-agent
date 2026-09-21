@@ -21,6 +21,7 @@ def bound(tmp_path, monkeypatch):
     packet.write_text(json.dumps(payload)); route['packet_sha256']=dc.digest(packet)
     row=dict(task='scope-fix',status='running',generation=1,authorization='owner routing',deadline=time.time()+600,artifact=str(tmp_path/'result.md'),worker_route=route,visible_binding={'target':target,'shell':{'pid':12}},identity={'home':str(tmp_path),'profile':'diggr-main','session':'fixture','session_key':'fixture','platform':'telegram','chat_id':'564628210','user_id':'564628210','thread_id':''})
     monkeypatch.setattr(dc,'verify_visible_target',Mock(return_value=({},{})))
+    monkeypatch.setattr(dc,'bound_shell_identity',lambda binding: dict(pid=12,created=1))
     # Source repair must expose this read-only git identity boundary.
     monkeypatch.setattr(dc,'_git_route_identity',lambda path: (str(work), route['branch'], 'a'*40, ''),raising=False)
     return row, route, payload
@@ -256,6 +257,8 @@ def recovery_fixture(bound, monkeypatch, tmp_path):
     with guard.transaction() as tasks:
         tasks[row['task']].update(worker_pid=process.pid, worker_identity=identity)
     guard.observe(row['task'], 1, 'unknown')
+    due = guard.get(row['task'])['due']
+    monkeypatch.setattr(dc.time, 'time', lambda: due)
     wake = guard.tick(row['identity'])
     assert guard.begin(row['identity'], wake)
     current = guard.get(row['task'])
@@ -369,6 +372,8 @@ def test_second_no_progress_strategy_retains_all_effect_history(bound,monkeypatc
     identity=guard.get(wake['task'])['identity']
     first=guard.recover(identity,wake,str(path),dc.digest(path),strategy)
     guard.observe(wake['task'],first['generation'],'unknown')
+    due=guard.get(wake['task'])['due']
+    monkeypatch.setattr(dc.time, 'time', lambda: due)
     second_wake=guard.tick(identity)
     assert guard.begin(identity,second_wake)
     row=guard.get(wake['task'])
