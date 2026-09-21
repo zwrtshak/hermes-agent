@@ -6,6 +6,8 @@ all transitions serialized across processes. One active task per target session.
 import hashlib
 import json
 import os
+import math
+import uuid
 from pathlib import Path
 import tempfile
 import time
@@ -29,6 +31,8 @@ class Guard:
             fcntl.flock(lock, fcntl.LOCK_EX)
             state = json.loads(self.path.read_text(encoding='utf-8')) if self.path.exists() else {}
             before = json.dumps(state, sort_keys=True)
+            for row in state.values():
+                self.normalize(row)
             yield state
             after = json.dumps(state, sort_keys=True)
             if before != after:
@@ -61,7 +65,12 @@ class Guard:
             raise ValueError('unsupported responsible Main')
         if str(Path(identity['home']).resolve()) != identity['home'] or not Path(task['artifact']).is_absolute():
             raise ValueError('canonical absolute home and artifact required')
-        if task['deadline'] <= now or not 0 < task['wake_budget'] <= 10:
+        for field in ('deadline', 'hard_stop', 'authorization_expires_at'):
+            value = task.get(field)
+            if value is not None and (type(value) not in (int, float) or not math.isfinite(value) or value <= now):
+                raise ValueError('finite future execution and authorization bounds required')
+        if (task['deadline'] <= now or type(task['wake_budget']) is not int or
+                not 0 < task['wake_budget'] <= 10):
             raise ValueError('invalid bounded budget')
         if Path(task['artifact']).exists():
             raise ValueError('worker artifact must be a new task-specific path')
@@ -70,7 +79,53 @@ class Guard:
                 raise ValueError('artifact path already bound to another task; never reuse')
             if task['task'] in state or any(r['identity'] == identity and r['status'] not in TERMINAL for r in state.values()):
                 raise ValueError('task already registered or session owned; explicitly supersede first')
-            state[task['task']] = dict(task, generation=1, status='running', wakes=0, due=now, lease=0, evidence=None, registered_at=now)
+            state[task['task']] = dict(task, generation=1, status='running', wakes=0,
+                due=now, lease=0, evidence=None, registered_at=now, schema_version=2,
+                epoch=1, epoch_wakes=0, recovery_attempt=0, progress_fingerprint=None,
+                effect_status='unknown', checkpoint=None, action_id=uuid.uuid4().hex,
+                effect_id=uuid.uuid4().hex, attempt_history=[],
+                epoch_seconds=max(1, min(3600, task['deadline'] - now)))
+            self.normalize(state[task['task']])
+
+    @staticmethod
+    def normalize(row):
+        # Add fields only; never revive historic terminal records.
+        row.setdefault('schema_version', 2)
+        row.setdefault('epoch', 1)
+        row.setdefault('epoch_wakes', row.get('wakes', 0))
+        row.setdefault('recovery_attempt', 0)
+        row.setdefault('progress_fingerprint', None)
+        row.setdefault('effect_status', 'unknown')
+        row.setdefault('checkpoint', None)
+        row.setdefault('action_id', uuid.uuid4().hex)
+        row.setdefault('effect_id', uuid.uuid4().hex)
+        row.setdefault('attempt_history', [])
+        row.setdefault('epoch_seconds', max(1, min(3600, row['deadline'] - row.get('registered_at', row['deadline'] - 300))))
+
+    @staticmethod
+    def checkpoint(row):
+        row['checkpoint'] = {key: row.get(key) for key in (
+            'scope', 'task', 'gate', 'action', 'owner', 'identity', 'authorization',
+            'generation', 'epoch', 'epoch_wakes', 'wakes', 'evidence',
+            'progress_fingerprint', 'effect_status', 'recovery_attempt', 'due',
+            'action_id', 'effect_id', 'worker_route', 'visible_binding', 'worker_identity',
+            'launcher_identity', 'visible_shell_identity')}
+
+    @classmethod
+    def renew(cls, row, now):
+        cls.normalize(row)
+        if row['status'] in TERMINAL:
+            return False
+        for field in ('hard_stop', 'authorization_expires_at'):
+            if row.get(field) is not None and now >= row[field]:
+                cls.checkpoint(row)
+                row.update(status='paused', reason=field, generation=row['generation'] + 1)
+                return False
+        if now >= row['deadline']:
+            cls.checkpoint(row)
+            row.update(epoch=row['epoch'] + 1, epoch_wakes=0,
+                       deadline=now + row['epoch_seconds'])
+        return True
 
     def get(self, task):
         with self.transaction() as state:
@@ -106,13 +161,20 @@ class Guard:
             row = state[task]
             if row['generation'] != generation or row['status'] != 'running':
                 return False
+            if not self.renew(row, now):
+                return False
             if outcome == 'running':
                 return True
             if outcome not in {'completed', 'unknown'}:
                 raise ValueError('unknown outcome')
             valid = self.evidence_matches(row, evidence) and evidence.get('result') == 'ready_for_main_review'
-            row.update(owner='main', gate='main_validation' if valid else 'reconcile',
-                       action='validate coding evidence' if valid else 'read-only reconcile unknown outcome; do not repeat effects',
+            if not valid:
+                row['evidence'] = evidence
+                self.schedule_recovery(row, now, 'unknown or invalid worker outcome')
+                return True
+            self.checkpoint(row)
+            row.update(owner='main', gate='main_validation',
+                       action='validate coding evidence',
                        evidence=evidence, generation=generation + 1, status='pending', due=now)
             return True
 
@@ -122,22 +184,22 @@ class Guard:
             for row in state.values():
                 if row['identity'] != identity or row['status'] in TERMINAL:
                     continue
-                if now >= row['deadline']:
-                    row.update(status='blocked', reason='shared deadline exhausted')
+                if not self.renew(row, now):
                     continue
                 if busy or row['status'] == 'running':
                     continue
                 if row['status'] in {'queued', 'executing'}:
                     if now < row['lease']:
                         continue
-                    row.update(status='pending', gate='reconcile', generation=row['generation'] + 1,
-                               action='read-only reconcile unknown outcome; do not repeat effects', due=now)
+                    self.schedule_recovery(row, row['lease'], 'expired Main lease')
                 if now < row['due']:
                     continue
-                if row['wakes'] >= row['wake_budget']:
-                    row.update(status='blocked', reason='shared wake budget exhausted')
-                    continue
-                row.update(status='queued', wakes=row['wakes'] + 1, lease=now + min(60, 15 * 2 ** row['wakes']))
+                if row['epoch_wakes'] >= row['wake_budget']:
+                    self.checkpoint(row)
+                    row.update(epoch=row['epoch'] + 1, epoch_wakes=0)
+                row.update(status='queued', wakes=row['wakes'] + 1,
+                           epoch_wakes=row['epoch_wakes'] + 1,
+                           lease=now + min(60, 15 * 2 ** min(row['recovery_attempt'], 2)))
                 return dict(row)
         return None
 
@@ -147,7 +209,10 @@ class Guard:
             row = state.get(wake.get('task'))
             if not row or row['identity'] != identity or row['generation'] != wake.get('generation'):
                 return False
-            if row['status'] != 'queued' or now >= row['deadline']:
+            if row['status'] != 'queued' or not self.renew(row, now):
+                return False
+            if now >= row['lease']:
+                self.schedule_recovery(row, row['lease'], 'expired Main lease')
                 return False
             row.update(status='executing', lease=now + 60)
             return True
@@ -158,7 +223,10 @@ class Guard:
             raise ValueError('no shipping or Coding dispatch authority')
         with self.transaction() as state:
             row = state.get(wake['task'])
-            if not row or row['identity'] != identity or row['status'] != 'executing' or now >= row['deadline']:
+            if not row or row['identity'] != identity or row['status'] != 'executing' or row['generation'] != wake['generation'] or not self.renew(row, now):
+                return False
+            if now >= row['lease']:
+                self.schedule_recovery(row, row['lease'], 'expired Main lease')
                 return False
             if row['generation'] != wake['generation'] or not self.evidence_matches(row, evidence) or evidence.get('result') != 'validated':
                 return False
@@ -178,12 +246,220 @@ class Guard:
                         return False
                 except (KeyError, ValueError, OSError, TypeError):
                     return False
-            if next_gate == 'awaiting_user' and not evidence.get('human_decision'):
-                return False
+            if next_gate == 'awaiting_user':
+                blocker = evidence.get('blocker', {})
+                if (not isinstance(blocker, dict) or blocker.get('category') not in
+                        {'credentials', 'identity_authority', 'new_cost', 'destructive_out_of_scope', 'scope_decision'} or
+                        not isinstance(blocker.get('evidence'), str) or not blocker['evidence'].strip()):
+                    return False
+            fingerprint = hashlib.sha256(json.dumps(
+                [next_gate, evidence['sha256']], sort_keys=True).encode()).hexdigest()
+            if next_gate == 'main_live' and fingerprint == row['progress_fingerprint']:
+                self.schedule_recovery(row, now, 'no validated progress')
+                return True
+            self.checkpoint(row)
+            row.update(progress_fingerprint=fingerprint, recovery_attempt=0)
             row.update(generation=row['generation'] + 1, gate=next_gate, action=next_action,
                        status=next_gate if next_gate in {'done', 'awaiting_user'} else 'pending',
-                       due=now + min(60, 2 ** row['wakes']), evidence=evidence)
+                       due=now + 2, evidence=evidence)
             return True
+
+    @classmethod
+    def schedule_recovery(cls, row, now, reason, retry_at=0):
+        cls.checkpoint(row)
+        attempt = row['recovery_attempt'] + 1
+        row.update(status='pending', owner='main', gate='reconcile',
+                   generation=row['generation'] + 1, recovery_attempt=attempt,
+                   action='read-only reconcile prior effects and process exit; prepare fresh bounded strategy',
+                   recovery_reason=reason,
+                   due=max(now + min(300, 5 * 2 ** min(attempt, 6)), retry_at))
+
+    def retry(self, identity, wake, report, now=None):
+        now = time.time() if now is None else now
+        retry_at = report.get('retry_at', 0)
+        if (not isinstance(retry_at, (int, float)) or not math.isfinite(retry_at) or
+                not report.get('reason') or not report.get('detail')):
+            raise ValueError('concrete technical diagnosis and finite reset time required')
+        with self.transaction() as tasks:
+            row = tasks.get(wake['task'])
+            if (not row or row['identity'] != identity or row['status'] != 'executing' or
+                    row['generation'] != wake['generation'] or not self.renew(row, now)):
+                return False
+            if now >= row['lease']:
+                self.schedule_recovery(row, row['lease'], 'expired Main lease')
+                return False
+            self.schedule_recovery(row, now, report, retry_at)
+            return True
+
+    def recover(self, identity, wake, report_path, report_sha256, strategy, now=None):
+        """Issue one fresh strategy ticket after read-only Main reconciliation.
+
+        This never dispatches a worker. Existing preflight and terminal transport
+        remain mandatory. Failed/uncertain effects are not replay permissions.
+        """
+        import copy
+        now = time.time() if now is None else now
+        with self.transaction() as tasks:
+            row = tasks.get(wake['task'])
+            if (not row or row['identity'] != identity or row['generation'] != wake['generation'] or
+                    row['status'] != 'executing' or row['gate'] != 'reconcile' or
+                    now >= row['lease'] or not self.renew(row, now)):
+                raise ValueError('stale or unauthorized reconciliation')
+            report = json.loads(verified_bytes(report_path, report_sha256))
+            if any(report.get(k) != row.get(k) for k in
+                   ('task', 'generation', 'identity', 'action_id', 'effect_id')):
+                raise ValueError('reconciliation identity mismatch')
+            effects = report.get('effects')
+            if (not isinstance(effects, list) or len(effects) != 1 or
+                    effects[0].get('effect_id') != row['effect_id'] or
+                    effects[0].get('status') not in {'no_effect', 'reconciled'}):
+                raise ValueError('unknown effects must never replay')
+            observations = report.get('observations')
+            if not isinstance(observations, list) or not observations:
+                raise ValueError('concrete hashed reconciliation observations required')
+            for observation in observations:
+                verified_bytes(observation['path'], observation['sha256'])
+            if not prior_process_exited(row):
+                raise ValueError('prior actual process exit not reconciled')
+            if not row.get('visible_binding') or not row.get('worker_route'):
+                raise ValueError('fresh strategy requires the registered visible worker route')
+            visible_binding = recovery_visible_binding(row)
+            route = copy.deepcopy(strategy['worker_route'])
+            previous = row['worker_route']
+            if route.get('plane_id') != previous['plane_id'] or route.get('visible_target') != previous['visible_target']:
+                raise ValueError('fresh strategy must preserve scope and exact visible target')
+            old_packet = json.loads(verified_bytes(previous['packet'], previous['packet_sha256']))
+            new_packet = json.loads(verified_bytes(route['packet'], route['packet_sha256']))
+            if new_packet.get('coding_route') != old_packet.get('coding_route'):
+                raise ValueError('fresh strategy must preserve model and action authorization')
+            if not strategy.get('action') or route['argv'][-1] == previous['argv'][-1]:
+                raise ValueError('explicit fresh strategy required; never replay prior action')
+            used = set()
+            for record in tasks.values():
+                for attempt in [record] + record.get('attempt_history', []):
+                    used.add(attempt['artifact'])
+                    used.update(attempt.get('worker_route', {}).get(k) for k in ('packet', 'receipt'))
+            for path in (strategy['artifact'], route['receipt'], route['packet']):
+                target = Path(path)
+                if (not target.is_absolute() or str(target.resolve()) != path or
+                        target.is_symlink() or path in used):
+                    raise ValueError('exclusive fresh canonical artifact/route paths required')
+                if path != route['packet'] and target.exists():
+                    raise ValueError('fresh artifact or receipt already exists')
+            fresh = copy.deepcopy(row)
+            fresh.update(generation=row['generation'] + 1, status='running', owner='coding', gate='coding',
+                         action=strategy['action'], artifact=strategy['artifact'], worker_route=route,
+                         visible_binding=visible_binding,
+                         visible_shell_identity=bound_shell_identity(visible_binding),
+                         action_id=uuid.uuid4().hex, effect_id=uuid.uuid4().hex,
+                         ticket_nonce=uuid.uuid4().hex, evidence=None, effect_status='unknown',
+                         registered_at=now, due=now, lease=0)
+            for key in ('worker_pid', 'worker_identity', 'worker_started_ns', 'visible_sent', 'visible_sent_at',
+                        'process_id', 'process_started_at', 'launcher_expected', 'launcher_identity',
+                        'receipt_sha256', 'non_cmm_receipt_sha256'):
+                fresh.pop(key, None)
+            # Full real route validation before committing new authority.
+            preflight_non_cmm(fresh, route)
+            self.checkpoint(row)
+            fresh['checkpoint'] = row['checkpoint']
+            fresh['checkpoint'].update(effect_status='reconciled', reconciliation_sha256=report_sha256,
+                                       reconciliation_path=report_path)
+            fresh['attempt_history'].append(dict(artifact=row['artifact'], worker_route=previous,
+                action_id=row['action_id'], effect_id=row['effect_id'],
+                reconciliation_sha256=report_sha256, effect_status='reconciled'))
+            # Reservation survives a crash before state commit: never reuse uncertain paths.
+            with open(strategy['artifact'] + '.reservation', 'x', encoding='utf-8') as reservation:
+                json.dump(dict(task=row['task'], action_id=fresh['action_id'], effect_id=fresh['effect_id']), reservation)
+                reservation.flush()
+                os.fsync(reservation.fileno())
+            tasks[row['task']] = fresh
+            return worker_ticket(fresh)
+
+
+def verified_bytes(path, sha256):
+    candidate = Path(path)
+    if not candidate.is_absolute() or candidate.is_symlink() or str(candidate.resolve()) != str(candidate):
+        raise ValueError('canonical non-symlink evidence required')
+    data = candidate.read_bytes()
+    if hashlib.sha256(data).hexdigest() != sha256:
+        raise ValueError('evidence hash mismatch')
+    return data
+
+
+def launcher_identity(session):
+    """Capture native local ownership while the launcher handle is available.
+
+    A short-lived child may already be reaped: its waitable handle still proves
+    exit. A registry flag or a bare PID, including a recovered legacy PID, does
+    not supply that proof. Never inspect a sandbox PID as a host PID.
+    """
+    import psutil
+    if session.pid_scope != 'host' or not session.pid:
+        return None
+    handle = session.process or session._pty
+    if handle is None or handle.pid != session.pid:
+        return None
+
+    def exited():
+        return handle.poll() is not None if session.process is not None else not handle.isalive()
+
+    proof = dict(process_id=session.id, session_key=session.session_key,
+                 started_at=session.started_at, pid=session.pid)
+    if exited():
+        return dict(proof, exited=True)
+    try:
+        created = psutil.Process(session.pid).create_time()
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return dict(proof, exited=True) if exited() else None
+    # Recheck the owning handle: don't capture a recycled PID after reaping.
+    return dict(proof, exited=True) if exited() else dict(proof, created=created)
+
+
+def identity_exited(binding):
+    import psutil
+    if (not isinstance(binding, dict) or type(binding.get('pid')) is not int or
+            binding['pid'] <= 0 or type(binding.get('created')) not in (float, int) or
+            not math.isfinite(binding['created']) or binding['created'] <= 0):
+        return False
+    try:
+        return psutil.Process(binding['pid']).create_time() != binding['created']
+    except psutil.NoSuchProcess:
+        return True
+    except psutil.AccessDenied:
+        return False
+
+
+def prior_process_exited(row):
+    binding = row.get('worker_identity')
+    if row.get('worker_pid') and (not binding or binding.get('pid') != row['worker_pid'] or
+                                  not identity_exited(binding)):
+        return False  # Legacy PID alone is not identity proof.
+    process_id = row.get('process_id')
+    if row.get('launcher_expected') and not process_id:
+        return False
+    if process_id:
+        from tools.process_registry import process_registry
+        session = process_registry.get(process_id)
+        if session is not None:
+            if (session.session_key != row['identity']['session_key'] or
+                    session.started_at != row['process_started_at']):
+                return False
+            process_registry._reconcile_local_exit(session)
+        proof = row.get('launcher_identity')
+        if proof:
+            if (proof.get('process_id') != process_id or
+                    proof.get('session_key') != row['identity']['session_key'] or
+                    proof.get('started_at') != row['process_started_at']):
+                return False
+            if proof.get('exited') is not True and not identity_exited(proof):
+                return False
+        elif session is None or (launcher_identity(session) or {}).get('exited') is not True:
+            # Native stdout EOF may set session.exited while the child lives.
+            # Legacy recovery needs the matching local handle's actual exit.
+            return False
+    # If no worker claimed, the old generation has already been fenced by
+    # observe(). Any delayed terminal command can no longer acquire a claim.
+    return True
 
 
 # Native event binding: tools inherit this through the existing executor context.
@@ -294,6 +570,47 @@ def verify_visible_target(binding, idle=False):
     return surface, shell
 
 
+def bound_shell_identity(binding):
+    import psutil
+    pid = binding['shell']['pid']
+    proof = dict(pid=pid, created=psutil.Process(pid).create_time())
+    verify_visible_target(binding, idle=True)
+    return proof
+
+
+def recovery_visible_binding(row):
+    """Rebind only the same authorized surface after the old shell is gone.
+
+    Called only after hashed effect reconciliation and launcher/worker exit.
+    No killing, target discovery, dispatch or reuse of the old route seal.
+    """
+    import psutil
+    binding = row['visible_binding']
+    try:
+        verify_visible_target(binding, idle=True)
+        return binding
+    except ValueError:
+        shell = binding['shell']
+        proof = row.get('visible_shell_identity')
+        if proof:
+            if proof.get('pid') != shell['pid'] or not identity_exited(proof):
+                raise ValueError('prior cmux shell exit not reconciled')
+        else:
+            # Legacy bindings have a full OS start identity, never just a PID.
+            if not shell.get('start'):
+                raise ValueError('prior cmux shell identity missing')
+            try:
+                psutil.Process(shell['pid'])
+                actual = process_identity(shell['pid'])
+                if actual['pid'] != shell['pid'] or actual['start'] == shell['start']:
+                    raise ValueError('prior cmux shell exit not reconciled')
+            except psutil.NoSuchProcess:
+                pass
+        current = bind_visible_target(binding['target'])
+        verify_visible_target(current, idle=True)
+        return current
+
+
 def verify_visible_claim(row):
     if not row.get('visible_sent'):
         raise ValueError('worker was not sent through registered visible transport')
@@ -344,7 +661,7 @@ def cmux_send(binding, command):
 def validate_ticket(tasks, ticket):
     row = tasks.get(ticket.get('task'))
     if (not row or row['status'] != 'running' or row.get('worker_pid') or
-            time.time() >= row['deadline'] or worker_ticket(row) != ticket):
+            worker_ticket(row) != ticket or not Guard.renew(row, time.time())):
         raise ValueError('UNREGISTERED, stale, paused, cancelled, expired or claimed worker ticket; never restart')
     return row
 
@@ -364,7 +681,7 @@ def _git_route_identity(worktree):
             git('rev-parse', 'HEAD'), git('status', '--porcelain'))
 
 
-def preflight_non_cmm(row, route, *, check_idle=True):
+def preflight_non_cmm(row, route, *, check_idle=True, legacy_expiry=None):
     """Validate a native-ticket-bound route without CMM or context measurement.
 
     Returns evidence, not authority: only route-preflight under validate_ticket
@@ -374,7 +691,7 @@ def preflight_non_cmm(row, route, *, check_idle=True):
     fields = ('packet', 'receipt', 'worktree', 'branch', 'plane_id', 'argv', 'visible_target')
     if any(route.get(k) != bound.get(k) for k in fields):
         raise ValueError('non-CMM route differs from native ticket')
-    if not row.get('authorization') or time.time() >= row['deadline']:
+    if not row.get('authorization') or not Guard.renew(row, time.time()):
         raise ValueError('non-CMM authorization missing or expired')
     for field in ('packet', 'receipt', 'worktree'):
         path = Path(bound[field])
@@ -428,16 +745,20 @@ def preflight_non_cmm(row, route, *, check_idle=True):
     if bound['visible_target'] != row['visible_binding']['target']:
         raise ValueError('visible target differs from registered binding')
     verify_visible_target(row['visible_binding'], idle=check_idle)
+    expires_at = (legacy_expiry if legacy_expiry is not None else
+                  min((row[k] for k in ('hard_stop', 'authorization_expires_at')
+                       if row.get(k) is not None), default=None))
     proof = dict(task=row['task'], generation=row['generation'],
                  authorization=row['authorization'], identity=row['identity'],
                  artifact=row['artifact'], argv=argv, binding=row['visible_binding'],
                  packet_sha256=bound['packet_sha256'], worktree=actual_root,
-                 branch=branch, head=head, expires_at=row['deadline'])
+                 branch=branch, head=head, expires_at=expires_at)
     fingerprint = hashlib.sha256(json.dumps(proof, sort_keys=True).encode()).hexdigest()
-    return dict(schema_version='diggr.native.non_cmm_route.v1', mode='non_cmm',
+    return dict(schema_version=('diggr.native.non_cmm_route.v1' if legacy_expiry is not None
+                                else 'diggr.native.non_cmm_route.v2'), mode='non_cmm',
                 verdict='allowed', route_packet=bound['packet'],
                 packet_sha256=bound['packet_sha256'], task=row['task'],
-                generation=row['generation'], expires_at=row['deadline'],
+                generation=row['generation'], expires_at=expires_at,
                 binding_sha256=fingerprint,
                 coding_route_contract=dict(contract, plane_id=bound['plane_id'],
                                            operator_scope_authorized=True))
@@ -458,7 +779,12 @@ def route_check(row, route, seal=False):
         if packet.get('routing_mode') == 'non_cmm':
             if row.get('non_cmm_receipt_sha256') != digest(receipt_path):
                 raise ValueError('non-CMM receipt not issued by native preflight')
-            expected = preflight_non_cmm(row, bound, check_idle=False)
+            # PR9's sealed deadline was an execution deadline, not user expiry.
+            # Only accept the old format when its bytes were already sealed.
+            legacy = (receipt.get('expires_at') if
+                      receipt.get('schema_version') == 'diggr.native.non_cmm_route.v1' and
+                      row.get('receipt_sha256') == digest(receipt_path) else None)
+            expected = preflight_non_cmm(row, bound, check_idle=False, legacy_expiry=legacy)
             if receipt != expected:
                 raise ValueError('non-CMM receipt stale or mismatched')
         contract = receipt.get('coding_route_contract', {})
@@ -507,6 +833,7 @@ def register_native(task):
         route['packet_sha256'] = digest(route['packet'])
         task.update(worker_route=route, ticket_nonce=secrets.token_hex(32),
                     visible_binding=bind_visible_target(route['visible_target']))
+        task['visible_shell_identity'] = bound_shell_identity(task['visible_binding'])
     guard.register(task)
     return guard, guard.get(task['task'])
 
@@ -518,7 +845,7 @@ def observe_processes(guard):
     for row in rows:
         if row.get('worker_pid'):
             import psutil
-            if not psutil.pid_exists(row['worker_pid']):
+            if (not psutil.pid_exists(row['worker_pid']) or prior_process_exited(row)):
                 guard.observe(row['task'], row['generation'], 'unknown')
             continue
         if row.get('visible_sent_at') and time.time() - row['visible_sent_at'] > 30:
@@ -591,7 +918,7 @@ def terminal_dispatch(args, invoke):
         raise ValueError('guarded terminal launch requires native background supervision')
     guard, row = register_native(task)
     with guard.transaction() as tasks:
-        tasks[row['task']]['registered_at'] = time.time()
+        tasks[row['task']].update(registered_at=time.time(), launcher_expected=True)
     try:
         launch = dict(args, notify_on_complete=False)
         if row.get('producer') == 'cmux':
@@ -612,7 +939,8 @@ def terminal_dispatch(args, invoke):
             raise ValueError('terminal process is not owned by registered native event')
         with guard.transaction() as tasks:
             current = tasks[row['task']]
-            current.update(process_id=process_id, process_started_at=session.started_at)
+            current.update(process_id=process_id, process_started_at=session.started_at,
+                           launcher_identity=launcher_identity(session))
         observe_processes(guard)
         data.pop('hint', None)
         data['continuation'] = dict(task=row['task'], generation=row['generation'],
@@ -630,7 +958,7 @@ def main(argv=None):
     import argparse
     parser = argparse.ArgumentParser(description='Evidence-bound native Main receipts')
     parser.add_argument('--home', required=True)
-    parser.add_argument('operation', choices=['register', 'route-check', 'route-bind', 'route-preflight', 'worker', 'ack', 'complete', 'status'])
+    parser.add_argument('operation', choices=['register', 'route-check', 'route-bind', 'route-preflight', 'worker', 'ack', 'complete', 'status', 'retry', 'recover'])
     payload_options = parser.add_mutually_exclusive_group(required=True)
     payload_options.add_argument('--payload', help='JSON file')
     payload_options.add_argument('--payload-json', help='Inline machine-readable JSON')
@@ -702,7 +1030,9 @@ def main(argv=None):
                     raise ValueError('worker artifact already exists; stale evidence refused')
                 generation = row['generation']
                 verify_visible_claim(row)
-                row.update(worker_pid=os.getpid(), worker_started_ns=time.time_ns())
+                import psutil
+                row.update(worker_pid=os.getpid(), worker_started_ns=time.time_ns(),
+                           worker_identity=dict(pid=os.getpid(), created=psutil.Process().create_time()))
         except Exception:
             if generation is not None:
                 guard.observe(payload['task'], generation, 'unknown')
@@ -710,7 +1040,8 @@ def main(argv=None):
         try:
             print('SYSTEM167_VISIBLE_WORKER_START ' + json.dumps(dict(task=row['task'], pid=os.getpid(),
                   binding=row['visible_binding'])), flush=True)
-            completed = subprocess.run(command, check=False, cwd=row['worker_route']['worktree'])
+            completed = subprocess.run(command, check=False, cwd=row['worker_route']['worktree'],
+                                       timeout=row['epoch_seconds'])
             artifact = Path(row['artifact'])
             evidence = None
             if (completed.returncode == 0 and artifact.is_file() and not artifact.is_symlink() and
@@ -724,6 +1055,13 @@ def main(argv=None):
         except BaseException:
             guard.observe(row['task'], row['generation'], 'unknown')
             raise
+    elif args.operation == 'recover':
+        result = guard.recover(payload['identity'], payload, payload['report_path'],
+                               payload['report_sha256'], payload['strategy'])
+    elif args.operation == 'retry':
+        result = guard.retry(payload['identity'], payload, payload['report'])
+        if not result:
+            raise ValueError('stale or unauthorized technical retry')
     elif args.operation == 'status':
         result = guard.get(payload['task'])
     else:
@@ -748,7 +1086,13 @@ def prompt(wake):
         f'Final command: python -m hermes_cli.diggr_continuation --home {__import__("shlex").quote(wake["identity"]["home"])} complete --payload /absolute/final-receipt.json. '
         'Receipts bind task, generation, identity, evidence(task/generation/action/artifact/sha256/result), next_gate and next_action. '
         'DONE additionally requires final_gate=passed, registered authorization, final_artifact and final_sha256 in evidence. The separate final JSON binds task/generation/action/authorization, result=passed and nonempty checks; no shipping authority. '
-        'Reconciliation is read-only: inspect recorded state and artifacts; never launch a worker or repeat effects.'
+        'Reconciliation is read-only: inspect prior effects and actual process exit. Unknown effects never replay. '
+        'For technical failures use retry with report(reason/detail/retry_at optional), never awaiting_user. '
+        'Only credentials, identity_authority, new_cost, destructive_out_of_scope or scope_decision with concrete blocker evidence permit awaiting_user. '
+        'After reconciliation use recover with report_path/report_sha256 and strategy(action/artifact/worker_route); '
+        'the report binds task/generation/identity/action_id/effect_id, effects and hashed observations. '
+        'Recover issues one fresh ticket; run route-preflight and existing registered terminal transport. No manual reset or provider fallback. '
+        f"Action/effect IDs: {wake.get('action_id')}/{wake.get('effect_id')}. Epoch: {wake.get('epoch')}. "
     )
 
 
