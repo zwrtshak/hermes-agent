@@ -453,8 +453,10 @@ def prior_process_exited(row):
                 return False
             if proof.get('exited') is not True and not identity_exited(proof):
                 return False
-        elif session is None or not session.exited:
-            return False  # Missing in-memory state is never exit evidence.
+        elif session is None or (launcher_identity(session) or {}).get('exited') is not True:
+            # Native stdout EOF may set session.exited while the child lives.
+            # Legacy recovery needs the matching local handle's actual exit.
+            return False
     # If no worker claimed, the old generation has already been fenced by
     # observe(). Any delayed terminal command can no longer acquire a claim.
     return True
