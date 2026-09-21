@@ -26,7 +26,7 @@ Use this skill when all of the following are true:
 - an implementer submitted a `review_requested` handoff;
 - the task needs an independent verdict before it can be completed.
 
-Do not use it for a separate downstream review card. A downstream card is ordinary implementation work with a review-oriented specification and completes through its own lifecycle.
+Independent review defaults to this same-card cycle. Do not create separate repair/re-review cards or a reviewer that owns autonomous repair recursion. Pre-created downstream QA/release children are valid, but release only after final PASS/done of the reviewed implementation card.
 
 ## Prerequisites
 
@@ -70,7 +70,7 @@ The baseline duties in the Procedure section still apply on every round; the len
 
 ### Lens variation for ad-hoc review fan-outs
 
-The same principle applies outside the Kanban review lane. When spawning multiple parallel reviewers via `delegate_task`, give each reviewer a different lens — one diff-only brief, one full-context brief, one checkout-and-run brief — rather than identical briefs. Identical briefs produce correlated verdicts and duplicate findings; varied briefs cover more defect classes for the same review spend.
+The same principle applies outside the Kanban review lane. Outside a dispatcher-owned review run, when spawning multiple parallel reviewers via `delegate_task`, give each reviewer a different lens — one diff-only brief, one full-context brief, one checkout-and-run brief — rather than identical briefs. Identical briefs produce correlated verdicts and duplicate findings; varied briefs cover more defect classes for the same review spend.
 
 ## Procedure
 
@@ -146,7 +146,8 @@ Use escalation only when the reviewer and implementer cannot resolve the problem
 
 ```text
 kanban_block(
-    reason="escalation: <decision or prerequisite required>"
+    reason="escalation: <decision or prerequisite required>",
+    kind="needs_input"  # or dependency/capability for an external prerequisite
 )
 ```
 
@@ -154,7 +155,7 @@ Explain the blocked decision and the smallest information needed to continue.
 
 ### 4. Preserve role separation
 
-Do not edit the implementation while acting as reviewer. Request changes and let the implementer produce the next candidate; then independently verify that candidate in the next review run.
+A claim from review is review-only for its entire run, even after a handoff. Do not edit the implementation (including through terminal), spawn repairs/subtasks, delegate, or request nested review. Read/test and attach evidence; request_changes returns precise findings to the original implementer without human intervention. Stop after that transition. The implementer produces the next candidate and requests a fresh review run. Never alternate reviewer and implementer inside one run.
 
 ## Pitfalls
 

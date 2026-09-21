@@ -1314,6 +1314,12 @@ def handle_function_call(
                 disabled_toolsets=disabled_toolsets,
             )
 
+    from tools.kanban_tools import review_tool_rejection
+
+    role_error = review_tool_rejection(function_name, function_args)
+    if role_error:
+        return _return_bridge_result(role_error)
+
     _tool_original_args = dict(function_args)
     if not skip_tool_request_middleware:
         try:

@@ -6182,6 +6182,8 @@ def request_review(
                 "(worker ownership) or force=True (explicit operator "
                 "override) instead of clearing the live run's claim",
             )
+        if _retry_status_for_run(conn, task_id, trow["current_run_id"]) == "review":
+            return _ret(False, "review-only run: use request_changes or complete, not nested review")
         implementer = trow["assignee"]
         if reviewer is None:
             changes_run = conn.execute(
@@ -8745,6 +8747,57 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # failure and are NOT crashes, so they stay out of the ``crashed`` return.
     detect_crashed_workers._last_rate_limited = rate_limited  # type: ignore[attr-defined]
     return crashed
+
+
+def record_iteration_exhaustion(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_run_id: int,
+    summary: Optional[str],
+    budget_used: int,
+    budget_max: int,
+) -> bool:
+    """Checkpoint deterministic loop exhaustion without retrying unchanged work.
+
+    Unlike process timeouts, another identical claim cannot cure this failure.
+    A sticky block requires explicit recovery after scope/checkpoint changes.
+    Run ownership is mandatory: a late finalizer must not close a successor.
+    """
+    error = (
+        f"Iteration budget exhausted ({budget_used}/{budget_max}) — "
+        "task could not complete within the allowed iterations"
+    )
+    summary = redact_review_value(summary)
+    with write_txn(conn):
+        task = get_task(conn, task_id)
+        if (
+            task is None
+            or task.status != "running"
+            or task.current_run_id != expected_run_id
+        ):
+            return False
+        metadata = {
+            "budget_used": budget_used,
+            "budget_max": budget_max,
+            "retry_status": _retry_status_for_run(conn, task_id, expected_run_id),
+            "automatic_retry": False,
+        }
+        conn.execute(
+            "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL, "
+            "consecutive_failures = consecutive_failures + 1, last_failure_error = ? "
+            "WHERE id = ?", (error, task_id),
+        )
+        run_id = _end_run(
+            conn, task_id, outcome="iteration_exhausted", status="blocked",
+            summary=summary, error=error, metadata=metadata,
+        )
+        _append_event(conn, task_id, "iteration_exhausted", metadata, run_id=run_id)
+        _append_event(conn, task_id, "blocked", {
+            **metadata, "reason": error, "trigger_outcome": "iteration_exhausted",
+        }, run_id=run_id)
+    return True
 
 
 def _record_task_failure(

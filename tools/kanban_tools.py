@@ -100,6 +100,43 @@ def _reject_delegated_child_mutation(tool_name: str) -> Optional[str]:
     )
 
 
+def review_tool_rejection(tool_name: str, args: dict) -> Optional[str]:
+    """Enforce review role from the worker's original claim, not live status.
+
+    Resolve against the dispatcher's board, never a model-supplied board.
+    The original run remains review-only even after request_changes hands the
+    card to a successor. Read/test and evidence tools remain available.
+    """
+    restricted = {
+        "kanban_create", "kanban_link", "kanban_request_review",
+        "write_file", "patch", "delegate_task", "cronjob", "execute_code",
+    }
+    if tool_name not in restricted and tool_name != "kanban_block":
+        return None
+    tid = os.environ.get("HERMES_KANBAN_TASK")
+    if not tid or not _is_dispatcher_owned_worker():
+        return None
+    try:
+        kb, conn = _connect()
+        try:
+            review_only = kb._retry_status_for_run(conn, tid, _worker_run_id(tid)) == "review"
+        finally:
+            conn.close()
+    except Exception:
+        return tool_error("Cannot verify Kanban worker role; refusing role-changing tool")
+    if not review_only:
+        return None
+    if tool_name == "kanban_block" and args.get("kind") in {
+        "dependency", "needs_input", "capability",
+    }:
+        return None
+    return tool_error(
+        f"{tool_name} refused: review-only run. Read/test and attach evidence; "
+        "use kanban_request_changes for technical defects or kanban_complete "
+        "for PASS. Block only for a genuine external dependency with an explicit kind."
+    )
+
+
 def _check_kanban_mode() -> bool:
     """Task-lifecycle tools are available when:
 
@@ -816,6 +853,9 @@ def _handle_complete(args: dict, **kw) -> str:
 
 def _handle_block(args: dict, **kw) -> str:
     """Transition the task to blocked with a reason a human will read."""
+    role_error = review_tool_rejection("kanban_block", args)
+    if role_error:
+        return role_error
     delegated_err = _reject_delegated_child_mutation("kanban_block")
     if delegated_err:
         return delegated_err
@@ -897,6 +937,9 @@ def _handle_block(args: dict, **kw) -> str:
 
 def _handle_request_review(args: dict, **kw) -> str:
     """Move implementation into the first-class review phase."""
+    role_error = review_tool_rejection("kanban_request_review", args)
+    if role_error:
+        return role_error
     delegated_err = _reject_delegated_child_mutation("kanban_request_review")
     if delegated_err:
         return delegated_err
@@ -1346,6 +1389,9 @@ def _handle_create(args: dict, **kw) -> str:
     ``parents`` can be a list of task ids; dependency-gated promotion
     works as usual.
     """
+    role_error = review_tool_rejection("kanban_create", args)
+    if role_error:
+        return role_error
     delegated_err = _reject_delegated_child_mutation("kanban_create")
     if delegated_err:
         return delegated_err
@@ -1639,6 +1685,9 @@ def _handle_unblock(args: dict, **kw) -> str:
 
 def _handle_link(args: dict, **kw) -> str:
     """Add a parent→child dependency edge after the fact."""
+    role_error = review_tool_rejection("kanban_link", args)
+    if role_error:
+        return role_error
     delegated_err = _reject_delegated_child_mutation("kanban_link")
     if delegated_err:
         return delegated_err
