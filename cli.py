@@ -11467,6 +11467,36 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             resolved_key = event_key
         return str(resolved_key) == current_key
 
+    def _diggr_cli_tick(self, consume=None):
+        from hermes_cli.diggr_continuation import runtime_guard, prompt, token
+        from hermes_constants import get_hermes_home
+        guard = runtime_guard()
+        if guard is None:
+            return True if consume is not None else False
+        # CLI registration supplies an explicit identity; no inferred Telegram route.
+        with guard.transaction() as tasks:
+            targets = [r['identity'] for r in tasks.values()
+                       if r['identity']['platform'] == 'cli'
+                       and r['identity']['session'] == self.session_id
+                       and r['identity']['home'] == str(get_hermes_home().resolve())]
+        if not targets:
+            return token(consume) is None if consume is not None else False
+        identity = targets[-1]
+        if consume is not None:
+            controls = {'/stop': 'paused', '/goal pause': 'paused', '/goal clear': 'cancelled',
+                        'stop': 'paused', 'stopp': 'paused', 'pause': 'paused', 'cancel': 'cancelled',
+                        'abbrechen': 'cancelled', '/new': 'superseded', '/reset': 'superseded'}
+            if isinstance(consume, str) and consume.strip().casefold() in controls:
+                guard.control(identity, controls[consume.strip().casefold()])
+            wake = token(consume)
+            return wake is None or guard.begin(identity, wake)
+        if getattr(self, '_last_turn_interrupted', False):
+            guard.control(identity, 'paused')
+        wake = guard.tick(identity, busy=self._agent_running or not self._pending_input.empty())
+        if wake:
+            self._pending_input.put(prompt(wake))
+        return guard.blocks(identity)
+
     def _drain_process_notifications(self, consumer: str) -> None:
         """Queue background notifications owned by this visible CLI session.
 
@@ -11481,6 +11511,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             complete_event_delivery,
         )
 
+        try:
+            self._diggr_cli_tick()
+        except Exception:
+            logger.exception("SYSTEM167 CLI guard failure; native notifications continue")
         session_key = getattr(self, "session_id", "") or ""
         for event, synthetic_message in process_registry.drain_notifications(
             session_key=session_key,
@@ -11537,6 +11571,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         The empty-response skip mirrors the gateway guard at
         ``_handle_message`` in ``gateway/run.py``.
         """
+        if self._diggr_cli_tick():
+            return
         mgr = self._get_goal_manager()
         if mgr is None or not mgr.is_active():
             return
@@ -18299,6 +18335,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                                 self._drain_process_notifications("cli-idle")
                             except Exception:
                                 pass
+                        continue
+
+                    if not self._diggr_cli_tick(consume=user_input):
                         continue
 
                     fresh_context_internal = False
