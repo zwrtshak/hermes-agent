@@ -88,6 +88,39 @@ def test_native_recovery_preserves_action_and_launcher_without_dispatch(native_r
     with pytest.raises(ValueError): dc.maintenance_control(request(r))
 
 
+@pytest.mark.parametrize('missing_identity', [False, True])
+def test_native_recovery_after_restart_requires_persisted_absent_processes(native_recovery, missing_identity):
+    import psutil
+    r = native_recovery
+    process = psutil.Process
+    def absent_process(pid):
+        if pid in r.processes:
+            return process(pid)
+        raise psutil.NoSuchProcess(pid)
+    r.monkeypatch.setattr(psutil, 'Process', absent_process)
+    with r.guard.transaction() as rows:
+        row = rows[r.task['task']]
+        row['launcher_identity']['created'] = 500.0
+        if missing_identity:
+            row['launcher_identity'].pop('created')
+    r.registry.get = lambda key: None
+    r.evidence = report(r)
+    before = r.row()['policy'].copy()
+    if missing_identity:
+        with pytest.raises(ValueError, match='persisted native launcher identity'):
+            dc.maintenance_control(request(r))
+        assert r.row()['policy'] == before
+        assert not Path(r.strategy['artifact'] + '.reservation').exists()
+    else:
+        ticket = dc.maintenance_control(request(r))
+        assert ticket['task'] == r.task['task']
+        after = r.row()['policy']
+        assert after['recoveries'] == before['recoveries'] + 1
+        assert {k: v for k, v in after.items() if k != 'recoveries'} == {k: v for k, v in before.items() if k != 'recoveries'}
+        assert not r.row().get('visible_sent')
+    dc.cmux_send.assert_not_called()
+
+
 @pytest.mark.parametrize('change', ['action', 'argv', 'packet', 'old-target', 'launcher', 'hash', 'legacy-effects'])
 def test_recovery_rejects_incompatible_or_incomplete_donor_contract(native_recovery, change):
     r = native_recovery

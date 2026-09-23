@@ -288,6 +288,7 @@ def test_codex_home_binds_native_environment_not_caller(bound, monkeypatch, tmp_
     monkeypatch.setattr(dc, 'runtime_guard', lambda home: guard)
     monkeypatch.setattr(dc, 'bind_visible_target', lambda target: row['visible_binding'])
     monkeypatch.delenv('CODEX_HOME', raising=False)
+    monkeypatch.setenv('HOME', str(tmp_path / 'native-user'))
     if native_home:
         monkeypatch.setenv('CODEX_HOME', str(tmp_path / 'native-codex'))
     task = dict(row, task='native-binding', scope='fixture only', owner='coding', gate='coding',
@@ -304,9 +305,34 @@ def test_codex_home_binds_native_environment_not_caller(bound, monkeypatch, tmp_
         assert ticket['codex_home'] == str(tmp_path / 'native-codex')
         assert 'CODEX_HOME=' + ticket['codex_home'] in command
     else:
-        assert 'codex_home' not in ticket
-        assert not any(word.startswith('CODEX_HOME=') for word in command)
+        assert ticket['codex_home'] == str(tmp_path / 'native-user' / '.codex')
+        assert 'CODEX_HOME=' + ticket['codex_home'] in command
     assert not (tmp_path / 'native-codex').exists()  # No auth/config contents are accessed.
+
+
+@pytest.mark.parametrize('pinned', [False, True])
+def test_visible_worker_keeps_native_codex_home_across_profile_home_change(bound, monkeypatch, tmp_path, pinned):
+    import os
+    import shlex
+    import subprocess
+    import sys
+    row, _, _ = bound
+    monkeypatch.setenv('HOME', str(tmp_path / 'native-user'))
+    monkeypatch.delenv('CODEX_HOME', raising=False)
+    ticket = dc.worker_ticket(row)
+    expected = str(tmp_path / 'native-user' / '.codex')
+    if pinned:
+        expected = str(tmp_path / 'pinned-codex')
+        ticket['codex_home'] = expected
+    argv = shlex.split(dc.visible_worker_command(ticket))
+    # Execute the actual generated environment prefix, never the worker or Codex.
+    probe = argv[:argv.index(sys.executable)] + [sys.executable, '-c',
+        "import os,json; print(json.dumps({k:os.environ[k] for k in ('HOME','HERMES_HOME','CODEX_HOME')}))"]
+    shell_env = dict(os.environ, HOME=str(tmp_path / 'other-shell'), CODEX_HOME=str(tmp_path / 'wrong-codex'))
+    result = subprocess.run(probe, env=shell_env, check=True, text=True, capture_output=True)
+    assert json.loads(result.stdout) == dict(HOME=row['identity']['home'],
+        HERMES_HOME=row['identity']['home'], CODEX_HOME=expected)
+    assert not Path(expected).exists()  # Credentials/config are neither read nor copied.
 
 
 @pytest.mark.parametrize('operation', ['route-preflight', 'route-check', 'route-bind'])

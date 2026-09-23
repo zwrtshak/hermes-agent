@@ -223,6 +223,11 @@ class Guard:
                     continue
                 if not self.renew(row, now):
                     continue
+                if (busy and row['status'] == 'executing' and now < row['lease'] and
+                        row.get('coordinator_turns', {}).get(str(row['generation']), {}).get('status') == 'accepted'):
+                    # Native watcher still observes this accepted coordinator turn.
+                    # Never revive an expired/finished turn or extend owner bounds.
+                    row['lease'] = min(now + 60, row['deadline'], row['policy']['deadline'])
                 if busy or row['status'] == 'running':
                     continue
                 if row['status'] in {'queued', 'executing'}:
@@ -473,7 +478,11 @@ class Guard:
                 raise ValueError('prior effects unknown; recovery refused')
             if report['outcome'] == 'reconciled' and not report.get('effect_proof'):
                 raise ValueError('reconciled effects require proof')
-            verify_prior_exit(row)
+            from tools.process_registry import process_registry
+            if process_registry.get(row.get('process_id')) is None:
+                verify_restarted_reservation_exit(row)
+            else:
+                verify_prior_exit(row)
             worker_action = row.get('worker_action')
             checkpoint = row.get('checkpoint') or {}
             if not worker_action and checkpoint.get('gate') == 'coding':
@@ -1153,8 +1162,10 @@ def visible_worker_command(ticket):
             'PYTHONPATH=' + str(source.parents[1]), 'PYTHONNOUSERSITE=1',
             'PYTHONDONTWRITEBYTECODE=1', sys.executable, '-B', str(source), '--home', home,
             'worker', '--payload-b64', payload]
-    if ticket.get('codex_home'):
-        argv.insert(3, 'CODEX_HOME=' + canonical_path(ticket['codex_home']))
+    # Resolve before HOME becomes the Hermes profile. Legacy tickets also need
+    # the originating runtime's default, never the target shell's credentials.
+    codex_home = ticket.get('codex_home') or os.environ.get('CODEX_HOME') or str(Path.home().resolve() / '.codex')
+    argv.insert(3, 'CODEX_HOME=' + canonical_path(codex_home))
     # cmux send interprets backslash escapes. Refuse them and control bytes entirely.
     if any('\\' in word or any(ord(ch) < 32 or ord(ch) == 127 for ch in word) for word in argv):
         raise ValueError('unsafe terminal transport bytes')
@@ -1351,8 +1362,7 @@ def register_native(task):
                 argv[argv.index('--model') + 1] != model):
             raise ValueError('registered Codex argv must match route executor and model')
         task.pop('codex_home', None)  # Only the originating native environment may bind it.
-        if os.environ.get('CODEX_HOME'):
-            task['codex_home'] = canonical_path(os.environ['CODEX_HOME'])
+        task['codex_home'] = canonical_path(os.environ.get('CODEX_HOME') or str(Path.home().resolve() / '.codex'))
         route['packet_sha256'] = digest(route['packet'])
         task.update(worker_route=route, ticket_nonce=secrets.token_hex(32),
                     visible_binding=bind_visible_target(route['visible_target']))

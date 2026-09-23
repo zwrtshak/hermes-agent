@@ -89,6 +89,37 @@ class GuardTests(unittest.TestCase):
         self.assertIsNone(self.g.tick(self.identity, busy=True, now=20))
         self.assertIsNotNone(self.g.tick(self.identity, now=21))
 
+    def test_active_native_coordinator_keeps_lease_without_new_wake(self):
+        self.completed()
+        wake = self.g.tick(self.identity, now=20)
+        self.assertTrue(self.g.begin(self.identity, wake, now=21))
+        before = self.g.get(self.task['task'])
+        for now in (40, 80, 120):
+            self.assertIsNone(self.g.tick(self.identity, busy=True, now=now))
+        row = self.g.get(self.task['task'])
+        self.assertEqual(row['generation'], wake['generation'])
+        self.assertEqual(row['policy'], before['policy'])
+        self.assertGreater(row['lease'], 120)
+        receipt = self.evidence(wake['generation'], 'validated')
+        receipt['action'] = wake['action']
+        self.assertTrue(self.g.ack(self.identity, wake, receipt, 'main_live', 'check result', now=121))
+
+    def test_busy_signal_cannot_revive_expired_or_finished_turn(self):
+        self.completed()
+        wake = self.g.tick(self.identity, now=20)
+        self.assertTrue(self.g.begin(self.identity, wake, now=21))
+        for finished in (False, True):
+            with self.subTest(finished=finished):
+                with self.g.transaction() as rows:
+                    row = rows[self.task['task']]
+                    row['lease'] = 81
+                    row['coordinator_turns'][str(wake['generation'])]['status'] = 'response_produced' if finished else 'accepted'
+                now = 40 if finished else 90
+                self.g.tick(self.identity, busy=True, now=now)
+                self.assertEqual(self.g.get(self.task['task'])['lease'], 81)
+        self.g.tick(dict(self.identity, session='other'), busy=True, now=40)
+        self.assertEqual(self.g.get(self.task['task'])['lease'], 81)
+
     def test_concurrent_locked_ticks_one_wake(self):
         self.completed()
         with concurrent.futures.ThreadPoolExecutor(4) as pool:
