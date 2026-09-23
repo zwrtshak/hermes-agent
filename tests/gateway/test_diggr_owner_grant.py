@@ -343,3 +343,74 @@ async def test_unconfirmed_launcher_command_never_reaches_executor(route):
     with pytest.raises(ValueError, match='exact owner-confirmed command'):
         dc.terminal_dispatch(dict(command='different launcher', background=True, continuation=task), invoke)
     invoke.assert_not_called()
+
+
+async def confirmed_cmux(r, monkeypatch, *, pin_packet=False):
+    import json
+    packet = r.tmp / 'packet.json'
+    packet.write_text(json.dumps(dict(operator_scope_authorized=True, plane_id='fixture',
+                                     coding_route=dict(required_model='fixture-model'))))
+    worker_route = dict(packet=str(packet), receipt=str(r.tmp / 'receipt.json'),
+        worktree=str(r.tmp), branch='fixture-branch', plane_id='fixture',
+        argv=['/tools/codex', 'exec', '--model', 'fixture-model', 'bounded fixture work'],
+        visible_target=dict(workspace='fixture-workspace', surface='fixture-surface'))
+    if pin_packet:
+        worker_route['packet_sha256'] = dc.digest(packet)
+    task = dict(r.task, producer='cmux', launcher_command='fixture launcher', worker_route=worker_route)
+    proposal = manifest(task)
+    bid, _, _ = await confirm(r, proposal)
+    with r.guard.transaction() as rows:
+        identity = copy.deepcopy(rows.grants['batches'][bid]['coordinator_identity'])
+    # Only the external terminal/OS boundary is supplied by this fixture.
+    monkeypatch.setattr(dc, 'bind_visible_target', lambda target: dict(target=target, shell=dict(pid=123)))
+    monkeypatch.setattr(dc, 'bound_shell_identity', lambda binding: dict(pid=123, created=1))
+    return dict(task, owner_batch=bid, owner_issue=owner.issue_key(proposal['todos'][0])), identity
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('pin_packet', [False, True])
+async def test_confirmed_cmux_native_registration_seals_packet(route, monkeypatch, pin_packet):
+    r = route
+    task, identity = await confirmed_cmux(r, monkeypatch, pin_packet=pin_packet)
+    original = copy.deepcopy(task)
+    token = dc.EVENT_CONTEXT.set(dict(identity=identity))
+    try:
+        _, registered = dc.register_native(task)
+    finally:
+        dc.EVENT_CONTEXT.reset(token)
+    assert task == original
+    assert registered['worker_route']['packet_sha256'] == dc.digest(task['worker_route']['packet'])
+    assert registered['policy']['batch'] == task['owner_batch']
+    with r.guard.transaction() as rows:
+        batch = rows.grants['batches'][task['owner_batch']]
+        assert batch['manifest']['todos'][0]['contract'] == owner.contract(original)
+        assert batch['tasks'] == {task['owner_issue']: task['task']}
+    from pathlib import Path
+    Path(task['worker_route']['packet']).write_text('{}')
+    with pytest.raises(ValueError, match='routing packet changed'):
+        dc.route_check(registered, registered['worker_route'])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('changed', ['action', 'argv', 'worktree', 'launcher', 'extra_route', 'pinned_packet'])
+async def test_confirmed_cmux_rejects_changed_owner_contract(route, monkeypatch, changed):
+    import json
+    from pathlib import Path
+    r = route
+    task, identity = await confirmed_cmux(r, monkeypatch, pin_packet=changed == 'pinned_packet')
+    before = r.guard.path.read_bytes()
+    if changed == 'action': task['action'] = 'different action'
+    if changed == 'argv': task['worker_route']['argv'][-1] = 'different work'
+    if changed == 'worktree': task['worker_route']['worktree'] = str(r.tmp / 'different')
+    if changed == 'launcher': task['launcher_command'] = 'different launcher'
+    if changed == 'extra_route': task['worker_route']['unconfirmed'] = 'different authority'
+    if changed == 'pinned_packet':
+        path = Path(task['worker_route']['packet'])
+        path.write_text(json.dumps(dict(json.loads(path.read_text()), altered=True)))
+    token = dc.EVENT_CONTEXT.set(dict(identity=identity))
+    try:
+        with pytest.raises(ValueError, match='task differs from owner-confirmed'):
+            dc.register_native(task)
+    finally:
+        dc.EVENT_CONTEXT.reset(token)
+    assert r.guard.path.read_bytes() == before

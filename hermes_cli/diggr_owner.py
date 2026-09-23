@@ -221,7 +221,15 @@ def bind(rows, task, now):
     if not batch or batch['owner'] != stable_owner(task['identity']) or batch['revoked']:
         raise ValueError('confirmed native owner batch required')
     todo = next((t for t in batch['manifest']['todos'] if issue_key(t) == key), None)
-    if not todo or todo['contract'] != contract(task):
+    actual = contract(task)
+    # Native registration adds this seal; it is not an executor-selected route field.
+    # Preserve exact comparison when an older confirmed proposal already pinned it.
+    if (todo and actual['producer'] == 'cmux' and
+            isinstance(todo['contract']['worker_route'], dict) and
+            isinstance(actual['worker_route'], dict) and
+            'packet_sha256' not in todo['contract']['worker_route']):
+        actual['worker_route'] = {k: v for k, v in actual['worker_route'].items() if k != 'packet_sha256'}
+    if not todo or todo['contract'] != actual:
         raise ValueError('task differs from owner-confirmed logical Todo contract')
     if key in batch['tasks']:
         raise ValueError('logical Todo already admitted; alias/session cannot reset budget')
