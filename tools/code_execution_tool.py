@@ -367,9 +367,9 @@ _TOOL_STUBS = {
     ),
     "terminal": (
         "terminal",
-        "command: str, timeout: int = None, workdir: str = None",
+        "command: str, timeout: int = None, workdir: str = None, continuation: dict = None, continuation_ticket: dict = None, continuation_control: dict = None, continuation_proposal: dict = None, completion_receipt: str = None",
         '"""Run a shell command (foreground only). Returns dict with "output" and "exit_code"."""',
-        '{"command": command, "timeout": timeout, "workdir": workdir}',
+        '{"command": command, "timeout": timeout, "workdir": workdir, "continuation": continuation, "continuation_ticket": continuation_ticket, "continuation_control": continuation_control, "continuation_proposal": continuation_proposal, "completion_receipt": completion_receipt}',
     ),
 }
 

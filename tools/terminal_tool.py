@@ -2531,6 +2531,7 @@ def terminal_tool(
     pty: bool = False,
     notify_on_complete: bool = False,
     watch_patterns: Optional[List[str]] = None,
+    completion_receipt: Optional[str] = None,
 ) -> str:
     """
     Execute a command in the configured terminal environment.
@@ -2575,6 +2576,20 @@ def terminal_tool(
                 "error": f"Invalid command: expected string, got {type(command).__name__}",
                 "status": "error",
             }, ensure_ascii=False)
+
+        receipt_binding = None
+        receipt_schedule = None
+        if completion_receipt is not None:
+            from gateway.session_context import completion_launch_context
+            from agent.delegation_context import is_delegated_child_context
+            native = completion_launch_context.get()
+            if (not background or not isinstance(completion_receipt, str)
+                    or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,63}', completion_receipt)
+                    or native is None or is_delegated_child_context()):
+                return json.dumps({"error": "completion_receipt requires a safe task label and background launch in a native Telegram Main turn", "exit_code": -1})
+            receipt_binding = dict(native[0], task=completion_receipt)
+            receipt_schedule = native[1]
+            notify_on_complete = True
 
         # Get configuration
         config = _get_env_config()
@@ -2764,6 +2779,8 @@ def terminal_tool(
         from tools.approval import get_current_session_key
 
         session_key = get_current_session_key(default="") or (task_id or "")
+        if receipt_binding is not None and session_key != receipt_binding['session_key']:
+            return json.dumps({"error": "completion_receipt launch owner mismatch", "exit_code": -1})
 
         # Hard-block: gateway lifecycle commands (systemctl/launchctl/hermes
         # restart|stop targeting hermes-gateway) must never run inside the
@@ -2994,6 +3011,7 @@ def terminal_tool(
                         session_key=session_key,
                         env_vars=env.env if hasattr(env, 'env') else None,
                         use_pty=effective_pty,
+                        **({"completion_receipt": receipt_binding} if receipt_binding is not None else {}),
                     )
                 else:
                     proc_session = process_registry.spawn_via_env(
@@ -3002,6 +3020,7 @@ def terminal_tool(
                         cwd=effective_cwd,
                         task_id=effective_task_id,
                         session_key=session_key,
+                        **({"completion_receipt": receipt_binding} if receipt_binding is not None else {}),
                     )
 
                 result_data = {
@@ -3196,7 +3215,7 @@ def terminal_tool(
                     # turn.  CLI mode uses the completion_queue directly.
                     if proc_session.watcher_platform:
                         proc_session.watcher_interval = 5
-                        process_registry.pending_watchers.append({
+                        watcher = {
                             "session_id": proc_session.id,
                             "check_interval": 5,
                             "session_key": session_key,
@@ -3207,7 +3226,13 @@ def terminal_tool(
                             "thread_id": proc_session.watcher_thread_id,
                             "message_id": proc_session.watcher_message_id,
                             "notify_on_complete": True,
-                        })
+                        }
+                        if receipt_binding is not None:
+                            watcher['_receipt_process'] = proc_session
+                            receipt_schedule(watcher)
+                            result_data['completion_receipt'] = completion_receipt
+                        else:
+                            process_registry.pending_watchers.append(watcher)
 
                 # Set watch patterns for output monitoring
                 if watch_patterns and background:
@@ -3759,6 +3784,11 @@ TERMINAL_SCHEMA = {
                 "description": "Run in pseudo-terminal (PTY) mode for interactive CLI tools like Codex, Claude Code, or Python REPL. Only works with local and SSH backends. Default: false.",
                 "default": False
             },
+            "completion_receipt": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$",
+                "description": "Opt-in safe task label for a direct completion receipt in the ORIGINAL native Telegram Main chat/topic. Requires background=true; forces notify_on_complete. Unavailable in CLI or delegated children. Receipt means process exit, not task acceptance."
+            },
             "notify_on_complete": {
                 "type": "boolean",
                 "description": "With background=true: get exactly one notification when the process exits. The right choice for nearly every bounded long task — set it and keep working. MUTUALLY EXCLUSIVE with watch_patterns (watch_patterns is dropped when both are set).",
@@ -3775,7 +3805,98 @@ TERMINAL_SCHEMA = {
 }
 
 
+TERMINAL_SCHEMA['parameters']['properties']['continuation_proposal'] = {
+    'type': 'object',
+    'description': 'Proposal only, never a grant. command=SYSTEM167_PROPOSE_OWNER_BATCH. Native owner must show and separately confirm its immutable hash; no shell execution.',
+    'properties': {
+        'budgets': {'type': 'object', 'properties': {
+            'todo_seconds': {'type': 'integer', 'enum': [3600]},
+            'batch_seconds': {'type': 'integer', 'enum': [7200]},
+            'wakes': {'type': 'integer', 'enum': [10]},
+            'recoveries': {'type': 'integer', 'enum': [2]},
+            'corrections': {'type': 'integer', 'enum': [2]},
+        }, 'required': ['todo_seconds', 'batch_seconds', 'wakes', 'recoveries', 'corrections'], 'additionalProperties': False},
+        'todos': {'type': 'array', 'minItems': 1, 'maxItems': 4, 'items': {
+            'type': 'object', 'properties': {
+                'workspace_id': {'type': 'string', 'format': 'uuid'},
+                'project_id': {'type': 'string', 'format': 'uuid'},
+                'issue_id': {'type': 'string', 'format': 'uuid'},
+                'contract': {'type': 'object', 'properties': {
+                    'scope': {'type': 'string'}, 'action': {'type': 'string'},
+                    'owner': {'type': 'string'}, 'gate': {'type': 'string'},
+                    'producer': {'type': ['string', 'null']},
+                    'worker_route': {'type': ['object', 'null']},
+                    'launcher_command': {'type': ['string', 'null']}
+                }, 'required': ['scope', 'action', 'owner', 'gate', 'producer', 'worker_route', 'launcher_command'], 'additionalProperties': False},
+                'depends_on': {'type': 'array', 'items': {'type': 'string'}},
+                'gates': {'type': 'array', 'items': {'type': 'string'},
+                          'description': 'Exactly owner_confirmed, native_checks, prior_done in that order.'}
+            }, 'required': ['workspace_id', 'project_id', 'issue_id', 'contract', 'depends_on', 'gates'], 'additionalProperties': False}},
+        'replaces': {'type': ['string', 'null']}
+    }, 'required': ['budgets', 'todos', 'replaces'], 'additionalProperties': False
+}
+
+TERMINAL_SCHEMA['parameters']['properties']['continuation_ticket'] = {
+    'type': 'object',
+    'description': 'Immutable registered Coding ticket from routing prompt. command must be SYSTEM167_REGISTERED_WORKER; trusted cmux transport sends the registered worker to its bound idle terminal; no native background worker.'
+}
+TERMINAL_SCHEMA['parameters']['properties']['continuation_control'] = {
+    'type': 'object',
+    'description': 'Bound native Main maintenance; command must be SYSTEM168_CONTINUATION_CONTROL. No shell execution. authorize/revoke/failure/recover/retire require the originating native Main event; recover may use its exact unexpired one-use maintenance grant. Retirement only discharges proven terminal ownership, never success or dispatch.',
+    'properties': {
+        'operation': {'type': 'string', 'enum': ['authorize', 'revoke', 'failure', 'recover', 'retire']},
+        'wake': {'type': 'object', 'properties': {
+            'task': {'type': 'string'}, 'generation': {'type': 'integer', 'minimum': 1}
+        }, 'required': ['task', 'generation']},
+        'evidence': {'type': 'object', 'properties': {
+            'path': {'type': 'string'}, 'sha256': {'type': 'string'}
+        }, 'required': ['path', 'sha256']},
+        'strategy': {'type': 'object', 'properties': {
+            'kind': {'type': 'string', 'enum': ['technical', 'review']},
+            'reason': {'type': 'string'}, 'hypothesis': {'type': 'string'},
+            'artifact': {'type': 'string'}, 'worker_route': {'type': 'object'}
+        }, 'required': ['kind', 'reason', 'hypothesis', 'artifact', 'worker_route']},
+        'expires': {'type': 'number'},
+        'maintenance': {'type': 'object'},
+        'identity': {'type': 'object'}
+    },
+    'required': ['operation', 'wake']
+}
+TERMINAL_SCHEMA['parameters']['properties']['continuation'] = {
+    'type': 'object',
+    'properties': {
+        'owner_batch': {'type': 'string'}, 'owner_issue': {'type': 'string'},
+        'launcher_command': {'type': 'string'},
+        'producer': {'type': 'string', 'enum': ['cmux']},
+        'task': {'type': 'string'}, 'scope': {'type': 'string'},
+        'owner': {'type': 'string'}, 'gate': {'type': 'string'},
+        'action': {'type': 'string'}, 'artifact': {'type': 'string'},
+        'deadline': {'type': 'number'},
+        'wake_budget': {'type': 'integer', 'minimum': 1, 'maximum': 10},
+        'authorization': {'type': 'string'},
+        'worker_route': {'type': 'object', 'properties': {
+            'packet': {'type': 'string'}, 'receipt': {'type': 'string'},
+            'worktree': {'type': 'string'}, 'branch': {'type': 'string'},
+            'plane_id': {'type': 'string'},
+            'visible_target': {'type': 'object', 'properties': {
+                'workspace': {'type': 'string'}, 'surface': {'type': 'string'}
+            }, 'required': ['workspace', 'surface']},
+            'argv': {'type': 'array', 'items': {'type': 'string'}, 'minItems': 1}
+        }, 'required': ['packet', 'receipt', 'worktree', 'branch', 'plane_id', 'visible_target', 'argv']}
+    },
+    'required': ['owner_batch', 'owner_issue', 'launcher_command', 'producer', 'task',
+                 'scope', 'owner', 'gate', 'action', 'artifact', 'deadline',
+                 'wake_budget', 'authorization', 'worker_route'],
+    'description': 'Persisted native owner grant required: owner_batch and owner_issue (workspace/project/issue UUID path). No executor authorization text can mint authority. Explicit authorized Main task: task, scope, owner, gate, action, artifact (new absolute output), deadline, wake_budget, authorization, producer=cmux. Native event binds identity; background=true required. cmux requires worker_route with absolute packet, receipt, worktree, branch, plane_id, visible_target (exact workspace and surface UUIDs) and authorized argv (codex exec --model matching packet). cmux send exit is never worker completion.'
+}
+
+
 def _handle_terminal(args, **kw):
+    from hermes_cli.diggr_continuation import terminal_dispatch
+    return terminal_dispatch(args, lambda bound: _diggr_terminal_native(bound, **kw))
+
+
+def _diggr_terminal_native(args, **kw):
     return terminal_tool(
         command=args.get("command"),
         background=args.get("background", False),
@@ -3785,6 +3906,7 @@ def _handle_terminal(args, **kw):
         workdir=args.get("workdir"),
         pty=args.get("pty", False),
         notify_on_complete=args.get("notify_on_complete", False),
+        completion_receipt=args.get("completion_receipt"),
         watch_patterns=args.get("watch_patterns"),
     )
 

@@ -1,5 +1,7 @@
 """Focused tests for API server session-control endpoints."""
 
+import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -8,6 +10,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
+from gateway.turn_lease import SessionTurnLeaseRegistry
 from hermes_state import SessionDB
 
 
@@ -49,6 +52,58 @@ def _create_session_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post("/api/sessions/{session_id}/chat", adapter._handle_session_chat)
     app.router.add_post("/api/sessions/{session_id}/chat/stream", adapter._handle_session_chat_stream)
     return app
+
+
+@pytest.mark.asyncio
+async def test_session_chat_waits_for_gateway_turn_lease_before_loading_history(
+    auth_adapter, session_db
+):
+    adapter = auth_adapter
+    session_id = session_db.create_session("shared-mira", "telegram")
+    session_key = "agent:main:telegram:dm:test"
+    leases = SessionTurnLeaseRegistry()
+    adapter.gateway_runner = SimpleNamespace(_turn_leases=leases)
+    holder = await leases.acquire(
+        session_id, owner_key=session_key, generation=1, timeout=1
+    )
+    history_loaded = asyncio.Event()
+
+    async def load_history(_session_id):
+        history_loaded.set()
+        return []
+
+    adapter._conversation_history_for_session = load_history
+    adapter._run_agent = AsyncMock(
+        return_value=({"final_response": "Mira", "session_id": session_id}, {})
+    )
+    app = _create_session_app(adapter)
+    try:
+        async with TestClient(TestServer(app)) as cli:
+            request_task = asyncio.create_task(
+                cli.post(
+                    f"/api/sessions/{session_id}/chat",
+                    headers={
+                        "Authorization": "Bearer sk-test",
+                        "X-Hermes-Session-Key": session_key,
+                    },
+                    json={"message": "voice turn"},
+                )
+            )
+            for _ in range(100):
+                if leases._leases[session_id].pending_acquires == 1:
+                    break
+                await asyncio.sleep(0.01)
+            assert leases._leases[session_id].pending_acquires == 1
+            assert not history_loaded.is_set()
+            assert not request_task.done()
+            assert leases.release(holder) is True
+            response = await asyncio.wait_for(request_task, timeout=1)
+            assert response.status == 200
+    finally:
+        leases.release(holder)
+
+    assert history_loaded.is_set()
+    adapter._run_agent.assert_awaited_once()
 
 
 @pytest.mark.asyncio

@@ -1024,6 +1024,7 @@ class TestKillProcess:
         s = _make_session(sid="proc_detached", command="sleep 999")
         s.pid = 424242
         s.detached = True
+        s.host_start_time = 12345
         registry._running[s.id] = s
 
         terminate_calls = []
@@ -1047,6 +1048,7 @@ class TestKillProcess:
             # SIGKILL-escalation step (grace=0) so it doesn't call
             # ``psutil.wait_procs`` on the FakeProcess.
             with patch("gateway.status._pid_exists", return_value=True), \
+                 patch.object(ProcessRegistry, "_safe_host_start_time", return_value=12345), \
                  patch.object(ProcessRegistry, "_daemon_term_grace_seconds",
                               staticmethod(lambda: 0.0)), \
                  patch.object(_psutil, "Process", side_effect=lambda pid: FakeProcess(pid)):
@@ -1056,6 +1058,32 @@ class TestKillProcess:
             assert ("terminate", 424242) in terminate_calls
         finally:
             registry._running.pop(s.id, None)
+
+
+    @pytest.mark.parametrize("recorded,current,expected", [
+        (None, 12345, "error"),
+        (12345, None, "error"),
+        (12345, 67890, "already_exited"),
+    ])
+    def test_detached_unknown_or_reused_identity_never_signaled(self, registry, recorded, current, expected):
+        session = _make_session(sid="proc_identity_fixture")
+        session.pid = 424242
+        session.detached = True
+        session.host_start_time = recorded
+        registry._running[session.id] = session
+        with patch("gateway.status._pid_exists", return_value=True), \
+             patch.object(ProcessRegistry, "_safe_host_start_time", return_value=current), \
+             patch.object(ProcessRegistry, "_terminate_host_pid") as terminate, \
+             patch("psutil.Process") as process, patch("os.kill") as kill:
+            result = registry.kill_process(session.id)
+        assert result["status"] == expected
+        terminate.assert_not_called()
+        process.assert_not_called()
+        kill.assert_not_called()
+        if expected == "error":
+            assert "identity is unknown" in result["error"]
+            assert not session.exited
+
 
 
 # =========================================================================

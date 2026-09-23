@@ -724,3 +724,19 @@ async def test_thread_fallback_only_fires_once():
     # The key point: the message was delivered despite the invalid thread
 
 
+
+
+@pytest.mark.asyncio
+async def test_completion_strict_topic_never_sends_to_root():
+    adapter = _make_adapter()
+    calls = []
+    async def send_message(**kwargs):
+        calls.append(kwargs)
+        if kwargs.get('message_thread_id'):
+            raise FakeBadRequest('Message thread not found')
+        return SimpleNamespace(message_id=42)
+    adapter._bot = SimpleNamespace(send_message=send_message)
+    result = await adapter.send('-100123', 'completion-probe: finished',
+                                metadata={'thread_id': '77', 'strict_topic': True})
+    assert result.success is False
+    assert calls and all(call.get('message_thread_id') == 77 for call in calls)
