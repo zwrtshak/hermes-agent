@@ -23000,7 +23000,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def _completion_receipt_scope(self, evt, binding):
         try:
-            self.session_store._ensure_loaded()
+            await self.async_session_store._ensure_loaded()
         except Exception:
             return False
         entry = self.session_store._entries.get(binding['session_key'])

@@ -3011,7 +3011,7 @@ def terminal_tool(
                         session_key=session_key,
                         env_vars=env.env if hasattr(env, 'env') else None,
                         use_pty=effective_pty,
-                        completion_receipt=receipt_binding,
+                        **({"completion_receipt": receipt_binding} if receipt_binding is not None else {}),
                     )
                 else:
                     proc_session = process_registry.spawn_via_env(
@@ -3020,7 +3020,7 @@ def terminal_tool(
                         cwd=effective_cwd,
                         task_id=effective_task_id,
                         session_key=session_key,
-                        completion_receipt=receipt_binding,
+                        **({"completion_receipt": receipt_binding} if receipt_binding is not None else {}),
                     )
 
                 result_data = {
