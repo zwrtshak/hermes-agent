@@ -241,6 +241,26 @@ async def test_wrong_profile_config_cannot_capture_request(tmp_path, monkeypatch
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('failed', [False, True])
+async def test_completed_turn_preserves_valid_progress_and_failed_turn_recovery(tmp_path, monkeypatch, failed):
+    from hermes_cli.diggr_delivery import NativeWake
+    r = await setup(tmp_path, monkeypatch)
+    result(r)
+    wake = r.guard.tick(r.identity)
+    assert r.guard.begin(r.identity, wake)
+    event = SimpleNamespace(source=r.source, _diggr_wake=NativeWake(wake['task'], wake['generation'], r.identity['session']))
+    if not failed:
+        evidence = {k: wake[k] for k in ('task', 'generation', 'action', 'artifact')}
+        evidence.update(sha256=dc.digest(wake['artifact']), result='validated')
+        assert r.guard.ack(r.identity, wake, evidence, 'main_live', 'perform authorized live check')
+    assert await r.runner._diggr_finish(event, {'final_response': 'fixture answer', 'failed': failed})
+    r.clock[0] += 120
+    next_wake = dc.Guard(r.guard.path).tick(r.identity)
+    assert next_wake['gate'] == ('reconcile' if failed else 'main_live')
+    assert next_wake['policy']['wakes'] == 2
+
+
+@pytest.mark.asyncio
 async def test_nonzero_exit_cannot_be_success(tmp_path, monkeypatch):
     r = await setup(tmp_path, monkeypatch)
     row = r.guard.get(r.task['task'])
@@ -273,6 +293,18 @@ async def test_coordinator_answer_is_durable_and_does_not_restart_work(tmp_path,
     assert not r.guard.begin(r.identity, wake)
     reply = r.guard.get(r.task['task'])['deliveries'][-1]
     assert reply['phase'] == 'coordinator_reply' and reply['status'] == 'delivered'
+    # A finished answer without a lifecycle receipt is not a lost process.
+    # Waiting out its lease must not buy another identical model turn.
+    r.clock[0] += 120
+    reopened = dc.Guard(r.guard.path)
+    assert reopened.tick(r.identity) is None
+    row = reopened.get(r.task['task'])
+    assert row['status'] == 'blocked'
+    assert row['policy']['wakes'] == 1
+    assert row['reason'] == 'coordinator answered without lifecycle transition'
+    r.clock[0] += 120
+    assert reopened.tick(r.identity) is None
+    assert reopened.get(r.task['task'])['policy']['wakes'] == 1
 
 
 @pytest.mark.asyncio

@@ -233,6 +233,16 @@ class Guard:
                 if row['status'] in {'queued', 'executing'}:
                     if now < row['lease']:
                         continue
+                    turn = row.get('coordinator_turns', {}).get(str(row['generation']), {})
+                    if turn.get('status') == 'response_produced' and not turn.get('failed'):
+                        # Delivery of a final answer is not a lifecycle receipt,
+                        # but proves the coordinator finished. Do not classify
+                        # this as a crash and spend another wake on the same gap.
+                        self.checkpoint(row)
+                        row.update(status='blocked',
+                                   reason='coordinator answered without lifecycle transition',
+                                   limit_generation=row['generation'], generation=row['generation'] + 1)
+                        continue
                     self.schedule_recovery(row, row['lease'], 'expired Main lease')
                 if now < row['due']:
                     continue
