@@ -876,7 +876,7 @@ def target_reserved(row, target):
 def cmux_tree():
     import subprocess
     tree = json.loads(subprocess.check_output([CMUX, '--json', '--id-format', 'both',
-        'tree', '--all'], text=True, timeout=10))
+        'top', '--all'], text=True, timeout=10))
     if not isinstance(tree, (dict, list)) or not tree:
         raise ValueError('missing topology evidence')
     return tree

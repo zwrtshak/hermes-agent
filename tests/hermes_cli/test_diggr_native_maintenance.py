@@ -18,6 +18,24 @@ REAL_CHECK_OUTPUT = subprocess.check_output
 REAL_ROUTE_CHECK = dc.route_check
 
 
+@pytest.mark.parametrize('present', [False, True])
+def test_live_cmux_inventory_shape_verifies_exact_target(monkeypatch, present):
+    target = dict(workspace='11111111-1111-4111-8111-111111111111',
+                  surface='22222222-2222-4222-8222-222222222222')
+    surface = dict(id=target['surface'] if present else '33333333-3333-4333-8333-333333333333', type='terminal')
+    # Shapes observed from installed cmux tree vs top, with user data omitted.
+    tree = dict(windows=[dict(workspaces=[dict(id=target['workspace'], panes=[dict(surfaces=[surface])])])])
+    top = copy.deepcopy(tree)
+    workspace = top['windows'][0]['workspaces'][0]
+    workspace['kind'] = 'workspace'
+    workspace['panes'][0]['surfaces'][0]['kind'] = 'surface'
+    def inventory(cmd, **kwargs):
+        assert cmd[0] == dc.CMUX and '--all' in cmd
+        return json.dumps(top if 'top' in cmd else tree)
+    monkeypatch.setattr(subprocess, 'check_output', inventory)
+    assert dc.exact_target_present(dc.cmux_tree(), target) is present
+
+
 @pytest.fixture
 def native_recovery(rig):
     r = rig
