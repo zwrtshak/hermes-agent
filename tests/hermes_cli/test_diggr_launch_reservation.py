@@ -562,3 +562,125 @@ def test_claimed_attempt_without_child_exit_proof_remains_owned(rig):
     assert dc.ownership_pending(r.row())
     with pytest.raises(ValueError, match='child exit unknown'):
         retire(r)
+
+
+def restarted_reservation(r, sent=True):
+    if sent:
+        send(r)
+    fence(r)
+    with r.guard.transaction() as rows:
+        proof = rows[r.task['task']]['launcher_identity']
+        proof.pop('exited', None)
+        proof['created'] = 999.01
+    r.registry.get = lambda key: None
+    r.processes.pop(101)
+    r.identity = dict(r.identity, session='after-gateway-restart')
+    dc.EVENT_CONTEXT.set(dict(identity=r.identity))
+
+
+@pytest.mark.parametrize('sent', [True, False])
+def test_native_owner_retires_persisted_dead_reservation_after_restart(rig, sent):
+    r = rig
+    ticket = r.ticket()
+    restarted_reservation(r, sent)
+    before = r.row()
+    assert dc.ownership_pending(before)
+    assert retire(r)
+    after = dc.Guard(r.guard.path).get(r.task['task'])
+    assert not dc.ownership_pending(after)
+    assert after['identity'] == before['identity']
+    assert after['status'] == 'blocked'
+    assert after['policy'] == before['policy']
+    assert after['failure_evidence'] == before['failure_evidence']
+    assert after['reservation_retirement']['retired_by'] == r.identity
+    with pytest.raises(ValueError, match='UNREGISTERED'):
+        dc.validate_ticket({r.task['task']: after}, ticket)
+    with pytest.raises(ValueError):
+        retire(r)
+
+
+@pytest.mark.parametrize('change', ['owner', 'session-key', 'profile', 'created', 'nan',
+    'pid', 'start', 'launcher-live', 'shell-live', 'access-denied', 'child-missing',
+    'historic-child-live', 'historic-launcher-missing', 'evidence'])
+def test_restart_retirement_keeps_unknown_foreign_and_live_processes_reserved(rig, change):
+    r = rig
+    restarted_reservation(r)
+    with r.guard.transaction() as rows:
+        row = rows[r.task['task']]
+        if change == 'created': row['launcher_identity'].pop('created')
+        if change == 'nan': row['launcher_identity']['created'] = float('nan')
+        if change == 'pid': row['launcher_identity']['pid'] = 999
+        if change == 'start': row['launcher_identity']['started_at'] = 1
+        if change == 'child-missing':
+            row.update(worker_pid=303, worker_identity=dict(pid=303, start='worker', executable='python'))
+        if change.startswith('historic-'):
+            old = copy.deepcopy(row)
+            if change == 'historic-child-live':
+                old.update(worker_pid=303, worker_identity=dict(pid=303, start='worker', executable='python'),
+                           child_identity=dict(pid=404, start='child', executable='codex'))
+                r.processes[404] = old['child_identity']
+            else:
+                old.pop('launcher_identity')
+            row['history'] = [old]
+    if change in ('owner', 'session-key', 'profile'):
+        r.identity[{'owner': 'user_id', 'session-key': 'session_key', 'profile': 'profile'}[change]] = 'foreign'
+    if change == 'launcher-live': r.processes[202] = dict(pid=202)
+    if change == 'shell-live': r.processes[101] = dict(pid=101)
+    if change == 'access-denied':
+        import psutil
+        def denied(pid):
+            raise psutil.AccessDenied(pid)
+        r.monkeypatch.setattr(psutil, 'pid_exists', denied)
+    evidence = report(r)
+    if change == 'evidence': (r.tmp / 'effect.json').write_text('changed')
+    before = r.guard.path.read_bytes()
+    with pytest.raises((ValueError, OSError)):
+        retire(r, evidence)
+    assert r.guard.path.read_bytes() == before
+
+
+@pytest.mark.macos_only
+def test_retirement_after_registry_loss_with_real_local_processes(tmp_path, monkeypatch):
+    import subprocess
+    import time
+    from tools.process_registry import process_registry
+
+    identity = dict(home=str(tmp_path), profile='diggr-main', session='before', session_key='local-test',
+                    platform='cli', chat_id='chat', user_id='user', thread_id='')
+    launcher = subprocess.Popen(['/bin/sh', '-c', 'read ignored'], stdin=subprocess.PIPE, text=True)
+    shell = subprocess.Popen(['/bin/sh', '-c', 'read ignored'], stdin=subprocess.PIPE, text=True)
+    try:
+        session = SimpleNamespace(id='local-launcher', session_key=identity['session_key'],
+            started_at=time.time(), pid=launcher.pid, pid_scope='host', process=launcher, _pty=None)
+        proof = dc.launcher_identity(session)
+        assert proof and proof.get('created')
+        shell_identity = dc.process_identity(shell.pid)
+        launcher.communicate('\n', timeout=5)
+        shell.communicate('\n', timeout=5)
+        guard = dc.Guard(tmp_path / 'state.json')
+        task = dict(task='local-restart', scope='local test', identity=identity, owner='coding',
+                    gate='coding', action='test', artifact=str(tmp_path / 'result.md'),
+                    deadline=time.time()+60, wake_budget=2, authorization='test', producer='cmux',
+                    visible_binding=dict(target=dict(workspace='11111111-1111-4111-8111-111111111111',
+                        surface='22222222-2222-4222-8222-222222222222'), shell=shell_identity),
+                    launcher_expected=True, process_id=session.id, process_started_at=session.started_at,
+                    launcher_pid=launcher.pid, launcher_identity=proof)
+        guard.register(authorize(guard, task))
+        with guard.transaction() as rows:
+            rows[task['task']].update(status='blocked', gate='reconcile')
+        # A fresh registry genuinely has no waitable handle or entry for these processes.
+        assert process_registry.get(session.id) is None
+        current = dict(identity, session='after')
+        context = dc.EVENT_CONTEXT.set(dict(identity=current))
+        try:
+            row = guard.get(task['task'])
+            r = SimpleNamespace(row=lambda: guard.get(task['task']), tmp=tmp_path)
+            assert guard.retire_reservation(current, dict(task=task['task'], generation=row['generation']), report(r))
+            assert not dc.ownership_pending(dc.Guard(guard.path).get(task['task']))
+        finally:
+            dc.EVENT_CONTEXT.reset(context)
+    finally:
+        for proc in (launcher, shell):
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=5)

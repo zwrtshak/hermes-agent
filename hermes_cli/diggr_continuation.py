@@ -406,7 +406,9 @@ class Guard:
         require_native_main(identity)
         with self.transaction() as state:
             row = state.get(wake.get('task'))
-            if (not row or row['identity'] != identity or row['generation'] != wake.get('generation') or
+            if (not row or owner_policy.stable_owner(row['identity']) != owner_policy.stable_owner(identity) or
+                    row['identity']['session_key'] != identity['session_key'] or
+                    row['generation'] != wake.get('generation') or
                     row['status'] not in TERMINAL or row.get('producer') != 'cmux' or
                     row.get('reservation_retirement')):
                 raise ValueError('terminal current owner required; retirement replay refused')
@@ -416,7 +418,15 @@ class Guard:
                     report.get('authorization') != row['authorization'] or not report.get('reason') or
                     report.get('outcome') not in {'no_effect', 'reconciled'} or not report.get('effect_proof')):
                 raise ValueError('exact authorized row and independently hashed effect reconciliation required')
-            if row.get('worker_pid'):
+            from tools.process_registry import process_registry
+            if process_registry.get(row.get('process_id')) is None:
+                # Only explicit, effect-reconciled retirement may use persisted
+                # ownership after registry loss. It never authorizes recovery,
+                # dispatch, acceptance or a replacement worker.
+                verify_restarted_reservation_exit(row)
+            elif row['identity'] != identity:
+                raise ValueError('live registry requires original coordinator session')
+            elif row.get('worker_pid'):
                 verify_prior_exit(row)  # Claimed attempts retain every worker/child safeguard.
             else:
                 if any(key in row for key in ('worker_pid', 'worker_identity', 'worker_started_ns',
@@ -433,7 +443,8 @@ class Guard:
             row['reservation_retirement'] = dict(
                 row_sha256=object_hash(row), evidence=dict(evidence),
                 request_row_sha256=before, at=now, generation=row['generation'],
-                identity=dict(identity), action_id=row['action_id'], effect_id=row['effect_id'])
+                identity=dict(row['identity']), retired_by=dict(identity),
+                action_id=row['action_id'], effect_id=row['effect_id'])
             return True
 
     def recover(self, identity, wake, evidence, strategy, maintenance=None, now=None):
@@ -758,6 +769,50 @@ def verify_launcher_exit(row):
             not launcher_pid or session.pid != launcher_pid or
             not pid_is_absent(session.pid)):
         raise ValueError('prior launcher alive, reused PID or exit proof missing')
+
+
+def verify_restarted_reservation_exit(row):
+    """Prove recorded host processes absent without pretending to know exit codes.
+
+    launcher_identity captures PID + creation time from an owned local handle
+    before the registry can be lost. A bare PID or an exited flag is insufficient.
+    Require the original terminal and all recorded prior children to be absent
+    too; an occupied replacement terminal is neither signalled nor reused here.
+    """
+    from tools.process_registry import process_registry
+    import psutil
+
+    attempts = [row] + row.get('history', [])
+    for attempt in attempts:
+        proof = attempt.get('launcher_identity')
+        started = attempt.get('process_started_at')
+        if (attempt.get('task') != row['task'] or attempt.get('identity') != row['identity'] or
+                not attempt.get('process_id') or not isinstance(proof, dict) or
+                type(started) not in (int, float) or not math.isfinite(started) or started <= 0 or
+                any(proof.get(k) != v for k, v in dict(process_id=attempt['process_id'],
+                    session_key=attempt['identity']['session_key'], started_at=started,
+                    pid=attempt.get('launcher_pid')).items()) or
+                type(proof.get('created')) not in (int, float) or
+                not math.isfinite(proof['created']) or proof['created'] <= 0 or
+                process_registry.get(attempt['process_id']) is not None):
+            raise ValueError('persisted native launcher identity missing or registry still owns it')
+        try:
+            if not pid_is_absent(proof['pid']) or not identity_exited(proof):
+                raise ValueError('prior launcher alive, reused PID or identity unknown')
+            if not process_absent(attempt['visible_binding']['shell']):
+                raise ValueError('prior terminal alive or PID reused')
+            worker = attempt.get('worker_pid')
+            if worker:
+                identity = attempt.get('worker_identity')
+                if (not isinstance(identity, dict) or identity.get('pid') != worker or
+                        not process_absent(identity) or
+                        not process_absent(attempt.get('child_identity'))):
+                    raise ValueError('prior worker or child exit unknown')
+            elif any(k in attempt for k in ('worker_pid', 'worker_identity', 'worker_started_ns',
+                                           'child_identity', 'child_exited')):
+                raise ValueError('ambiguous prior worker or child claim')
+        except psutil.Error as exc:
+            raise ValueError('prior process identity unavailable') from exc
 
 
 def ownership_pending(row):

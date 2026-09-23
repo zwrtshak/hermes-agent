@@ -3864,9 +3864,30 @@ TERMINAL_SCHEMA['parameters']['properties']['continuation_control'] = {
 }
 TERMINAL_SCHEMA['parameters']['properties']['continuation'] = {
     'type': 'object',
-    'properties': {'owner_batch': {'type': 'string'}, 'owner_issue': {'type': 'string'}, 'launcher_command': {'type': 'string'}},
-    'required': ['owner_batch', 'owner_issue'],
-    'description': 'Persisted native owner grant required: owner_batch and owner_issue (workspace/project/issue UUID path). No executor authorization text can mint authority. Explicit authorized Main task: task, scope, owner, gate, action, artifact (new absolute output), deadline, wake_budget, authorization, producer (codex/cmux/pilot). Native event binds identity; background=true required. cmux requires worker_route with absolute packet, receipt, worktree, branch, plane_id, visible_target (exact workspace and surface UUIDs) and authorized argv (codex exec --model matching packet). cmux send exit is never worker completion.'
+    'properties': {
+        'owner_batch': {'type': 'string'}, 'owner_issue': {'type': 'string'},
+        'launcher_command': {'type': 'string'},
+        'producer': {'type': 'string', 'enum': ['cmux']},
+        'task': {'type': 'string'}, 'scope': {'type': 'string'},
+        'owner': {'type': 'string'}, 'gate': {'type': 'string'},
+        'action': {'type': 'string'}, 'artifact': {'type': 'string'},
+        'deadline': {'type': 'number'},
+        'wake_budget': {'type': 'integer', 'minimum': 1, 'maximum': 10},
+        'authorization': {'type': 'string'},
+        'worker_route': {'type': 'object', 'properties': {
+            'packet': {'type': 'string'}, 'receipt': {'type': 'string'},
+            'worktree': {'type': 'string'}, 'branch': {'type': 'string'},
+            'plane_id': {'type': 'string'},
+            'visible_target': {'type': 'object', 'properties': {
+                'workspace': {'type': 'string'}, 'surface': {'type': 'string'}
+            }, 'required': ['workspace', 'surface']},
+            'argv': {'type': 'array', 'items': {'type': 'string'}, 'minItems': 1}
+        }, 'required': ['packet', 'receipt', 'worktree', 'branch', 'plane_id', 'visible_target', 'argv']}
+    },
+    'required': ['owner_batch', 'owner_issue', 'launcher_command', 'producer', 'task',
+                 'scope', 'owner', 'gate', 'action', 'artifact', 'deadline',
+                 'wake_budget', 'authorization', 'worker_route'],
+    'description': 'Persisted native owner grant required: owner_batch and owner_issue (workspace/project/issue UUID path). No executor authorization text can mint authority. Explicit authorized Main task: task, scope, owner, gate, action, artifact (new absolute output), deadline, wake_budget, authorization, producer=cmux. Native event binds identity; background=true required. cmux requires worker_route with absolute packet, receipt, worktree, branch, plane_id, visible_target (exact workspace and surface UUIDs) and authorized argv (codex exec --model matching packet). cmux send exit is never worker completion.'
 }
 
 
