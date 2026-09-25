@@ -505,6 +505,7 @@ async def test_exhaustion_preserves_successful_receipt_when_main_retries(case, m
 @pytest.mark.parametrize('observation', ['none', 'exception', 'mismatch'])
 @pytest.mark.parametrize('consumer', ['refresh', 'kill'])
 async def test_detached_current_identity_observation(case, monkeypatch, tmp_path, observation, consumer):
+    monkeypatch.setattr('tools.process_registry._IS_DARWIN', False)  # stable kernel-tick identity
     import gateway.status as status
     import tools.process_registry as processes
     import psutil
@@ -577,6 +578,7 @@ def test_identity_recovery_and_signal_boundary(case, monkeypatch, tmp_path, obse
     import gateway.status as status
     import tools.process_registry as processes
     from unittest.mock import Mock
+    monkeypatch.setattr(processes, '_IS_DARWIN', False)  # exercise stable kernel-tick reuse
     _, registry, session, _ = receipt_watcher(case, monkeypatch, tmp_path, exited=False)
     session.pid = 424242
     session.detached = True
@@ -1014,6 +1016,33 @@ def test_failed_post_effect_ack_remains_uncertain_after_restart(case, monkeypatc
     asyncio.run(runner._deliver_completion_notification('ended', dict(evt)))
     runner._inject_watch_notification.assert_awaited_once()
     runner.adapters[Platform.TELEGRAM].send.assert_awaited_once()
+
+
+@pytest.mark.parametrize('recipient,ack', [('main', 'accepted'), ('receipt', 'sent')])
+def test_failed_ack_and_uncertain_write_never_repeat_effect_without_restart(case, monkeypatch, recipient, ack):
+    import utils
+    runner, evt, _, _ = case
+    original_write = utils.atomic_json_write
+    failures = []
+    def fail_ack_then_uncertainty(path, entries, *args, **kwargs):
+        value = entries[0]['receipt_state'].get(recipient)
+        if (not failures and value == ack) or (failures == [ack] and value == 'uncertain'):
+            failures.append(value)
+            raise OSError('synthetic post-effect persistence failure')
+        return original_write(path, entries, *args, **kwargs)
+    monkeypatch.setattr(utils, 'atomic_json_write', fail_ack_then_uncertainty)
+    effect = runner._inject_watch_notification if recipient == 'main' else runner.adapters[Platform.TELEGRAM].send
+    if recipient == 'main':
+        runner.adapters[Platform.TELEGRAM].send.return_value = SendResult(
+            False, error='safe retry', raw_response={'delivery_outcome': 'safe_retry'})
+    else:
+        runner._inject_watch_notification.return_value = False
+    for _ in range(3):
+        assert asyncio.run(runner._deliver_completion_notification('ended', evt)) is False
+    assert failures == [ack, 'uncertain']
+    effect.assert_awaited_once()
+    assert evt['_receipt_state'][recipient] == 'uncertain'
+    assert not evt['_receipt_state']['done']
 
 
 def test_failed_receipt_update_does_not_rollback_concurrent_ack(case, monkeypatch):

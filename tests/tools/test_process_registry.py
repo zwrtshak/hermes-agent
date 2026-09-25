@@ -27,13 +27,20 @@ def registry():
 
 
 @pytest.fixture(autouse=True)
-def _reset_systemd_scope_cache():
+def _reset_systemd_scope_cache(monkeypatch, request):
     """Reset the cached ``systemd-run --user --scope`` availability flag
     before each test so a probe run on a real systemd host (where
     ``INVOCATION_ID`` is set) doesn't leak into tests that mock
     ``subprocess.Popen``. Tests that exercise the probe directly reset the
     cache themselves."""
     import tools.process_registry as _pr
+
+    if request.cls and request.cls.__name__ in {
+        'TestSpawnEnvSanitization', 'TestSpawnRewriteCompoundBackground', 'TestSystemdCgroupIsolation',
+    }:
+        # These spawn tests use invented PIDs and intercept every Popen call.
+        # They cannot provide real OS provenance for their fake process handles.
+        monkeypatch.setattr(_pr.ProcessRegistry, '_safe_host_os_identity', staticmethod(lambda pid: None))
 
     original = _pr._SYSTEMD_SCOPE_AVAILABLE
     _pr._SYSTEMD_SCOPE_AVAILABLE = False
@@ -1065,7 +1072,8 @@ class TestKillProcess:
         (12345, None, "error"),
         (12345, 67890, "already_exited"),
     ])
-    def test_detached_unknown_or_reused_identity_never_signaled(self, registry, recorded, current, expected):
+    def test_detached_unknown_or_reused_identity_never_signaled(self, registry, recorded, current, expected, monkeypatch):
+        monkeypatch.setattr('tools.process_registry._IS_DARWIN', False)  # stable kernel ticks
         session = _make_session(sid="proc_identity_fixture")
         session.pid = 424242
         session.detached = True
@@ -1398,8 +1406,9 @@ class TestPidReuseGuard:
         assert proc.alive and signals == []
 
 
-    def test_refresh_detached_marks_recycled_pid_exited(self, registry):
+    def test_refresh_detached_marks_recycled_pid_exited(self, registry, monkeypatch):
         """A detached session whose PID got recycled is moved to finished."""
+        monkeypatch.setattr('tools.process_registry._IS_DARWIN', False)  # stable kernel ticks
         wrong_start = (ProcessRegistry._safe_host_start_time(os.getpid()) or 0) + 999
         s = _make_session(sid="proc_detached")
         s.pid = os.getpid()          # alive, but...
@@ -2095,8 +2104,8 @@ class TestSystemdCgroupIsolation:
 
         stopped = []
         terminated = []
-        monkeypatch.setattr(registry, "_host_pid_is_ours", lambda pid, start: False)
-        monkeypatch.setattr(registry, "_terminate_host_pid", lambda pid, start: terminated.append((pid, start)))
+        monkeypatch.setattr(registry, "_host_pid_is_ours", lambda pid, start, native=None, owned=None: False)
+        monkeypatch.setattr(registry, "_terminate_host_pid", lambda pid, start, native=None, owned=None: terminated.append((pid, start)))
         monkeypatch.setattr("tools.process_registry._stop_systemd_unit", lambda unit: stopped.append(unit) or True)
 
         with patch.object(registry, "_write_checkpoint"):
@@ -2221,3 +2230,98 @@ class TestSystemdCgroupIsolation:
         )
 
         assert pr._stop_systemd_unit("hermes-worker-gone.scope") is True
+
+
+@pytest.mark.parametrize('native', [False, True])
+def test_darwin_clock_drift_does_not_finish_or_signal_unknown_session(monkeypatch, tmp_path, native):
+    import tools.process_registry as pr
+    monkeypatch.setattr(pr, '_IS_DARWIN', True)
+    monkeypatch.setattr(pr, 'CHECKPOINT_PATH', tmp_path / 'processes.json')
+    proof = {'pid': 424242, 'start': 'Wed Sep 23 16:34:17 2026', 'executable': '/fixture/python'}
+    monkeypatch.setattr(pr.ProcessRegistry, '_is_host_pid_alive', staticmethod(lambda pid: True))
+    monkeypatch.setattr(pr.ProcessRegistry, '_safe_host_start_time', staticmethod(lambda pid: 10000))
+    monkeypatch.setattr(pr.ProcessRegistry, '_safe_host_os_identity', staticmethod(lambda pid: dict(proof)))
+    registry = pr.ProcessRegistry()
+    session = ProcessSession(id='drift', command='fixture', pid=424242, detached=True,
+                             host_start_time=10100, host_os_identity=dict(proof) if native else None)
+    registry._running[session.id] = session
+    assert registry._write_checkpoint()
+    recovered = pr.ProcessRegistry()
+    assert recovered.recover_from_checkpoint() == 1
+    current = recovered.get(session.id)
+    assert current and not current.exited
+    assert current.host_os_identity == (proof if native else None)
+    assert recovered.poll(session.id)['status'] == 'running'
+    assert recovered.completion_queue.empty()
+    assert pr.ProcessRegistry._host_pid_identity(424242, 10100, current.host_os_identity) is (True if native else None)
+    if not native:
+        with patch.object(pr.ProcessRegistry, '_terminate_host_pid') as terminate:
+            assert recovered.kill_process(session.id)['status'] == 'error'
+        terminate.assert_not_called()
+        assert not current.exited and recovered.completion_queue.empty()
+
+
+@pytest.mark.parametrize('change,expected', [('start', False), ('executable', None), ('unavailable', None)])
+def test_darwin_native_identity_rechecks_at_signal_boundary(monkeypatch, change, expected):
+    import tools.process_registry as pr
+    monkeypatch.setattr(pr, '_IS_DARWIN', True)
+    proof = {'pid': 424242, 'start': 'Wed Sep 23 16:34:17 2026', 'executable': '/fixture/python'}
+    current = dict(proof)
+    if change != 'unavailable':
+        current[change] = 'changed'
+    monkeypatch.setattr(pr.ProcessRegistry, '_is_host_pid_alive', staticmethod(lambda pid: True))
+    monkeypatch.setattr(pr.ProcessRegistry, '_safe_host_start_time', staticmethod(lambda pid: 10100))
+    monkeypatch.setattr(pr.ProcessRegistry, '_safe_host_os_identity', staticmethod(lambda pid: None if change == 'unavailable' else current))
+    assert pr.ProcessRegistry._host_pid_identity(424242, 10100, proof) is expected
+    with patch('psutil.Process') as process, patch('os.kill') as kill:
+        assert pr.ProcessRegistry._terminate_host_pid(424242, 10100, proof) is False
+    process.assert_not_called()
+    kill.assert_not_called()
+
+
+def test_darwin_spawn_captures_native_identity_in_checkpoint(monkeypatch, tmp_path):
+    import tools.process_registry as pr
+    import hermes_cli.diggr_continuation as dc
+    monkeypatch.setattr(pr, '_IS_DARWIN', True)
+    monkeypatch.setattr(pr, 'CHECKPOINT_PATH', tmp_path / 'processes.json')
+    monkeypatch.setattr(pr.ProcessRegistry, '_safe_host_start_time', staticmethod(lambda pid: 10100))
+    monkeypatch.setattr('gateway.restart.is_gateway_supervisor_process', lambda: False)
+    proof = {'pid': 424242, 'start': 'Wed Sep 23 16:34:17 2026', 'executable': '/fixture/python'}
+    native_lookup = MagicMock(return_value=dict(proof, ppid=12, tty='??'))
+    monkeypatch.setattr(dc, 'process_identity', native_lookup)
+    with patch.object(pr.subprocess, 'Popen', return_value=MagicMock(pid=424242)), patch.object(pr.threading, 'Thread'):
+        registry = pr.ProcessRegistry()
+        session = registry.spawn_local('fixture-only', cwd=str(tmp_path))
+    native_lookup.assert_called_once_with(424242)
+    assert session.host_os_identity == proof
+    saved = json.loads(pr.CHECKPOINT_PATH.read_text())
+    assert saved[0]['host_os_identity'] == proof
+    assert 'ppid' not in saved[0]['host_os_identity']
+
+
+@pytest.mark.skipif(sys.platform != 'darwin', reason='Darwin native executable transition')
+def test_owned_popen_exec_transition_remains_stoppable(registry, tmp_path):
+    import shlex
+    gate = tmp_path / 'exec-gate'
+    command = (f'while [ ! -f {shlex.quote(str(gate))} ]; do sleep 0.01; done; '
+               f'exec {shlex.quote(sys.executable)} -c "import time; time.sleep(30)"')
+    session = registry.spawn_local(command, cwd=str(tmp_path))
+    try:
+        assert session.host_os_identity and session.process.poll() is None
+        original = dict(session.host_os_identity)
+        gate.touch()
+        deadline = time.monotonic() + 5
+        current = original
+        while time.monotonic() < deadline:
+            current = registry._safe_host_os_identity(session.pid)
+            if current and current['executable'] != original['executable']:
+                break
+            time.sleep(0.01)
+        assert current and current['start'] == original['start']
+        assert current['executable'] != original['executable']
+        assert registry.kill_process(session.id)['status'] == 'killed'
+        session.process.wait(timeout=5)
+    finally:
+        if session.process.poll() is None:
+            session.process.kill()
+        session.process.wait(timeout=5)

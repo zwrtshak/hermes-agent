@@ -1622,6 +1622,9 @@ def validate_logical_changes(task):
             git('symbolic-ref', '--quiet', '--short', 'HEAD').decode().strip() != route['branch']):
         raise ValueError('logical acceptance worktree/branch changed')
     paths = git('diff', '--no-ext-diff', '--no-textconv', '--no-renames', '--name-only', '-z', packet['base'], '--')
+    # The index can differ even when worktree bytes were restored to the base.
+    # Disable rename folding so both source and destination obey the grant.
+    paths += git('diff', '--cached', '--no-ext-diff', '--no-textconv', '--no-renames', '--name-only', '-z', packet['base'], '--')
     paths += git('ls-files', '--others', '--exclude-standard', '-z')
     for raw in paths.split(b'\0'):
         if not raw:

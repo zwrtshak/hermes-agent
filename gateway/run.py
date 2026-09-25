@@ -16952,16 +16952,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         context = build_session_context(source, self.config, session_entry)
         
         # Set session context variables for tools (task-local, concurrency-safe)
-        _session_env_tokens = self._set_session_env(context)
-        from hermes_cli.diggr_continuation import EVENT_CONTEXT, runtime_guard
-        _diggr_home = self._resolve_profile_home_for_source(source).resolve()
-        _diggr_guard = runtime_guard(_diggr_home)
-        if _diggr_guard is not None:
-            self._diggr_homes = getattr(self, '_diggr_homes', set()) | {str(_diggr_home)}
-            EVENT_CONTEXT.set(dict(identity=_native_origin or self._diggr_identity(source, session_entry.session_id),
-                                   native_wake=getattr(event, '_diggr_wake', None)))
-        else:
-            EVENT_CONTEXT.set(None)
+        from hermes_cli.diggr_delivery import set_tool_context
+        _session_env_tokens = await set_tool_context(self, event, context, session_entry)
         
         # Read privacy.redact_pii from config (re-read per message)
         _redact_pii = False
@@ -23131,7 +23123,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Send independently; ambiguous attempts are retained without replay."""
         state = evt['_receipt_state']
         if state.get('receipt') == 'sending':
-            self._completion_receipt_save(evt, receipt='uncertain')
+            # The effect may already have happened. Failed persistence must
+            # retain the no-replay fence in memory as well as after restart.
+            return self._completion_receipt_save(evt, receipt='uncertain')
         if state.get('receipt') in ('sent', 'uncertain', 'rejected', 'suppressed', 'exhausted'):
             return True
         source = await self._completion_receipt_scope(evt, binding)
@@ -23215,7 +23209,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             async def inject():
                 if state.get('main') == 'sending':
-                    self._completion_receipt_save(evt, main='uncertain')
+                    return self._completion_receipt_save(evt, main='uncertain')
                 if state.get('main') in ('accepted', 'uncertain', 'suppressed', 'exhausted'):
                     return True
                 source = await self._completion_receipt_scope(evt, binding)
@@ -28244,6 +28238,11 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         return False
     atexit.register(remove_pid_file)
     atexit.register(release_gateway_runtime_lock)
+
+    # Only the gateway that won this profile's singleton claim may replace
+    # processes.json. Standalone CLIs and forked children remain in-memory.
+    from tools.process_registry import process_registry
+    process_registry.bind_gateway_checkpoint(_hermes_home)
 
     # Lifecycle ledger (NS-608): report if the previous gateway life died
     # uncleanly (SIGKILL / OOM / VM death — no exit path ran), then claim

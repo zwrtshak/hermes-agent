@@ -323,3 +323,48 @@ async def native_session_matches(runner, identity, entry):
         return bool(child and not child.get('ended_at'))
     except Exception:
         return False
+
+
+async def set_tool_context(runner, event, context, entry):
+    """Build tools against a verified wake's immutable admission provenance.
+
+    The agent transcript still uses the live compression child. Only native
+    wakes may retain the parent identity; ordinary turns keep their own session.
+    """
+    from hermes_cli.diggr_continuation import EVENT_CONTEXT, runtime_guard
+    from gateway.session_context import completion_launch_context
+    identity = native_identity(runner, event)
+    if identity is not None and (context.session_id != entry.session_id or
+            context.session_key != entry.session_key or
+            not await native_session_matches(runner, identity, entry)):
+        raise ValueError('native wake session lineage unresolved; tool context refused')
+    tokens = runner._set_session_env(context)
+    try:
+        home = runner._resolve_profile_home_for_source(context.source).resolve()
+        guard = runtime_guard(home)
+        if identity is not None:
+            # Revalidate after the asynchronous lineage lookup. Never borrow a
+            # parent from caller metadata or from a different route/session.
+            if native_identity(runner, event) != identity:
+                raise ValueError('native wake origin changed during tool setup')
+            row = guard.get(event._diggr_wake.task) if guard else None
+            original = transport_for(row) if row else None
+            current = completion_launch_context.get()
+            if not original or not current:
+                raise ValueError('native wake transport unavailable at tool setup')
+            binding, schedule = current
+            bound = dict(binding, parent_session_id=identity['session'])
+            if bound != original:
+                raise ValueError('native wake transport changed during tool setup')
+            completion_launch_context.set((json.loads(json.dumps(original)), schedule))
+        if guard is not None:
+            runner._diggr_homes = getattr(runner, '_diggr_homes', set()) | {str(home)}
+            EVENT_CONTEXT.set(dict(identity=identity or runner._diggr_identity(context.source, context.session_id),
+                                   native_wake=getattr(event, '_diggr_wake', None)))
+        else:
+            EVENT_CONTEXT.set(None)
+        return tokens
+    except Exception:
+        runner._clear_session_env(tokens)
+        completion_launch_context.set(None)
+        raise
