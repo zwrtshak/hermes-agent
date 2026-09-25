@@ -35,11 +35,14 @@ informative rejection instead of scheduling a job that will only fail
 
 from __future__ import annotations
 
+import ast
+import builtins
 import logging
 import os
 import re
 import shlex
 import stat
+import sys
 from pathlib import Path
 from typing import Callable, Iterator, Optional
 
@@ -151,6 +154,263 @@ _BINARY_SNIFF_BYTES = 4096
 _ReadRemoteScriptFn = Callable[[str], Optional[str]]
 
 
+# A deliberately small literal delimiter grammar, shared by the additional
+# conservative boundary scan and the exact Python invocation proof.
+_LITERAL_HEREDOC_WORD = r'''(?:[A-Za-z0-9_]|'[A-Za-z0-9_]+'|"[A-Za-z0-9_]+"|\\[A-Za-z0-9_])+'''
+_HEREDOC_START = re.compile(r"<<(-?)[ \t]*(" + _LITERAL_HEREDOC_WORD + r")(?=[ \t\n;&|<>)]|$)")
+
+
+def _heredoc_scan_parts(command: str) -> list[str]:
+    """Expose complete literal heredoc boundaries without exempting any body.
+
+    This is an ADDITIONAL scan: the original text still goes through all the
+    existing checks. Quotes in stdin data cannot hide commands after its real
+    delimiter. Quoted shell -c arguments are opened by their own recursive scan.
+    Unknown delimiter syntax keeps the original conservative path.
+    """
+    parts = []
+    pending = []
+    start = index = 0
+    quote = None
+    while index < len(command):
+        char = command[index]
+        if char == "\\" and quote != "'":
+            index += 2
+            continue
+        if quote:
+            if char == quote:
+                quote = None
+        elif char in "\"'":
+            quote = char
+        elif char == "#":
+            end = command.find("\n", index)
+            index = len(command) if end < 0 else end
+            continue
+        elif command.startswith("<<", index) and (index == 0 or command[index - 1] != "<"):
+            match = _HEREDOC_START.match(command, index)
+            if match:
+                pending.append((shlex.split(match[2])[0], bool(match[1])))
+                index = match.end()
+                continue
+        elif char == "\n" and pending:
+            parts.append(command[start:index])
+            index += 1
+            for delimiter, strip_tabs in pending:
+                start = index
+                while index < len(command):
+                    end = command.find("\n", index)
+                    if end < 0:
+                        end = len(command)
+                    line = command[index:end]
+                    if (line.lstrip("\t") if strip_tabs else line) == delimiter:
+                        parts.append(command[start:index])
+                        index = end + 1
+                        break
+                    index = end + 1
+                else:
+                    return []  # No trustworthy closing boundary.
+            pending = []
+            start = index
+            continue
+        index += 1
+    if parts:
+        parts.append(command[start:])
+    return parts
+
+
+class _ReadProofError(ValueError):
+    pass
+
+
+class _PythonReadProof:
+    """Whole-program, fail-closed type/provenance proof; never evaluate code.
+
+    Types describe only exact trusted stdlib results or literal data. Callable
+    and module values cannot be stored in containers, aliased or rebound.
+    No generic visitor: every accepted statement/expression consumes all its
+    executable children; every other AST kind is rejected.
+    """
+
+    _data = frozenset({"text", "bytes", "number", "bool", "none", "data"})
+    _values = _data | {"path", "paths"}
+    _protected = frozenset(vars(builtins)) | {"Path", "pathlib", "json"}
+
+    def __init__(self):
+        self.names: dict[str, str] = {}
+
+    def prove(self, body: str) -> None:
+        # stdin is bytes. A coding cookie (e.g. unicode_escape) can turn an
+        # apparent comment into executable statements. Reject cookies before
+        # parsing, also avoiding codec lookup/imports in the guard process.
+        first_lines = body.replace("\r\n", "\n").replace("\r", "\n").split("\n", 2)[:2]
+        if any(re.match(r"^[ \t\f]*#.*?coding[:=]", line) for line in first_lines):
+            raise _ReadProofError
+        tree = ast.parse(body.encode("utf-8"))
+        if sum(1 for _ in ast.walk(tree)) > 4096:
+            raise _ReadProofError
+        for statement in tree.body:
+            if isinstance(statement, ast.Import):
+                for alias in statement.names:
+                    if alias.asname or alias.name not in {"pathlib", "json"} or alias.name in self.names:
+                        raise _ReadProofError
+                    self.names[alias.name] = alias.name
+            elif isinstance(statement, ast.ImportFrom):
+                if (statement.level or statement.module != "pathlib"
+                        or len(statement.names) != 1 or statement.names[0].name != "Path"
+                        or statement.names[0].asname or "Path" in self.names):
+                    raise _ReadProofError
+                self.names["Path"] = "Path"
+            elif isinstance(statement, ast.Assign):
+                if len(statement.targets) != 1 or not isinstance(statement.targets[0], ast.Name):
+                    raise _ReadProofError
+                name = statement.targets[0].id
+                kind = self.expression(statement.value)
+                if name.startswith("_") or name in self._protected or name in self.names or kind not in self._values:
+                    raise _ReadProofError
+                self.names[name] = kind
+            elif isinstance(statement, ast.Expr):
+                if self.expression(statement.value) not in self._values:
+                    raise _ReadProofError
+            else:
+                raise _ReadProofError
+
+    def expression(self, node: ast.AST, depth: int = 0) -> str:
+        if depth > 64:
+            raise _ReadProofError
+        expr = lambda child: self.expression(child, depth + 1)
+        if isinstance(node, ast.Constant):
+            kind = {str: "text", bytes: "bytes", int: "number", float: "number",
+                    bool: "bool", type(None): "none"}.get(type(node.value))
+            if kind:
+                return kind
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            if node.id in self.names and not node.id.startswith("_"):
+                return self.names[node.id]
+        elif isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+            if all(expr(item) in self._data for item in node.elts):
+                return "data"
+        elif isinstance(node, ast.Dict):
+            if all(key is not None and expr(key) in self._data and expr(value) in self._data
+                   for key, value in zip(node.keys, node.values)):
+                return "data"
+        elif isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+            if expr(node.operand) == "number":
+                return "number"
+        elif isinstance(node, ast.BinOp):
+            left, right = expr(node.left), expr(node.right)
+            if isinstance(node.op, ast.Div) and left == "path" and right == "text":
+                return "path"
+            if isinstance(node.op, ast.Add) and left == right and left in {"text", "number"}:
+                return left
+        elif isinstance(node, ast.Subscript):
+            owner, key = expr(node.value), expr(node.slice)
+            if owner == "data" and key in {"text", "number"}:
+                return "data"
+            if owner in {"text", "paths"} and key == "number":
+                return "text" if owner == "text" else "path"
+        elif isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load):
+            owner = expr(node.value)
+            if owner == "pathlib" and node.attr == "Path":
+                return "Path"
+            if owner == "path":
+                if node.attr == "parent":
+                    return "path"
+                if node.attr in {"name", "suffix", "stem"}:
+                    return "text"
+        elif isinstance(node, ast.Call):
+            # Star args and **kwargs have no statically proven call signature.
+            args = [expr(arg) for arg in node.args]
+            if any(kw.arg is None for kw in node.keywords):
+                raise _ReadProofError
+            kwargs = {kw.arg: expr(kw.value) for kw in node.keywords}
+            if len(kwargs) != len(node.keywords):
+                raise _ReadProofError
+            if isinstance(node.func, ast.Name) and node.func.id in {"print", "list", "sorted", "str", "len"}:
+                name = node.func.id
+                if not kwargs:
+                    if name == "print" and all(arg in self._values for arg in args):
+                        return "none"
+                    if len(args) == 1:
+                        if name == "list" and args[0] == "path_iter":
+                            return "paths"
+                        if name == "sorted" and args[0] == "paths":
+                            return "paths"
+                        if name == "str" and args[0] in self._values:
+                            return "text"
+                        if name == "len" and args[0] in {"text", "bytes", "data", "paths"}:
+                            return "number"
+            elif isinstance(node.func, ast.Attribute):
+                owner, method = expr(node.func.value), node.func.attr
+                if owner == "json" and not kwargs and len(args) == 1:
+                    if method == "loads" and args[0] in {"text", "bytes"}:
+                        return "data"
+                    if method == "dumps" and args[0] in self._data:
+                        return "text"
+                if owner == "path":
+                    if method == "read_text" and not args and all(
+                        kw.arg == "encoding" and isinstance(kw.value, ast.Constant) and kw.value.value == "utf-8"
+                        for kw in node.keywords
+                    ):
+                        return "text"
+                    if not args and not kwargs:
+                        result = {"read_bytes": "bytes", "iterdir": "path_iter",
+                                  "exists": "bool", "is_file": "bool", "is_dir": "bool"}.get(method)
+                        if result:
+                            return result
+                if owner == "data" and method == "get" and not kwargs and 1 <= len(args) <= 2 and all(arg in self._data for arg in args):
+                    return "data"
+                if owner == "pathlib" and method == "Path" and not kwargs and args == ["text"]:
+                    return "path"
+            elif expr(node.func) == "Path" and not kwargs and args == ["text"]:
+                return "path"
+        raise _ReadProofError
+
+
+def _canonical_python_body(command: str) -> Optional[str]:
+    """Recognize the exact whole invocation independently of its AST proof.
+
+    None means another invocation form; an empty body still matches this form.
+    No PATH lookup, symlink spellings, wrappers, surrounding shell syntax or
+    output redirects. File permissions are deliberately irrelevant.
+    """
+    try:
+        executable = Path(sys.executable).resolve(strict=True)
+        if not executable.is_absolute() or not executable.is_file():
+            return None
+        header, separator, rest = command.partition("\n")
+        prefix = shlex.quote(str(executable)) + " -I -S - "
+        match = re.fullmatch(re.escape(prefix) + r"<<(" + _LITERAL_HEREDOC_WORD + r")", header)
+        if not separator or not match or not any(char in match[1] for char in "'\"\\"):
+            return None
+        delimiter = shlex.split(match[1])[0]
+        lines = rest.split("\n")
+        end = lines.index(delimiter)
+        if lines[end + 1:] not in ([], [""]):
+            return None
+        return "\n".join(lines[:end])
+    except (ValueError, SyntaxError, RecursionError, OSError, RuntimeError):
+        return None
+
+
+def _is_canonical_python_read(command: str) -> Optional[bool]:
+    """None: other form; True: proven read; False: canonical proof rejected.
+
+    Only the explicitly local top-level caller may use this verdict. Once the
+    form matches, ANY proof failure must block, including resource limits and
+    unexpected checker errors; it must never fall back to the shell scan.
+    """
+    body = _canonical_python_body(command)
+    if body is None:
+        return None
+    try:
+        if len(command.encode("utf-8")) > _MAX_REFERENCED_SCRIPT_BYTES:
+            return False
+        _PythonReadProof().prove(body)
+        return True
+    except Exception:
+        return False
+
+
 def _logical_shell_lines(command: str) -> Iterator[str]:
     """Split only unquoted newlines; shlex still owns token interpretation.
 
@@ -226,6 +486,44 @@ def _command_token_index(segment: list[str]) -> Optional[int]:
         if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", token):
             continue
         return index
+    return None
+
+
+def _unwrapped_command_token_index(
+    segment: list[str], *, skipped: Optional[list[int]] = None,
+) -> Optional[int]:
+    """Open simple env/command/sudo prefixes for executable scans only.
+
+    Do not use this for data-sink masking: unwrapping must add protection,
+    never grant an additional data exemption. Record each skipped executable
+    so referenced wrapper files remain visible to the script scan.
+    """
+    index = _command_token_index(segment)
+    flags = {"env": {"-i", "--ignore-environment"}, "command": {"-p"},
+             "sudo": {"-n", "-E", "-H"}}
+    values = {"env": {"-u", "--unset"}, "command": set(),
+              "sudo": {"-u", "-g", "--user", "--group"}}
+    while index is not None and index < len(segment):
+        name = Path(segment[index]).name
+        if name not in flags:
+            return index
+        original = index
+        index += 1
+        while index < len(segment):
+            token = segment[index]
+            if token == "--":
+                index += 1
+                break
+            if token in values[name]:
+                index += 2
+            elif token in flags[name] or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", token):
+                index += 1
+            elif token.startswith("-"):
+                return original  # Unknown wrapper syntax: no guessed payload.
+            else:
+                break
+        if skipped is not None:
+            skipped.append(original)
     return None
 
 
@@ -391,13 +689,21 @@ def _iter_referenced_shell_scripts(
 ) -> Iterator[Path]:
     """Yield scripts executed directly or through a POSIX shell."""
     for segment in _iter_command_segments(command):
-        index = _command_token_index(segment)
+        skipped: list[int] = []
+        index = _unwrapped_command_token_index(segment, skipped=skipped)
+        for wrapper_index in skipped:
+            # A file named env/sudo/command can itself be a shell script.
+            # Retain EVERY skipped reference, including intermediate wrappers.
+            if "/" in segment[wrapper_index]:
+                resolved = _resolve_terminal_script_path(segment[wrapper_index], cwd)
+                if resolved is not None:
+                    yield resolved
         if index is None:
             continue
         executable = segment[index]
         executable_name = Path(executable).name
 
-        if executable_name in {".", "source"}:
+        if executable == "." or executable_name == "source":
             if len(segment) > index + 1:
                 resolved = _resolve_terminal_script_path(segment[index + 1], cwd)
                 if resolved is not None:
@@ -513,7 +819,7 @@ def _iter_shell_substitution_payloads(command: str) -> Iterator[Optional[str]]:
 def _iter_shell_command_payloads(command: str) -> Iterator[str]:
     """Yield code passed through ``sh|bash|... -c`` for recursive scanning."""
     for segment in _iter_command_segments(command):
-        index = _command_token_index(segment)
+        index = _unwrapped_command_token_index(segment)
         if index is None or Path(segment[index]).name not in _SHELL_EXECUTABLES:
             continue
         arguments = segment[index + 1 :]
@@ -617,6 +923,7 @@ def _contains_unsafe_gateway_action(
     depth: int,
     visited: set[Path],
     read_remote_script: Optional[_ReadRemoteScriptFn] = None,
+    is_local: Optional[bool] = None,
 ) -> bool:
     if _direct_lifecycle_scan(command):
         return True
@@ -630,6 +937,16 @@ def _contains_unsafe_gateway_action(
             depth=depth + 1,
             visited=visited,
             read_remote_script=read_remote_script,
+            is_local=is_local,
+        ):
+            return True
+
+    # Add boundary-aware scans; NEVER discard the conservative body/reference
+    # walk for an unknown stdin consumer (including executable forwarders).
+    for part in _heredoc_scan_parts(command):
+        if part and _contains_unsafe_gateway_action(
+            part, cwd=cwd, depth=depth + 1, visited=visited,
+            read_remote_script=read_remote_script, is_local=is_local,
         ):
             return True
 
@@ -640,12 +957,13 @@ def _contains_unsafe_gateway_action(
             depth=depth + 1,
             visited=visited,
             read_remote_script=read_remote_script,
+            is_local=is_local,
         ):
             return True
 
     for script_path in _iter_referenced_shell_scripts(command, cwd=cwd):
         try:
-            resolved = script_path.resolve(strict=False)
+            resolved = script_path if is_local is False else script_path.resolve(strict=False)
         except (OSError, ValueError):
             # OSError: unreadable/long paths. ValueError: embedded NUL byte
             # from a binary's decoded contents tokenized as a path — a
@@ -654,11 +972,14 @@ def _contains_unsafe_gateway_action(
         if resolved in visited:
             continue
         visited.add(resolved)
-        script_text, unsafe = _read_referenced_script(script_path)
+        script_text, unsafe = (
+            (None, False) if is_local is False else _read_referenced_script(script_path)
+        )
         if unsafe:
             return True
         if script_text is None and read_remote_script is not None:
-            # Local path missing; try the remote backend if one is available.
+            # Explicit remote context always uses the backend; otherwise this
+            # retains the existing fallback when no local text was found.
             # The callback's output crosses the same trust boundary as a
             # local read — sanitize it identically before it enters the
             # recursion (binary skip + size fail-closed).
@@ -678,6 +999,7 @@ def _contains_unsafe_gateway_action(
             depth=depth + 1,
             visited=visited,
             read_remote_script=read_remote_script,
+            is_local=is_local,
         ):
             return True
     return False
@@ -688,8 +1010,15 @@ def contains_gateway_lifecycle_command_or_referenced_script(
     *,
     cwd: Optional[str] = None,
     read_remote_script: Optional[_ReadRemoteScriptFn] = None,
+    is_local: Optional[bool] = None,
 ) -> bool:
     """Detect lifecycle/submit commands, including bounded nested scripts.
+
+    ``is_local=True`` enables the exact canonical Python read proof at the
+    outermost command only, failing closed if that form's proof is rejected.
+    Other forms retain the conservative scan. False makes backend reads
+    authoritative; None retains the historical reference scan without granting
+    any read exception.
 
     Total by construction: this function returns a verdict for *every*
     input and never raises. The direct scans below are pure string
@@ -705,6 +1034,13 @@ def contains_gateway_lifecycle_command_or_referenced_script(
     which is strictly worse than either verdict.
     """
     try:
+        # The callback is also supplied by LOCAL terminal backends; its
+        # presence says nothing about execution identity. Never propagate this
+        # exemption into a referenced script, substitution or shell -c body.
+        if is_local is True:
+            read_proof = _is_canonical_python_read(command)
+            if read_proof is not None:
+                return not read_proof or _direct_lifecycle_scan(command)
         # Includes the direct regex/submit scans at depth 0.
         return _contains_unsafe_gateway_action(
             command,
@@ -712,6 +1048,7 @@ def contains_gateway_lifecycle_command_or_referenced_script(
             depth=0,
             visited=set(),
             read_remote_script=read_remote_script,
+            is_local=is_local,
         )
     except Exception:
         logger.warning(

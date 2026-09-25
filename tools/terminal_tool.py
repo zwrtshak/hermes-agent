@@ -2818,11 +2818,11 @@ def terminal_tool(
             )
 
             def _read_script_in_env(script_path: str) -> Optional[str]:
-                """Best-effort script read; uses env.execute only when local read fails.
+                """Bounded script read in the explicitly selected backend.
 
                 For local backends the script path is on the host filesystem. For
-                SSH/Modal/Daytona the same path is remote; the local read misses, so we
-                fall back to a bounded ``env.execute('head -c ... < path')`` read.
+                SSH/Modal/Daytona must read remotely even if a same-named local
+                file exists; that host file cannot establish remote safety.
                 """
                 if env is None:
                     return None
@@ -2830,7 +2830,7 @@ def terminal_tool(
                     local_path = Path(script_path).expanduser()
                     if not local_path.is_absolute():
                         local_path = Path(guard_cwd) / local_path
-                    if local_path.is_file():
+                    if env_type == "local" and local_path.is_file():
                         metadata = local_path.stat()
                         if stat.S_ISREG(metadata.st_mode) and metadata.st_size <= _MAX_REFERENCED_SCRIPT_BYTES:
                             data = local_path.read_bytes()
@@ -2876,16 +2876,38 @@ def terminal_tool(
                 command,
                 cwd=guard_cwd,
                 read_remote_script=_read_script_in_env,
+                is_local=env_type == "local",
             ):
+                diagnostic_hint = (
+                    "This backend has no canonical Python read exemption; "
+                    "do not substitute a local interpreter path for a remote diagnostic. "
+                )
+                if env_type == "local":
+                    try:
+                        interpreter = Path(sys.executable).resolve(strict=True)
+                        if not interpreter.is_file():
+                            raise OSError("canonical interpreter is not a regular file")
+                        diagnostic_hint = (
+                            "For a local Python read diagnostic, use `"
+                            + shlex.quote(str(interpreter))
+                            + " -I -S - <<'PY'` followed by the supported pathlib/JSON read "
+                            "program and a closing `PY` line, as the entire command. "
+                            "Wrappers, pipes and redirects are not eligible. "
+                        )
+                    except (OSError, RuntimeError, ValueError):
+                        diagnostic_hint = (
+                            "The canonical local Python interpreter could not be resolved; "
+                            "no diagnostic invocation can be recommended. "
+                        )
                 return json.dumps({
                     "output": "",
                     "exit_code": 1,
                     "error": (
-                        "Blocked: command or referenced script cannot restart or stop "
-                        "the gateway from inside the gateway process. The gateway would "
-                        "kill this command before it could complete (SIGTERM propagates "
-                        "to child processes). Run `hermes gateway restart` from a "
-                        "separate shell outside the running gateway."
+                        "Blocked: command or referenced script contains gateway control "
+                        "or could not be established as safe by the conservative lifecycle scan. "
+                        + diagnostic_hint
+                        + "Actual gateway stop/restart remains blocked inside the gateway; "
+                        "perform intended gateway control from a separate shell outside it."
                     ),
                     "status": "error",
                 }, ensure_ascii=False)
