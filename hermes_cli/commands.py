@@ -142,6 +142,9 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("pause", "Pause new work globally (emergency stop); '/pause off' resumes", "Session",
                gateway_only=True, args_hint="[reason | off]",
                busy_policy="dispatch"),
+    CommandDef("continuation", "Show or confirm an immutable bounded owner proposal", "Session",
+               gateway_only=True, args_hint="show HASH | confirm HASH CODE",
+               subcommands=("show", "confirm"), busy_policy="dispatch"),
     CommandDef("approve", "Approve a pending dangerous command", "Session",
                gateway_only=True, args_hint="[session|always]", busy_policy="dispatch"),
     CommandDef("deny", "Deny a pending dangerous command (optionally with a reason)", "Session",
@@ -1277,7 +1280,7 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #     native slash.
 #   - pause: global emergency stop; reached via /hermes pause [off] on
 #     Slack. Added at the 50-cap — a native slot would clamp /platform.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "pause"})
+_SLACK_VIA_HERMES_ONLY = frozenset({"continuation", "topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "pause"})
 
 
 def _sanitize_slack_name(raw: str) -> str:

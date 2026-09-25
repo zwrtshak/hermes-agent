@@ -43,6 +43,7 @@ import uuid
 from pathlib import Path
 
 _IS_WINDOWS = platform.system() == "Windows"
+_IS_DARWIN = platform.system() == "Darwin"
 from tools.environments.local import _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env
 from hermes_cli._subprocess_compat import windows_hide_flags
 from dataclasses import dataclass, field
@@ -53,6 +54,9 @@ from hermes_cli.config import get_hermes_home
 from agent.redact import redact_sensitive_text
 
 logger = logging.getLogger(__name__)
+
+# Omitted identity is the legacy caller-owned API; explicit None is unknown.
+_UNSPECIFIED_HOST_IDENTITY = object()
 
 
 # Checkpoint file for crash recovery (gateway only)
@@ -376,6 +380,7 @@ class ProcessSession:
     cwd: Optional[str] = None                   # Working directory
     started_at: float = 0.0                     # time.time() of spawn (wall clock)
     host_start_time: Optional[int] = None       # kernel start ticks (/proc/<pid>/stat f22) — PID-reuse guard
+    host_os_identity: Optional[dict] = None     # macOS native start/executable, captured at spawn
     exited: bool = False                        # Whether the process has finished
     exit_code: Optional[int] = None             # Exit code (None if still running)
     completion_reason: str = "exited"           # exited|killed|lost|failed_start|already_exited
@@ -393,6 +398,8 @@ class ProcessSession:
     watcher_thread_id: str = ""
     watcher_message_id: str = ""                # Triggering message id — reply anchor for topic routing
     watcher_interval: int = 0                   # 0 = no watcher configured
+    completion_receipt: Optional[dict] = None    # Native launch binding
+    receipt_state: dict = field(default_factory=dict)  # Independent durable delivery dispositions
     notify_on_complete: bool = False             # Queue agent notification on exit
     # Watch patterns — trigger agent notification when output matches any pattern
     watch_patterns: List[str] = field(default_factory=list)
@@ -435,6 +442,7 @@ class ProcessRegistry:
     )
 
     def __init__(self):
+        self._checkpoint_owner = None
         self._running: Dict[str, ProcessSession] = {}
         self._finished: Dict[str, ProcessSession] = {}
         self._lock = threading.Lock()
@@ -745,36 +753,76 @@ class ProcessRegistry:
         except Exception:
             return None
 
+    @staticmethod
+    def _safe_host_os_identity(pid):
+        if not _IS_DARWIN or not pid:
+            return None
+        try:
+            from hermes_cli.diggr_continuation import process_identity
+            identity = process_identity(pid)
+            if identity.get('pid') == pid and identity.get('start') and identity.get('executable'):
+                return {key: identity[key] for key in ('pid', 'start', 'executable')}
+        except Exception:
+            pass
+        return None
+
     @classmethod
-    def _host_pid_is_ours(cls, pid: Optional[int], expected_start: Optional[int]) -> bool:
-        """True only if ``pid`` is alive AND still the process we spawned.
+    def _host_pid_identity(cls, pid: Optional[int], expected_start: Optional[int], expected_os=None, owned_process=None, owned_pty=None) -> Optional[bool]:
+        """True: matching live process; False: dead/reused; None: unknown.
 
-        The kernel recycles PID/PGID numbers once a process exits and is reaped,
-        so a stored PID can later name an *unrelated* process — observed in the
-        wild as a recycled number landing on a desktop browser's session leader,
-        which our tree-kill then SIGTERMs (Firefox dying at irregular intervals).
-        We compare the kernel start time captured at spawn against the live one;
-        a mismatch means the number was recycled and must never be signalled.
-
-        When no baseline was captured (legacy checkpoints, or platforms without
-        ``/proc``) we degrade to a bare liveness check rather than refusing to
-        act, preserving prior best-effort behaviour.
+        Unknown is neither evidence of exit nor permission to signal.
         """
         if not cls._is_host_pid_alive(pid):
             return False
-        if expected_start is None:
+        if _IS_DARWIN and expected_os is not None:
+            current = cls._safe_host_os_identity(pid)
+            if (not current or not isinstance(expected_os, dict)
+                    or expected_os.get('pid') != pid
+                    or not expected_os.get('start') or not expected_os.get('executable')):
+                return None
+            if current['start'] != expected_os['start']:
+                return False
+            # exec may legitimately change the executable of the same PID.
+            # Without the original executable, do not signal or claim exit.
+            if current['executable'] == expected_os['executable']:
+                return True
+            # An unreaped, still-running child cannot have had its PID reused.
+            # This exception is only available to the original waitable owner;
+            # recovered sessions have no waitable handle and stay unknown.
+            if owned_process is not None:
+                try:
+                    if owned_process.pid == pid and owned_process.poll() is None:
+                        return True
+                except Exception:
+                    pass
+            if owned_pty is not None:
+                try:
+                    from ptyprocess import PtyProcess
+                    if (isinstance(owned_pty, PtyProcess) and owned_pty.pid == pid
+                            and owned_pty.isalive() is True):
+                        return True
+                except Exception:
+                    pass
+            return None
+        current_start = cls._safe_host_start_time(pid)
+        if expected_start is None or current_start is None:
+            return None
+        if current_start == expected_start:
             return True
-        return cls._safe_host_start_time(pid) == expected_start
+        # psutil's cached Darwin boot epoch can shift live create_time values.
+        return None if _IS_DARWIN else False
+
+    @classmethod
+    def _host_pid_is_ours(cls, pid: Optional[int], expected_start: Optional[int], expected_os=None, owned_process=None) -> bool:
+        """Signal permission requires a positively matching live identity."""
+        return cls._host_pid_identity(pid, expected_start, expected_os, owned_process) is True
 
     def _refresh_detached_session(self, session: Optional[ProcessSession]) -> Optional[ProcessSession]:
         """Update recovered host-PID sessions when the underlying process has exited."""
         if session is None or session.exited or not session.detached or session.pid_scope != "host":
             return session
 
-        # Identity-aware liveness: a recycled PID (alive but a different process
-        # than we spawned) must be treated as "our process exited", so it is
-        # moved to finished and can never be tree-killed by a later kill().
-        if self._host_pid_is_ours(session.pid, session.host_start_time):
+        if self._host_pid_identity(session.pid, session.host_start_time, session.host_os_identity) is not False:
             return session
 
         with session._lock:
@@ -821,12 +869,14 @@ class ProcessRegistry:
             return 2.0
 
     @classmethod
-    def _terminate_host_pid(cls, pid: int, expected_start: Optional[int] = None) -> None:
+    def _terminate_host_pid(cls, pid: int, expected_start: Any = _UNSPECIFIED_HOST_IDENTITY, expected_os=None, owned_process=None) -> Optional[bool]:
         """Terminate a host-visible PID and its descendants.
 
         ``expected_start`` is the kernel start time captured when we spawned the
         process. When provided, it is re-validated against the live PID before
-        any signal is sent; a mismatch (or a dead PID) means the number was
+        any signal is sent. Explicit None refuses signaling; an omitted argument
+        preserves the caller-owned legacy API. False reports identity refusal.
+        A mismatch (or a dead PID) means the number was
         recycled onto an unrelated process and we refuse to touch it, so a stale
         background-session PID can never tree-kill a browser or other stranger.
 
@@ -863,15 +913,14 @@ class ProcessRegistry:
         POSIX and a missing ``taskkill.exe`` on Windows (effectively
         unreachable on real Windows installs, but cheap insurance).
         """
-        if expected_start is not None and not cls._host_pid_is_ours(pid, expected_start):
+        if expected_start is not _UNSPECIFIED_HOST_IDENTITY and not cls._host_pid_is_ours(pid, expected_start, expected_os, owned_process):
             # PID was recycled (start time changed) or is gone — never signal a
             # stranger. A leaked orphan is strictly preferable to killing e.g.
             # a browser whose session leader reused this dead session's PID.
             logger.warning(
-                "Refusing to terminate host pid %d: start-time mismatch — "
-                "PID was recycled onto an unrelated process.", pid,
+                "Refusing to terminate host pid %d: identity is not confirmed.", pid,
             )
-            return
+            return False
         if _IS_WINDOWS:
             try:
                 subprocess.run(
@@ -971,6 +1020,7 @@ class ProcessRegistry:
         session_key: str = "",
         env_vars: dict = None,
         use_pty: bool = False,
+        completion_receipt: Optional[dict] = None,
     ) -> ProcessSession:
         """
         Spawn a background process locally.
@@ -998,7 +1048,11 @@ class ProcessRegistry:
             session_key=session_key,
             cwd=_resolve_safe_cwd(cwd or os.getcwd()),
             started_at=time.time(),
+            completion_receipt=dict(completion_receipt) if completion_receipt else None,
+            notify_on_complete=completion_receipt is not None,
         )
+        if session.completion_receipt is not None:
+            session.completion_receipt["started_at"] = session.started_at
 
         pty_scope_attempted = False
         if use_pty:
@@ -1045,6 +1099,7 @@ class ProcessRegistry:
                 )
                 session.pid = pty_proc.pid
                 session.host_start_time = self._safe_host_start_time(session.pid)
+                session.host_os_identity = self._safe_host_os_identity(session.pid)
                 # Store the pty handle on the session for read/write
                 session._pty = pty_proc
 
@@ -1152,6 +1207,7 @@ class ProcessRegistry:
         session.process = proc
         session.pid = proc.pid
         session.host_start_time = self._safe_host_start_time(session.pid)
+        session.host_os_identity = self._safe_host_os_identity(session.pid)
 
         try:
             # Start output reader thread
@@ -1182,7 +1238,7 @@ class ProcessRegistry:
                     # Never killpg: scope teardown is the authoritative
                     # cleanup for the worker cgroup.
                     _stop_systemd_unit(session.systemd_unit)
-                    self._terminate_host_pid(proc.pid, session.host_start_time)
+                    self._terminate_host_pid(proc.pid, session.host_start_time, session.host_os_identity, session.process)
                 elif not _IS_WINDOWS:
                     try:
                         kill_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
@@ -1209,6 +1265,7 @@ class ProcessRegistry:
         task_id: str = "",
         session_key: str = "",
         timeout: int = 10,
+        completion_receipt: Optional[dict] = None,
     ) -> ProcessSession:
         """
         Spawn a background process through a non-local environment backend.
@@ -1228,9 +1285,13 @@ class ProcessRegistry:
             session_key=session_key,
             cwd=cwd,
             started_at=time.time(),
+            completion_receipt=dict(completion_receipt) if completion_receipt else None,
+            notify_on_complete=completion_receipt is not None,
             env_ref=env,
             pid_scope="sandbox",
         )
+        if session.completion_receipt is not None:
+            session.completion_receipt["started_at"] = session.started_at
 
         # Run the command in the sandbox with output capture
         temp_dir = self._env_temp_dir(env)
@@ -1554,13 +1615,15 @@ class ProcessRegistry:
         with self._lock:
             was_running = self._running.pop(session.id, None) is not None
             self._finished[session.id] = session
+            if session.completion_receipt:
+                session.receipt_state.setdefault("completed_at", time.time())
         session._completion_event.set()
         self._write_checkpoint()
 
         # Only enqueue completion notification on the FIRST move.  Without
         # this guard, kill_process() and the reader thread can both call
         # _move_to_finished(), producing duplicate [IMPORTANT: ...] messages.
-        if was_running and session.notify_on_complete:
+        if was_running and session.notify_on_complete and session.completion_receipt is None:
             from tools.ansi_strip import strip_ansi
             output_tail = strip_ansi(session.output_buffer[-2000:]) if session.output_buffer else ""
             self.completion_queue.put({
@@ -1827,6 +1890,8 @@ class ProcessRegistry:
             "uptime_seconds": int(time.time() - session.started_at),
             "output_preview": output_preview,
         }
+        if session.completion_receipt:
+            result["receipt_state"] = dict(session.receipt_state)
         if session.exited:
             result["exit_code"] = session.exit_code
             result["completion_reason"] = session.completion_reason
@@ -2053,47 +2118,58 @@ class ProcessRegistry:
                 self._completion_consumed.add(session_id)
             return result
 
+        if session.pid_scope == "host" and session.pid:
+            identity = self._host_pid_identity(
+                session.pid, session.host_start_time, session.host_os_identity,
+                session.process, session._pty if not session.detached else None)
+            if identity is None:
+                return {"status": "error", "error": "Process identity is unknown; refusing to signal"}
+            if identity is False:
+                if session.systemd_unit:
+                    _stop_systemd_unit(session.systemd_unit)
+                with session._lock:
+                    session.exited = True
+                    session.exit_code = None
+                    output = strip_ansi(session.output_buffer[-2000:])
+                if consume_output:
+                    self._completion_consumed.add(session_id)
+                self._move_to_finished(session)
+                return {
+                    "status": "already_exited",
+                    "exit_code": session.exit_code,
+                    "output": output,
+                }
+
         # Kill via PTY, Popen (local), or env execute (non-local)
         try:
             if session._pty:
                 # PTY process -- terminate via ptyprocess
+                if session.pid_scope == "host" and self._host_pid_identity(
+                        session.pid, session.host_start_time, session.host_os_identity,
+                        owned_pty=session._pty if not session.detached else None) is not True:
+                    return {"status": "error", "error": "Process identity changed; termination refused"}
                 try:
                     session._pty.terminate(force=True)
                 except Exception:
                     if session.pid:
+                        if self._host_pid_identity(
+                                session.pid, session.host_start_time, session.host_os_identity,
+                                owned_pty=session._pty if not session.detached else None) is not True:
+                            return {"status": "error", "error": "Process identity changed; termination refused"}
                         os.kill(session.pid, signal.SIGTERM)
             elif session.process:
                 # Local process -- kill the process tree. On Windows this
                 # must be taskkill /T /F; Popen.terminate() only kills the
                 # shell wrapper and leaves Git Bash descendants behind.
-                self._terminate_host_pid(session.process.pid, session.host_start_time)
+                if self._terminate_host_pid(session.process.pid, session.host_start_time, session.host_os_identity, session.process) is False:
+                    return {"status": "error", "error": "Process identity changed; termination refused"}
             elif session.env_ref and session.pid:
                 # Non-local -- kill inside sandbox
                 session.env_ref.execute(f"kill {session.pid} 2>/dev/null", timeout=5)
             elif session.detached and session.pid_scope == "host" and session.pid:
-                # Identity check, not bare liveness: if the PID is gone OR was
-                # recycled onto an unrelated process, treat our process as
-                # exited and never tree-kill the stranger.  If this recovered
-                # session also carries an owned systemd scope, stop that scope
-                # before returning: a daemonized descendant may still be alive
-                # there even though the wrapper PID exited or was recycled
-                # across the gateway restart (#70716, teknium1 review).
-                if not self._host_pid_is_ours(session.pid, session.host_start_time):
-                    if session.systemd_unit:
-                        _stop_systemd_unit(session.systemd_unit)
-                    with session._lock:
-                        session.exited = True
-                        session.exit_code = None
-                        output = strip_ansi(session.output_buffer[-2000:])
-                    if consume_output:
-                        self._completion_consumed.add(session_id)
-                    self._move_to_finished(session)
-                    return {
-                        "status": "already_exited",
-                        "exit_code": session.exit_code,
-                        "output": output,
-                    }
-                self._terminate_host_pid(session.pid, session.host_start_time)
+                # Recheck at the signal boundary; refusal must not become exit.
+                if self._terminate_host_pid(session.pid, session.host_start_time, session.host_os_identity) is False:
+                    return {"status": "error", "error": "Process identity changed; termination refused"}
             else:
                 return {
                     "status": "error",
@@ -2430,7 +2506,8 @@ class ProcessRegistry:
         now = time.time()
         expired = [
             sid for sid, s in self._finished.items()
-            if (now - s.started_at) > FINISHED_TTL_SECONDS
+            if (now - s.receipt_state.get("completed_at", s.started_at)) > FINISHED_TTL_SECONDS
+            and (not s.completion_receipt or s.receipt_state.get("done"))
         ]
         for sid in expired:
             del self._finished[sid]
@@ -2439,8 +2516,10 @@ class ProcessRegistry:
 
         # If still over limit, remove oldest finished
         total = len(self._running) + len(self._finished)
-        if total >= MAX_PROCESSES and self._finished:
-            oldest_id = min(self._finished, key=lambda sid: self._finished[sid].started_at)
+        prunable = {sid: s for sid, s in self._finished.items()
+                    if not s.completion_receipt or s.receipt_state.get("done")}
+        if total >= MAX_PROCESSES and prunable:
+            oldest_id = min(prunable, key=lambda sid: prunable[sid].started_at)
             del self._finished[oldest_id]
             self._completion_consumed.discard(oldest_id)
             self._poll_observed.discard(oldest_id)
@@ -2459,20 +2538,87 @@ class ProcessRegistry:
 
     # ----- Checkpoint (crash recovery) -----
 
+    @staticmethod
+    def requires_gateway_checkpoint():
+        """Restrict the DIGGR repair to its two canonical profile namespaces."""
+        home = CHECKPOINT_PATH.resolve().parent
+        return home.name in ('diggr-main', 'diggr-coding') and home.parent.name == 'profiles'
+
+    def bind_gateway_checkpoint(self, home) -> None:
+        """Called by gateway startup only after its runtime-lock/PID claim.
+
+        Environment markers cannot grant this instance checkpoint ownership.
+        The actual held lock and its record must belong to this process/home.
+        """
+        if not self.requires_gateway_checkpoint():
+            return
+        from gateway import status
+        home = Path(home).resolve()
+        handle = status._gateway_lock_handle
+        record = status._read_gateway_lock_record() or {}
+        if (handle is None or handle.closed or record.get('pid') != os.getpid()
+                or record.get('hermes_home') != str(home)
+                or Path(handle.name).resolve() != home / 'gateway.lock'
+                or CHECKPOINT_PATH.resolve().parent != home):
+            raise RuntimeError('Gateway checkpoint requires the owned profile runtime lock')
+        owner = (os.getpid(), home, handle)
+        if self._checkpoint_owner is not None and self._checkpoint_owner != owner:
+            raise RuntimeError('Gateway checkpoint owner cannot be rebound')
+        self._checkpoint_owner = owner
+
+    def _owns_gateway_checkpoint(self):
+        from gateway import status
+        owner = self._checkpoint_owner
+        if owner is None:
+            return not self.requires_gateway_checkpoint()
+        return bool(owner and owner[0] == os.getpid()
+                    and CHECKPOINT_PATH.resolve().parent == owner[1]
+                    and status._gateway_lock_handle is owner[2]
+                    and not owner[2].closed)
+
+    def save_receipt_state(self, session_id, started_at, state) -> bool:
+        """Persist only the matching process incarnation; never adopt or launch."""
+        return self._write_checkpoint(receipt_update=(session_id, started_at, dict(state)))
+
     def _write_checkpoint(
         self,
         extra_entries: Optional[List[Dict[str, Any]]] = None,
+        *,
+        receipt_update=None,
     ):
-        """Write running process metadata to checkpoint file atomically."""
+        # Reject a fork before touching an inherited, possibly locked mutex.
+        if not self._owns_gateway_checkpoint():
+            return False
+        if self._checkpoint_owner is None and not self.requires_gateway_checkpoint():
+            return self._write_checkpoint_owned(extra_entries, receipt_update=receipt_update)
+        from gateway import status
+        # Lock order: gateway lifetime gate, then this registry's data lock.
+        # Runtime-lock release takes the same gate and therefore cannot let a
+        # replacement gateway start until this full atomic commit has ended.
+        with status._gateway_checkpoint_commit_lock:
+            return self._write_checkpoint_owned(extra_entries, receipt_update=receipt_update)
+
+    def _write_checkpoint_owned(self, extra_entries=None, *, receipt_update=None):
+        """Write running processes and bounded completed receipt records atomically."""
+        if not self._owns_gateway_checkpoint():
+            return False
         try:
             with self._lock:
+                receipt_session = None
+                if receipt_update is not None:
+                    session_id, started_at, updates = receipt_update
+                    receipt_session = self._running.get(session_id) or self._finished.get(session_id)
+                    if (receipt_session is None or receipt_session.started_at != started_at
+                            or not receipt_session.completion_receipt):
+                        return False
                 entries = []
-                for s in self._running.values():
-                    if not s.exited:
+                for s in list(self._running.values()) + list(self._finished.values()):
+                    if not s.exited or s.completion_receipt:
                         # Lazily backfill the kernel start time for host PIDs so
                         # recovery after restart can detect PID recycling even
-                        # for sessions spawned before this field existed.
-                        if s.host_start_time is None and s.pid_scope == "host" and s.pid:
+                        # for sessions spawned before this field existed. Never
+                        # bless an unknown recovered PID as the original process.
+                        if s.host_start_time is None and not s.detached and s.pid_scope == "host" and s.pid:
                             s.host_start_time = self._safe_host_start_time(s.pid)
                         entries.append({
                             "session_id": s.id,
@@ -2483,10 +2629,15 @@ class ProcessRegistry:
                             # display/logging (the process is already running;
                             # adoption re-validates the PID, never re-runs the
                             # command), so masking is lossless.
-                            "command": redact_sensitive_text(s.command, code_file=True),
-                            "pid": s.pid,
+                            "command": "" if s.exited else redact_sensitive_text(s.command, code_file=True),
+                            "pid": None if s.exited else s.pid,
+                            "exited": s.exited,
+                            "exit_code": s.exit_code,
+                            "completion_reason": s.completion_reason,
+                            "receipt_state": s.receipt_state,
                             "pid_scope": s.pid_scope,
                             "host_start_time": s.host_start_time,
+                            "host_os_identity": s.host_os_identity,
                             "systemd_unit": s.systemd_unit,
                             "cwd": s.cwd,
                             "started_at": s.started_at,
@@ -2500,6 +2651,7 @@ class ProcessRegistry:
                             "watcher_message_id": s.watcher_message_id,
                             "watcher_interval": s.watcher_interval,
                             "notify_on_complete": s.notify_on_complete,
+                            "completion_receipt": s.completion_receipt,
                             "watch_patterns": s.watch_patterns,
                         })
                 if extra_entries:
@@ -2509,12 +2661,27 @@ class ProcessRegistry:
                         for item in extra_entries
                         if item.get("session_id") not in tracked_ids
                     )
-            
-            # Atomic write to avoid corruption on crash
-            from utils import atomic_json_write
-            atomic_json_write(CHECKPOINT_PATH, entries)
+
+                # Hold the registry lock through the replace: an older snapshot
+                # must never overwrite a newer delivery acknowledgement.
+                from utils import atomic_json_write
+                if receipt_session is not None:
+                    previous = dict(receipt_session.receipt_state)
+                    receipt_session.receipt_state.update(updates)
+                try:
+                    atomic_json_write(CHECKPOINT_PATH, entries)
+                except BaseException:
+                    if receipt_session is not None:
+                        # Preserve the shared dictionary and both recipients'
+                        # earlier acknowledgements. No other checkpoint writer
+                        # can observe or persist the failed update under this lock.
+                        receipt_session.receipt_state.clear()
+                        receipt_session.receipt_state.update(previous)
+                    raise
+            return True
         except Exception as e:
-            logger.debug("Failed to write checkpoint file: %s", e, exc_info=True)
+            logger.warning("Failed to write checkpoint file: %s", e, exc_info=True)
+            return False
 
     def recover_from_checkpoint(self) -> int:
         """
@@ -2522,7 +2689,7 @@ class ProcessRegistry:
 
         Returns the number of processes recovered as detached.
         """
-        if not CHECKPOINT_PATH.exists():
+        if not self._owns_gateway_checkpoint() or not CHECKPOINT_PATH.exists():
             return 0
 
         try:
@@ -2533,6 +2700,31 @@ class ProcessRegistry:
         recovered = 0
         unresolved_scope_entries: List[Dict[str, Any]] = []
         for entry in entries:
+            if entry.get("exited") and entry.get("completion_receipt"):
+                state = dict(entry.get("receipt_state") or {})
+                for recipient in ("receipt", "main"):
+                    if state.get(recipient) == "sending":
+                        state[recipient] = "uncertain"
+                session = ProcessSession(
+                    id=entry["session_id"], command="", exited=True,
+                    exit_code=entry.get("exit_code"),
+                    completion_reason=entry.get("completion_reason", "exited"),
+                    started_at=entry["started_at"], session_key=entry.get("session_key", ""),
+                    completion_receipt=entry["completion_receipt"], receipt_state=state,
+                    notify_on_complete=True,
+                )
+                session._completion_event.set()
+                with self._lock:
+                    self._finished[session.id] = session
+                if not state.get("done"):
+                    binding = session.completion_receipt
+                    self.pending_watchers.append(dict(
+                        session_id=session.id, session_key=session.session_key,
+                        check_interval=entry.get("watcher_interval") or 1,
+                        platform="telegram", chat_id=binding.get("chat_id", ""),
+                        thread_id=binding.get("thread_id", ""), notify_on_complete=True,
+                        _receipt_process=session))
+                continue
             pid = entry.get("pid")
             if not pid:
                 continue
@@ -2557,7 +2749,10 @@ class ProcessRegistry:
             # watcher tree-kill a stranger (e.g. a browser). Re-validate the
             # kernel start time recorded in the checkpoint.
             recorded_start = entry.get("host_start_time")
-            if not self._host_pid_is_ours(pid, recorded_start):
+            recorded_os = entry.get("host_os_identity")
+            identity = self._host_pid_identity(pid, recorded_start, recorded_os)
+            # Unknown sessions remain tracked, without exit or signal authority.
+            if identity is False:
                 if self._is_host_pid_alive(pid):
                     logger.info(
                         "Not recovering session %s: pid %d is alive but its "
@@ -2583,6 +2778,7 @@ class ProcessRegistry:
                 session_key=entry.get("session_key", ""),
                 pid=pid,
                 host_start_time=recorded_start,
+                host_os_identity=recorded_os,
                 pid_scope=pid_scope,
                 systemd_unit=entry.get("systemd_unit", ""),
                 cwd=entry.get("cwd"),
@@ -2596,6 +2792,7 @@ class ProcessRegistry:
                 watcher_message_id=entry.get("watcher_message_id", ""),
                 watcher_interval=entry.get("watcher_interval", 0),
                 notify_on_complete=entry.get("notify_on_complete", False),
+                completion_receipt=entry.get("completion_receipt"),
                 watch_patterns=entry.get("watch_patterns", []),
             )
             with self._lock:
@@ -2616,6 +2813,7 @@ class ProcessRegistry:
                     "thread_id": session.watcher_thread_id,
                     "message_id": session.watcher_message_id,
                     "notify_on_complete": session.notify_on_complete,
+                    "_receipt_process": session if session.completion_receipt else None,
                 })
 
         self._write_checkpoint(extra_entries=unresolved_scope_entries)

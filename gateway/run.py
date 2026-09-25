@@ -4666,8 +4666,9 @@ class TurnRunner:
             if _plat_streaming is None
             else bool(_plat_streaming)
         )
-        _want_stream_deltas = _streaming_enabled
-        _want_interim_messages = ctx.interim_assistant_messages_enabled
+        from hermes_cli.diggr_delivery import native_turn
+        _want_stream_deltas = _streaming_enabled and not native_turn()
+        _want_interim_messages = ctx.interim_assistant_messages_enabled and not native_turn()
         _want_interim_consumer = _want_interim_messages
         if _want_stream_deltas or _want_interim_consumer:
             try:
@@ -16143,6 +16144,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "protect the transcript, this message was not processed. "
                     "Wait for the active turn to finish, then resend it."
                 )
+            _diggr_routed = await self._diggr_finish(event, _agent_result)
             # Goal continuation: after the agent returns a final response
             # for this turn, check any standing /goal — the judge will
             # either mark it done, pause it (budget), or enqueue a
@@ -16171,6 +16173,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
             except Exception as _goal_exc:
                 logger.debug("goal continuation hook failed: %s", _goal_exc)
+            if _diggr_routed:
+                # Durable outbox owns final delivery, including failures. Returning
+                # no response prevents a second untracked adapter send.
+                return None
             return _agent_result
         finally:
             # MoA one-shot restore must run on EVERY exit path, not just
@@ -16810,11 +16816,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             source.chat_id or "unknown", _msg_preview, _reply_id, _reply_txt,
         )
 
+        from hermes_cli.diggr_delivery import native_identity, native_session_matches
+        _native_origin = native_identity(self, event)
+
         # Get or create session
         # Topic-mode DMs: rewrite a stale/foreign thread_id to the user's
         # last-active topic so a cross-topic Reply or stripped plain reply
         # doesn't fragment the conversation across sessions.
-        recovered = await asyncio.to_thread(self._recover_telegram_topic_thread_id, source)
+        recovered = (await asyncio.to_thread(self._recover_telegram_topic_thread_id, source)
+                     if _native_origin is None else None)
         if recovered is not None:
             logger.info(
                 "telegram topic recovery: chat=%s user=%s %r -> %s",
@@ -16827,11 +16837,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
 
         session_entry = await self.async_session_store.get_or_create_session(source)
+        if _native_origin is not None and not await native_session_matches(self, _native_origin, session_entry):
+            raise ValueError('native wake session lineage unresolved; agent start refused')
         session_key = session_entry.session_key
         pinned_session_id = str(
             (getattr(event, "metadata", None) or {}).get("gateway_session_id") or ""
         ).strip()
-        if pinned_session_id:
+        if pinned_session_id and _native_origin is None:
             resolved_entry = await self._resolve_async_delegation_session(
                 session_entry,
                 pinned_session_id,
@@ -16840,7 +16852,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return
             session_entry = resolved_entry
         self._cache_session_source(session_key, source)
-        if await asyncio.to_thread(self._is_telegram_topic_lane, source):
+        if _native_origin is None and await asyncio.to_thread(self._is_telegram_topic_lane, source):
             try:
                 binding = (await self._session_db.get_telegram_topic_binding(
                     chat_id=str(source.chat_id),
@@ -16940,15 +16952,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         context = build_session_context(source, self.config, session_entry)
         
         # Set session context variables for tools (task-local, concurrency-safe)
-        _session_env_tokens = self._set_session_env(context)
-        from hermes_cli.diggr_continuation import EVENT_CONTEXT, runtime_guard
-        _diggr_home = self._resolve_profile_home_for_source(source).resolve()
-        _diggr_guard = runtime_guard(_diggr_home)
-        if _diggr_guard is not None:
-            self._diggr_homes = getattr(self, '_diggr_homes', set()) | {str(_diggr_home)}
-            EVENT_CONTEXT.set(dict(identity=self._diggr_identity(source, session_entry.session_id)))
-        else:
-            EVENT_CONTEXT.set(None)
+        from hermes_cli.diggr_delivery import set_tool_context
+        _session_env_tokens = await set_tool_context(self, event, context, session_entry)
         
         # Read privacy.redact_pii from config (re-read per message)
         _redact_pii = False
@@ -19433,8 +19438,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         await _deliver()
 
     def _diggr_identity(self, source, session_id):
+        from hermes_cli.profiles import get_active_profile_name
+        profile = source.profile or self._profile_name_for_source(source) or get_active_profile_name()
         return dict(home=str(self._resolve_profile_home_for_source(source).resolve()),
-                    profile=source.profile or 'diggr-main', session=session_id,
+                    profile=profile, session=session_id,
                     session_key=self._session_key_for_source(source),
                     platform=source.platform.value, chat_id=str(source.chat_id),
                     user_id=str(source.user_id or ''), thread_id=str(source.thread_id or ''))
@@ -19445,8 +19452,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         wake = token(event.text)
         if guard is None:
             return wake is None
+        if wake is not None:
+            from hermes_cli.diggr_delivery import NativeWake, native_identity
+            proof = getattr(event, '_diggr_wake', None)
+            if type(proof) is not NativeWake:
+                return False
+            try:
+                native_identity(self, event, accepted=False)
+            except ValueError:
+                return False
         session = await self.async_session_store.get_or_create_session(event.source)
         identity = self._diggr_identity(event.source, session.session_id)
+        if (event.text or '').split(' ', 1)[0].casefold() == '/continuation':
+            from hermes_cli.diggr_owner import handle_command
+            return await handle_command(self, event, guard, identity)
         command = (event.text or '').strip().casefold()
         controls = {'/stop': 'paused', 'stop': 'paused', 'stopp': 'paused',
                     '/goal pause': 'paused', 'pause': 'paused', '/goal clear': 'cancelled',
@@ -19461,7 +19480,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 promoted = self._promote_queued_event(key, adapter, None)
                 if promoted is not None:
                     adapter._pending_messages[key] = promoted
-        return wake is None or guard.begin(identity, wake)
+        if wake is None:
+            return True
+        from hermes_cli.diggr_delivery import NativeWake
+        proof = getattr(event, '_diggr_wake', None)
+        if (type(proof) is not NativeWake or
+                (proof.task, proof.generation) != (wake.get('task'), wake.get('generation'))):
+            return False
+        from hermes_cli.diggr_delivery import native_identity, native_session_matches
+        try:
+            identity = native_identity(self, event, accepted=False)
+        except ValueError:
+            return False
+        if not await native_session_matches(self, identity, session):
+            return False
+        return guard.begin(identity, wake)
+
+    async def _diggr_finish(self, event, response):
+        from hermes_cli.diggr_delivery import finish
+        return await finish(self, event, response)
+
+    async def _diggr_deliver(self, guard, identity):
+        from hermes_cli.diggr_delivery import deliver
+        await deliver(self, guard, identity)
 
     async def _diggr_tick(self, source, session_id, idle=False):
         from hermes_cli.diggr_continuation import runtime_guard, prompt, token, observe_processes
@@ -19470,48 +19511,76 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return False
         identity = self._diggr_identity(source, session_id)
         observe_processes(guard)
-        if not guard.blocks(identity):
-            return False
-        adapter = self._adapter_for_source(source)
-        key = identity['session_key']
-        if adapter is None or not hasattr(adapter, '_pending_messages'):
-            raise ValueError('SYSTEM167 unsupported native adapter target')
-        busy = key in self._running_agents or key in getattr(adapter, '_active_sessions', {})
-        if idle and busy:
-            guard.tick(identity, busy=True)
+        from hermes_cli.diggr_continuation import TERMINAL
+        try:
+            if not guard.blocks(identity):
+                return False
+            from hermes_cli.diggr_delivery import route_scope
+            with guard.transaction() as rows:
+                row = next((dict(r) for r in rows.values()
+                            if r.get('identity') == identity and r['status'] not in TERMINAL), None)
+            if row is None:
+                return False
+            scoped_source = await route_scope(self, row)
+            if not scoped_source:
+                guard.tick(identity, busy=True)  # Maintain owner bounds without a wake.
+                return True
+            source = scoped_source
+            adapter = self._completion_receipt_adapter(source, row['origin']['transport'])
+            key = identity['session_key']
+            if adapter is None or not hasattr(adapter, '_pending_messages'):
+                guard.tick(identity, busy=True)
+                return True  # Retain result without consuming a coordinator wake.
+            busy = key in self._running_agents or key in getattr(adapter, '_active_sessions', {})
+            if idle and busy:
+                guard.tick(identity, busy=True)
+                return True
+            wake = guard.tick(identity, busy=False)
+            if wake:
+                event = MessageEvent(text=prompt(wake), message_type=MessageType.TEXT,
+                                     source=source, message_id=None, channel_prompt=None)
+                from hermes_cli.diggr_delivery import NativeWake
+                event._diggr_wake = NativeWake(wake['task'], wake['generation'], identity['session'])
+                event.internal = True
+                self._enqueue_fifo(key, event, adapter)
+            # Reuse the native adapter consumer, never launch a Coding worker.
+            if idle and not busy:
+                head = adapter._pending_messages.get(key)
+                if head:
+                    event = adapter.get_pending_message(key)
+                    self._promote_queued_event(key, adapter, event)
+                    adapter._start_session_processing(event, key)
             return True
-        wake = guard.tick(identity, busy=False)
-        if wake:
-            event = MessageEvent(text=prompt(wake), message_type=MessageType.TEXT,
-                                 source=source, message_id=None, channel_prompt=None)
-            self._enqueue_fifo(key, event, adapter)
-        # Reuse the native adapter consumer, never launch a Coding worker.
-        if idle and not busy:
-            head = adapter._pending_messages.get(key)
-            if head:
-                event = adapter.get_pending_message(key)
-                self._promote_queued_event(key, adapter, event)
-                adapter._start_session_processing(event, key)
-        return True
+        finally:
+            # Queue the independent coordinator turn before any slow transport
+            # await. Telegram failure must never delay native result intake.
+            await self._diggr_deliver(guard, identity)
 
     async def _diggr_idle_tick(self):
         from hermes_cli.diggr_continuation import runtime_guard, TERMINAL
         from hermes_constants import get_hermes_home
         homes = set(getattr(self, '_diggr_homes', set())) | {str(get_hermes_home().resolve())}
+        from hermes_cli.diggr_delivery import PROFILES
+        for profile in (getattr(self, '_profile_adapters', {}) or {}):
+            if profile in PROFILES:
+                source = SessionSource(platform=Platform.TELEGRAM, profile=profile, chat_id='')
+                homes.add(str(self._resolve_profile_home_for_source(source).resolve()))
         for home in homes:
             try:
                 guard = runtime_guard(home)
                 if guard is None:
                     continue
                 with guard.transaction() as tasks:
-                    identities = [r['identity'] for r in tasks.values() if r['status'] not in TERMINAL]
+                    identities = list({json.dumps(r['identity'], sort_keys=True): r['identity']
+                        for r in tasks.values() if r['status'] not in TERMINAL or
+                        any(d['status'] in {'pending', 'sending'} for d in r.get('deliveries', []))}.values())
                 for identity in identities:
                     try:
                         if identity['platform'] != 'telegram':
                             raise ValueError('unsupported Gateway continuation target')
                         source = SessionSource(platform=Platform.TELEGRAM, profile=identity['profile'],
                                                chat_id=identity['chat_id'], user_id=identity['user_id'],
-                                               thread_id=identity['thread_id'] or None)
+                                               thread_id=identity['thread_id'] or None, chat_type='dm')
                         if str(self._resolve_profile_home_for_source(source).resolve()) != home:
                             raise ValueError('stored target home no longer matches native routing')
                         await self._diggr_tick(source, identity['session'], idle=True)
@@ -19537,7 +19606,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         user message that arrives simultaneously is handled by the same
         queue and takes priority naturally.
         """
-        if await self._diggr_tick(source, getattr(session_entry, 'session_id', '') or ''):
+        from hermes_cli.diggr_continuation import EVENT_CONTEXT
+        from hermes_cli.diggr_delivery import NativeWake
+        proof = (EVENT_CONTEXT.get() or {}).get('native_wake')
+        bound_session = proof.session if type(proof) is NativeWake else getattr(session_entry, 'session_id', '') or ''
+        if await self._diggr_tick(source, bound_session):
             return
 
         try:
@@ -22088,9 +22161,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # bare runners built via object.__new__ (tests) without self.adapters
         # don't blow up — they simply default to supported.
         _adapters = getattr(self, "adapters", None) or {}
-        _adapter = _adapters.get(context.source.platform)
+        _adapter = self._adapter_for_source(context.source)
         _async_delivery = getattr(_adapter, "supports_async_delivery", True)
-        return set_session_vars(
+        from gateway.session_context import completion_launch_context
+        receipt_context = None
+        if (context.source.platform == Platform.TELEGRAM and _async_delivery
+                and context.session_id and context.session_key
+                and self._completion_receipt_bot_id(_adapter)):
+            loop = asyncio.get_running_loop()
+            # Capture ORIGINAL turn identity, not a mutable SessionEntry.
+            from gateway.platforms.base import _thread_metadata_for_source
+            binding = dict(metadata=_thread_metadata_for_source(context.source),
+                           profile=context.source.profile or "",
+                           transport_profile=self._adapter_profile_for_source(context.source) or "",
+                           home_namespace=str(_hermes_home),
+                           profile_home=str(self._resolve_profile_home_for_source(context.source).resolve()),
+                           platform=context.source.platform.value,
+                           user_id=str(context.source.user_id or ""),
+                           bot_id=self._completion_receipt_bot_id(_adapter),
+                           chat_type=context.source.chat_type,
+                           session_key=context.session_key,
+                           parent_session_id=context.session_id,
+                           chat_id=str(context.source.chat_id),
+                           thread_id=str(context.source.thread_id or ""))
+            def schedule(watcher):
+                loop.call_soon_threadsafe(
+                    lambda: asyncio.create_task(self._run_process_watcher(watcher)))
+            receipt_context = (binding, schedule)
+        tokens = set_session_vars(
             platform=context.source.platform.value,
             chat_id=context.source.chat_id,
             chat_type=(
@@ -22107,6 +22205,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             async_delivery=_async_delivery,
             cron_session="",
         )
+        completion_launch_context.set(receipt_context)
+        return tokens
 
     def _clear_session_env(self, tokens: list) -> None:
         """Restore session context variables to their pre-handler values."""
@@ -22668,7 +22768,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
 
     async def _inject_watch_notification(
-        self, synth_text: str, evt: dict,
+        self, synth_text: str, evt: dict, *, receipt_source=None, receipt_adapter=None,
     ) -> Optional[bool]:
         """Inject a watch/completion notification as a synthetic message event.
 
@@ -22679,7 +22779,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         is not a transactional boundary: a process crash after adapter
         acceptance can still cause durable at-least-once replay.
         """
-        source = self._build_process_event_source(evt)
+        source = receipt_source if receipt_source is not None else self._build_process_event_source(evt)
         if not source:
             # API-server-originated sessions bind a RAW session key (the
             # X-Hermes-Session-Id value — see _bind_api_server_session), not a
@@ -22731,30 +22831,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # (staging incident 2026-08-09, second occurrence). Resolve through
         # the shared transport resolver — native adapter wins; relay is
         # eligible only when it advertises fronting the logical platform.
-        adapter = None
-        try:
-            _platform_enum = Platform(platform_name)
-        except (ValueError, KeyError):
-            _platform_enum = None
-        if _platform_enum is not None:
+        adapter = receipt_adapter
+        if receipt_source is None:
+            adapter = None
             try:
-                _transport = resolve_delivery_transport(
-                    _platform_enum, self.config, self.adapters,
-                )
-            except Exception:
-                _transport = None
-            if _transport is not None:
-                adapter = _transport.adapter
-        if adapter is None:
-            # Legacy literal scan — still correct for native adapters, and
-            # keeps minimal runner stubs (tests) and exotic platform strings
-            # working when the resolver can't run.
-            for p, a in self.adapters.items():
-                if p.value == platform_name:
-                    adapter = a
-                    break
+                _platform_enum = Platform(platform_name)
+            except (ValueError, KeyError):
+                _platform_enum = None
+            if _platform_enum is not None:
+                try:
+                    _transport = resolve_delivery_transport(
+                        _platform_enum, self.config, self.adapters,
+                    )
+                except Exception:
+                    _transport = None
+                if _transport is not None:
+                    adapter = _transport.adapter
+            if adapter is None:
+                # Legacy literal scan — still correct for native adapters, and
+                # keeps minimal runner stubs (tests) and exotic platform strings
+                # working when the resolver can't run.
+                for p, a in self.adapters.items():
+                    if p.value == platform_name:
+                        adapter = a
+                        break
         if not adapter:
-            return None
+            return False if receipt_source is not None else None
         from gateway.wake import adapter_supports_push as _wake_push_ok
         if not _wake_push_ok(adapter):
             # Non-push adapter (api_server) resolved WITH routing metadata:
@@ -22811,6 +22913,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return True
         except Exception as e:
             logger.error("Watch notification injection error: %s", e)
+            if receipt_source is not None:
+                raise  # Acceptance may already have happened; do not auto-replay.
             return False
 
     @staticmethod
@@ -22901,18 +23005,273 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return "retry"
         return "deliver"
 
+    def _stop_completion_receipts(self, session_key):
+        # Interrupt authority must never depend on config or disk availability.
+        fences = getattr(self, '_completion_stop_fences', None)
+        if fences is None:
+            self._completion_stop_fences = fences = {}
+        fences[session_key] = time.time()
+        try:
+            self.session_store.set_session_metadata(
+                session_key, 'completion_receipt_stop_at', fences[session_key])
+        except Exception:
+            logger.warning('Completion stop fence persistence failed; in-memory fence active', exc_info=True)
+
+    @staticmethod
+    def _completion_receipt_bot_id(adapter):
+        # Public Telegram identity, never a token or credential fingerprint.
+        try:
+            value = getattr(getattr(adapter, '_bot', None), 'id', None)
+            return str(value) if isinstance(value, (str, int)) and value else ''
+        except Exception:
+            return ''
+
+    def _completion_receipt_adapter(self, source, binding):
+        from copy import copy
+        route = copy(source)
+        route.profile = binding.get('transport_profile') or None
+        adapter = self._adapter_for_source(route)
+        if adapter is not None:
+            if self._completion_receipt_bot_id(adapter) != binding.get('bot_id'):
+                return None
+            # Reattach authenticated transport provenance after SessionSource
+            # deserialization, so downstream Main replies use this same bot.
+            import weakref
+            source._transport_adapter_ref = weakref.ref(adapter)
+        return adapter
+
+    def _completion_receipt_save(self, evt, **updates):
+        from tools.process_registry import process_registry
+        # The registry commits partial updates under its checkpoint lock. Never
+        # publish a sending claim locally before its durable write succeeds.
+        return process_registry.save_receipt_state(evt['session_id'], evt['started_at'], updates)
+
+    def _completion_receipt_binding(self, evt):
+        return evt.get('completion_receipt') if evt.get('type') == 'completion' else None
+
+    async def _completion_receipt_scope(self, evt, binding, *, validate_binding=True):
+        if validate_binding and (not isinstance(binding, dict)
+                or not isinstance(binding.get('task'), str)
+                or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,63}', str(binding.get('task', '')))
+                or binding.get('started_at') != evt.get('started_at')
+                or binding.get('session_key') != evt.get('session_key')
+                or not binding.get('parent_session_id')
+                or not binding.get('bot_id')
+                or binding.get('home_namespace') != str(_hermes_home)):
+            return None
+        try:
+            await self.async_session_store._ensure_loaded()
+        except Exception:
+            return False
+        entry = self.session_store._entries.get(binding['session_key'])
+        source = getattr(entry, 'origin', None)
+        stopped_at = max(
+            getattr(entry, 'metadata', {}).get('completion_receipt_stop_at', 0),
+            getattr(self, '_completion_stop_fences', {}).get(binding['session_key'], 0))
+        if (not entry or getattr(entry, 'suspended', False) or not source
+                or evt['started_at'] <= stopped_at
+                or source.platform != Platform.TELEGRAM
+                or (source.profile or '') != binding.get('profile')
+                or ('chat_type' in binding and source.chat_type != binding['chat_type'])
+                or str(source.chat_id) != binding['chat_id']
+                or str(source.thread_id or '') != binding['thread_id']):
+            return None
+        route_id = entry.session_id
+        parent = binding['parent_session_id']
+        if getattr(self, '_session_db', None) is not None:
+            try:
+                verdict = await self._classify_completion_target(parent)
+            except Exception:
+                return False
+            if verdict != 'deliver':
+                return False if verdict == 'retry' else None
+        if entry.session_id != parent:
+            db = getattr(self, '_session_db', None)
+            if db is None:
+                return False
+            try:
+                row = await db.get_session(parent)
+                if not row or row.get('end_reason') != 'compression':
+                    return None
+                # Reuse the verified native compression lineage, never infer IDs.
+                tip = await db.get_compression_tip(parent)
+                if not tip or tip == parent:
+                    return False
+                tip_row = await db.get_session(tip)
+                if not tip_row or tip_row.get('ended_at'):
+                    return False
+                if entry.session_id != tip:
+                    route = await db.get_session(entry.session_id)
+                    if not route or route.get('end_reason') != 'compression':
+                        return None
+                    if await db.get_compression_tip(entry.session_id) != tip:
+                        return None
+            except Exception:
+                return False
+        # DB awaits can interleave /new, /stop or another compression rotation.
+        if self.session_store._entries.get(binding['session_key']) is not entry:
+            return None
+        if (getattr(entry, 'suspended', False)
+                or getattr(self, '_completion_stop_fences', {}).get(binding['session_key'], 0) >= evt['started_at']
+                or getattr(entry, 'metadata', {}).get('completion_receipt_stop_at', 0) >= evt['started_at']):
+            return None
+        if entry.session_id != route_id:
+            return False
+        return source
+
+    async def _send_completion_receipt(self, evt, identity, binding):
+        """Send independently; ambiguous attempts are retained without replay."""
+        state = evt['_receipt_state']
+        if state.get('receipt') == 'sending':
+            # The effect may already have happened. Failed persistence must
+            # retain the no-replay fence in memory as well as after restart.
+            return self._completion_receipt_save(evt, receipt='uncertain')
+        if state.get('receipt') in ('sent', 'uncertain', 'rejected', 'suppressed', 'exhausted'):
+            return True
+        source = await self._completion_receipt_scope(evt, binding)
+        if source is None:
+            self._completion_receipt_save(evt, receipt='suppressed')
+            return True
+        if source is False:
+            return False
+        adapter = self._completion_receipt_adapter(source, binding)
+        if adapter is None:
+            return False  # No send attempt; bounded by the original deadline.
+        if time.time() < state.get('retry_at', 0):
+            return False
+        if (evt.get('_receipt_exhausted')
+                or state.get('attempts', 0) >= self._RECEIPT_MAX_ATTEMPTS):
+            self._completion_receipt_save(evt, receipt='exhausted')
+            return True
+        from gateway.platforms.base import _thread_metadata_for_source
+        metadata = dict(binding.get('metadata') or _thread_metadata_for_source(source) or {})
+        metadata['strict_topic'] = True
+        metadata['diggr_durable_delivery'] = True  # Existing adapter no-replay send path.
+        code = evt.get('exit_code')
+        status = ('process exited; exit status unavailable' if code is None else
+                  'process finished' if type(code) is int and code == 0 else 'process blocked or failed')
+        text = f"{binding['task']}: {status}. Completion callback received; Main review pending."
+        if not self._completion_receipt_save(evt, receipt='sending', attempts=state.get('attempts', 0) + 1):
+            return False
+        try:
+            result = await asyncio.wait_for(adapter.send(
+                str(source.chat_id), text,
+                metadata=_non_conversational_metadata(metadata, platform='telegram'),
+            ), timeout=10.0)
+            if result.success is True and result.message_id:
+                disposition = 'sent'
+            elif result.success is True:
+                disposition = 'uncertain'
+            else:
+                outcome = (result.raw_response or {}).get('delivery_outcome') if isinstance(result.raw_response, dict) else None
+                disposition = {'safe_retry': 'pending', 'rejected': 'rejected'}.get(outcome, 'uncertain')
+            self._completion_receipt_save(evt, receipt=disposition,
+                message_id=result.message_id if disposition == 'sent' else None,
+                retry_at=time.time() + max(0, result.retry_after or 0))
+        except (Exception, asyncio.CancelledError):
+            self._completion_receipt_save(evt, receipt='uncertain')
+            if asyncio.current_task().cancelling():
+                raise
+        return state.get('receipt') != 'pending'
+
+    async def _completion_receipt_deliver(self, synth_text, evt, identity, binding):
+        from tools.process_registry import process_registry
+        if identity is None:
+            return None
+        session = process_registry.get(evt['session_id'])
+        if (session is None or not session.exited or session.started_at != evt.get('started_at')
+                or session.completion_receipt != binding
+                or session.exit_code != evt.get('exit_code')):
+            return None
+        evt['_receipt_state'] = session.receipt_state
+        evt['parent_session_id'] = binding.get('parent_session_id')
+        state = session.receipt_state
+        if state.get('done'):
+            return True
+        with self._completion_delivery_lock:
+            if identity in self._completion_deliveries_inflight:
+                return None
+            self._completion_deliveries_inflight.add(identity)
+        try:
+            scope = await self._completion_receipt_scope(evt, binding)
+            if scope is None:
+                updates = {'done': True}
+                if state.get('receipt') not in ('sent', 'uncertain', 'rejected', 'exhausted'):
+                    updates['receipt'] = 'suppressed'
+                if state.get('main') not in ('accepted', 'uncertain', 'exhausted'):
+                    updates['main'] = 'suppressed'
+                self._completion_receipt_save(evt, **updates)
+                return None
+            if scope is False:
+                return False
+            if not self._completion_receipt_save(evt):
+                return False
+
+            async def inject():
+                if state.get('main') == 'sending':
+                    return self._completion_receipt_save(evt, main='uncertain')
+                if state.get('main') in ('accepted', 'uncertain', 'suppressed', 'exhausted'):
+                    return True
+                source = await self._completion_receipt_scope(evt, binding)
+                if source is None:
+                    self._completion_receipt_save(evt, main='suppressed')
+                    return True
+                if source is False:
+                    return False
+                adapter = self._completion_receipt_adapter(source, binding)
+                if adapter is None or getattr(adapter, '_message_handler', True) is None:
+                    return False
+                if state.get('main_attempts', 0) >= self._RECEIPT_MAX_ATTEMPTS and not evt.get('_receipt_exhausted'):
+                    return False
+                if not self._completion_receipt_save(evt, main='sending', main_attempts=state.get('main_attempts', 0) + 1):
+                    return False
+                try:
+                    result = await self._inject_watch_notification(
+                        synth_text + f" Receipt delivery pending or unconfirmed; process {evt['session_id']} poll exposes receipt_state.",
+                        evt, receipt_source=source, receipt_adapter=adapter)
+                    self._completion_receipt_save(evt, main='accepted' if result is True else
+                                                  'suppressed' if result is None else 'pending')
+                    if result is True:
+                        evt['_main_injected'] = True
+                    return result is not False
+                except (Exception, asyncio.CancelledError):
+                    self._completion_receipt_save(evt, main='uncertain')
+                    if asyncio.current_task().cancelling():
+                        raise
+                    return True
+
+            # Neither recipient waits for the other recipient's network latency.
+            results = await asyncio.gather(inject(), self._send_completion_receipt(evt, identity, binding))
+            done = all(results)
+            self._completion_receipt_save(evt, done=done)
+            return done
+        finally:
+            self._completion_deliveries_inflight.discard(identity)
+            receipts = getattr(self, '_completion_receipts', None)
+            if receipts is None:
+                self._completion_receipts = receipts = OrderedDict()
+            receipts[identity] = dict(state, status=state.get('receipt', 'pending'))
+            while len(receipts) > self._completion_delivery_retention:
+                receipts.popitem(last=False)
+
     async def _deliver_completion_notification(
         self, synth_text: str, evt: dict,
     ) -> Optional[bool]:
         """Deliver once per live gateway, or return False for a retry.
 
-        ``True`` means this caller reached adapter acceptance, ``False`` means
-        injection failed and the claim was released for retry, and ``None``
+        ``True`` means adapter injection acceptance for ordinary events; for
+        opted-in receipts it means both recipients have final dispositions
+        (inspect receipt_state for sent, accepted, uncertain or rejected).
+        ``False`` means bounded delivery work remains, and ``None``
         means either another same-lifecycle caller owns/delivered the producer
         event or the event has no gateway route. No cross-process exactly-once
         guarantee is claimed.
         """
         identity = self._completion_delivery_identity(evt)
+        receipt_binding = self._completion_receipt_binding(evt)
+        if receipt_binding is not None:
+            return await self._completion_receipt_deliver(synth_text, evt, identity, receipt_binding)
+        already_injected = False
         durable_claim_id = ""
         durable_delegation_id = ""
         if evt.get("type") == "async_delegation":
@@ -22979,14 +23338,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             with self._completion_delivery_lock:
                 if (
                     identity in self._completion_deliveries_inflight
-                    or identity in self._completion_deliveries_delivered
+                    or (identity in self._completion_deliveries_delivered and receipt_binding is None)
                 ):
                     return None
+                already_injected = identity in self._completion_deliveries_delivered
                 self._completion_deliveries_inflight.add(identity)
 
         accepted = False
         try:
-            injection_result = await self._inject_watch_notification(synth_text, evt)
+            injection_result = True if already_injected else await self._inject_watch_notification(synth_text, evt)
             if injection_result is not True:
                 return injection_result
             accepted = True
@@ -23018,7 +23378,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
             return True
         finally:
-            if identity is not None and not accepted:
+            if identity is not None:
                 with self._completion_delivery_lock:
                     self._completion_deliveries_inflight.discard(identity)
             if durable_claim_id and not accepted:
@@ -23106,6 +23466,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("Async delegation watcher error: %s", e)
             await asyncio.sleep(interval)
 
+    _RECEIPT_MAX_ATTEMPTS = 3
+    _RECEIPT_TOTAL_SECONDS = 45.0
+    _RECEIPT_ATTEMPT_SECONDS = 12.0
+    _RECEIPT_FINAL_SECONDS = 5.0
+
     async def _run_process_watcher(self, watcher: dict) -> None:
         """
         Periodically check a background process and push updates to the user.
@@ -23147,12 +23512,88 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.debug("Process watcher ended (silent): %s", session_id)
             return
 
+        bound_process = watcher.pop('_receipt_process', None)
+        pending_receipt = None
+        receipt_deadline = None
         last_output_len = 0
         while True:
-            await asyncio.sleep(interval)
+            delay = interval
+            if receipt_deadline is not None:
+                delay = min(delay, max(0, receipt_deadline - time.monotonic()
+                                       - self._RECEIPT_FINAL_SECONDS))
+            await asyncio.sleep(delay)
 
-            session = process_registry.get(session_id)
-            if session is None:
+            if pending_receipt is None:
+                # Registry.get performs the native identity-aware detached refresh.
+                # A retained live object alone cannot observe a recovered PID exit.
+                if (bound_process is not None and not bound_process.exited
+                        and bound_process.detached
+                        and (bound_process.pid_scope != 'host'
+                             or bound_process.host_start_time is None)):
+                    logger.warning('Unsupported completion receipt recovery: %s', session_id)
+                    break
+                session = process_registry.get(session_id)
+                if session is None and bound_process is not None and bound_process.exited:
+                    session = bound_process  # Reader observed exit before registry pruning.
+                if session is None:
+                    if bound_process is not None:
+                        logger.warning('Completion receipt tracking lost before observed exit: %s', session_id)
+                    break
+                if (bound_process is not None
+                        and session.started_at != bound_process.started_at):
+                    logger.warning('Completion receipt process incarnation changed: %s', session_id)
+                    break
+                if bound_process is not None and session.exited:
+                    binding = dict(session.completion_receipt)
+                    pending_receipt = dict(
+                        type='completion', session_id=session.id,
+                        started_at=session.started_at, session_key=session_key,
+                        parent_session_id=binding['parent_session_id'],
+                        platform=platform_name, chat_id=chat_id, thread_id=thread_id,
+                        user_id=user_id, user_name=user_name, message_id=message_id,
+                        exit_code=session.exit_code, completion_receipt=binding,
+                        _receipt_state=session.receipt_state)
+                    state = session.receipt_state
+                    completed_at = state.setdefault('completed_at', time.time())
+                    state.setdefault('deadline', completed_at + self._RECEIPT_TOTAL_SECONDS)
+                    receipt_deadline = time.monotonic() + max(0, state['deadline'] - time.time())
+                    self._completion_receipt_save(pending_receipt)
+                    bound_process = None
+                    session = None  # Only minimal receipt data survives actual exit.
+            if pending_receipt is not None:
+                binding = pending_receipt['completion_receipt']
+                code = pending_receipt['exit_code']
+                status = ('exited; exit status unavailable' if code is None else
+                          'finished' if code == 0 else 'blocked or failed')
+                text = f"{binding['task']}: process {status}; Main review pending."
+                remaining = receipt_deadline - time.monotonic() - self._RECEIPT_FINAL_SECONDS
+                state = pending_receipt['_receipt_state']
+                if (remaining <= 0 or (state.get('main_attempts', 0) >= self._RECEIPT_MAX_ATTEMPTS
+                        and state.get('receipt') in ('sent', 'uncertain', 'rejected', 'suppressed', 'exhausted'))):
+                    pending_receipt['_receipt_exhausted'] = True
+                    state = pending_receipt['_receipt_state']
+                    if state.get('receipt') not in ('sent', 'uncertain', 'rejected', 'suppressed'):
+                        self._completion_receipt_save(pending_receipt, receipt='exhausted')
+                    try:
+                        await asyncio.wait_for(
+                            self._deliver_completion_notification(text, pending_receipt),
+                            timeout=max(0.001, receipt_deadline - time.monotonic()))
+                    except asyncio.TimeoutError:
+                        pass
+                    if state.get('main') not in ('accepted', 'uncertain', 'suppressed'):
+                        self._completion_receipt_save(pending_receipt, main='exhausted')
+                    self._completion_receipt_save(pending_receipt, done=True, retry_exhausted=True)
+                    identity = self._completion_delivery_identity(pending_receipt)
+                    self._completion_receipts[identity] = dict(state, status=state.get('receipt'))
+                    break
+                try:
+                    delivered = await asyncio.wait_for(
+                        self._deliver_completion_notification(text, pending_receipt),
+                        timeout=min(self._RECEIPT_ATTEMPT_SECONDS, remaining))
+                except asyncio.TimeoutError:
+                    delivered = False
+                if delivered is False:
+                    continue
                 break
 
             current_output_len = len(session.output_buffer)
@@ -23886,6 +24327,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Interrupt the current run and clear queued session state consistently."""
         if not session_key:
             return
+        if invalidation_reason.startswith(('stop_command', 'new_command')):
+            self._stop_completion_receipts(session_key)
         _iac_state = self._peek_session_state(session_key)
         running_agent = _iac_state.turn.agent if _iac_state else None
         _process_task_id = ""
@@ -24943,7 +25386,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         _thread_metadata: Optional[Dict[str, Any]] = self._thread_metadata_for_source(source, event_message_id)
 
-        if _streaming_enabled:
+        from hermes_cli.diggr_delivery import native_turn
+        if _streaming_enabled and not native_turn():
             try:
                 from gateway.stream_consumer import GatewayStreamConsumer
                 _adapter = self._adapter_for_source(source)
@@ -26477,7 +26921,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Use session_key (not source.chat_id) to match adapter's storage keys.
             pending_event = None
             pending = None
-            if result and adapter and session_key:
+            from hermes_cli.diggr_delivery import hold_native_queue
+            if result and adapter and session_key and not hold_native_queue(adapter, session_key):
                 pending_event = _dequeue_pending_event(adapter, session_key)
                 # /queue overflow: after consuming the adapter's "next-up"
                 # slot, promote the next queued event into it so the
@@ -26525,7 +26970,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # (e.g. during the final API call), the agent couldn't inject it
             # and returned it in result["pending_steer"]. Deliver it as the
             # next user turn so it isn't silently dropped.
-            if result and not pending and not pending_event:
+            from hermes_cli.diggr_delivery import native_turn
+            if result and not pending and not pending_event and not native_turn():
                 _leftover_steer = result.get("pending_steer")
                 if _leftover_steer:
                     pending = _leftover_steer
@@ -27793,6 +28239,11 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     atexit.register(remove_pid_file)
     atexit.register(release_gateway_runtime_lock)
 
+    # Only the gateway that won this profile's singleton claim may replace
+    # processes.json. Standalone CLIs and forked children remain in-memory.
+    from tools.process_registry import process_registry
+    process_registry.bind_gateway_checkpoint(_hermes_home)
+
     # Lifecycle ledger (NS-608): report if the previous gateway life died
     # uncleanly (SIGKILL / OOM / VM death — no exit path ran), then claim
     # the sentinel for this life. Placed after the PID-file/lock claim so
@@ -28129,14 +28580,13 @@ def _exit_after_graceful_shutdown(exit_code: int) -> None:
             stream.flush()
         except Exception:
             pass
-    # Release PID + runtime lock BEFORE the log drain: the drain is bounded but
-    # could still take up to its timeout on a wedged disk, and these locks must
-    # never be stranded. os._exit skips atexit, and the early SystemExit exit
-    # paths never run _stop_impl, so release here (idempotent).
+    # Never wait behind a wedged checkpoint in this hard-exit backstop.
+    # If a commit is busy, retain the runtime lock until os._exit closes it;
+    # unlocking while its writer still runs would permit stale replacement.
     try:
         from gateway.status import remove_pid_file, release_gateway_runtime_lock
         remove_pid_file()
-        release_gateway_runtime_lock()
+        release_gateway_runtime_lock(blocking=False)
     except Exception:
         pass
     # Mark this life cleanly exited in the lifecycle sentinel (NS-608). This

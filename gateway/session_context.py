@@ -126,6 +126,9 @@ _CRON_SESSION: ContextVar = ContextVar("HERMES_CRON_SESSION", default=_UNSET)
 # and any contextvar-unaware path keep working. Stateless adapters opt OUT by
 # setting ``supports_async_delivery = False`` on the adapter class; the gateway
 # propagates that into this contextvar at session-bind time.
+# Native gateway launch authority; never populated from process environment.
+completion_launch_context: ContextVar = ContextVar("completion_launch_context", default=None)
+
 _SESSION_ASYNC_DELIVERY: ContextVar = ContextVar("HERMES_SESSION_ASYNC_DELIVERY", default=_UNSET)
 
 # Cron auto-delivery vars — set per-job in run_job() so concurrent jobs
@@ -254,6 +257,7 @@ def set_session_vars(
     # "ContextVar-authoritative, strip on _UNSET" — see session_context_engaged.
     global _session_context_engaged
     _session_context_engaged = True
+    completion_launch_context.set(None)
     tokens = [
         _SESSION_PLATFORM.set(platform),
         _SESSION_SOURCE.set(source),
@@ -315,6 +319,7 @@ def clear_session_vars(tokens: list) -> None:
     # behavior (CLI / unaware paths), not be mistaken for an opted-out
     # stateless adapter.
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
+    completion_launch_context.set(None)
     try:
         from agent.runtime_cwd import clear_session_cwd
 
@@ -363,6 +368,7 @@ def reset_session_vars() -> None:
     # same inheritance-leak reason as the mapped vars above — see clear_session_vars,
     # which resets this var on the handler-exit path for the symmetric concern.
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
+    completion_launch_context.set(None)
     try:
         from agent.runtime_cwd import clear_session_cwd
 

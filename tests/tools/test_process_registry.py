@@ -27,13 +27,20 @@ def registry():
 
 
 @pytest.fixture(autouse=True)
-def _reset_systemd_scope_cache():
+def _reset_systemd_scope_cache(monkeypatch, request):
     """Reset the cached ``systemd-run --user --scope`` availability flag
     before each test so a probe run on a real systemd host (where
     ``INVOCATION_ID`` is set) doesn't leak into tests that mock
     ``subprocess.Popen``. Tests that exercise the probe directly reset the
     cache themselves."""
     import tools.process_registry as _pr
+
+    if request.cls and request.cls.__name__ in {
+        'TestSpawnEnvSanitization', 'TestSpawnRewriteCompoundBackground', 'TestSystemdCgroupIsolation',
+    }:
+        # These spawn tests use invented PIDs and intercept every Popen call.
+        # They cannot provide real OS provenance for their fake process handles.
+        monkeypatch.setattr(_pr.ProcessRegistry, '_safe_host_os_identity', staticmethod(lambda pid: None))
 
     original = _pr._SYSTEMD_SCOPE_AVAILABLE
     _pr._SYSTEMD_SCOPE_AVAILABLE = False
@@ -1024,6 +1031,7 @@ class TestKillProcess:
         s = _make_session(sid="proc_detached", command="sleep 999")
         s.pid = 424242
         s.detached = True
+        s.host_start_time = 12345
         registry._running[s.id] = s
 
         terminate_calls = []
@@ -1047,6 +1055,7 @@ class TestKillProcess:
             # SIGKILL-escalation step (grace=0) so it doesn't call
             # ``psutil.wait_procs`` on the FakeProcess.
             with patch("gateway.status._pid_exists", return_value=True), \
+                 patch.object(ProcessRegistry, "_safe_host_start_time", return_value=12345), \
                  patch.object(ProcessRegistry, "_daemon_term_grace_seconds",
                               staticmethod(lambda: 0.0)), \
                  patch.object(_psutil, "Process", side_effect=lambda pid: FakeProcess(pid)):
@@ -1056,6 +1065,33 @@ class TestKillProcess:
             assert ("terminate", 424242) in terminate_calls
         finally:
             registry._running.pop(s.id, None)
+
+
+    @pytest.mark.parametrize("recorded,current,expected", [
+        (None, 12345, "error"),
+        (12345, None, "error"),
+        (12345, 67890, "already_exited"),
+    ])
+    def test_detached_unknown_or_reused_identity_never_signaled(self, registry, recorded, current, expected, monkeypatch):
+        monkeypatch.setattr('tools.process_registry._IS_DARWIN', False)  # stable kernel ticks
+        session = _make_session(sid="proc_identity_fixture")
+        session.pid = 424242
+        session.detached = True
+        session.host_start_time = recorded
+        registry._running[session.id] = session
+        with patch("gateway.status._pid_exists", return_value=True), \
+             patch.object(ProcessRegistry, "_safe_host_start_time", return_value=current), \
+             patch.object(ProcessRegistry, "_terminate_host_pid") as terminate, \
+             patch("psutil.Process") as process, patch("os.kill") as kill:
+            result = registry.kill_process(session.id)
+        assert result["status"] == expected
+        terminate.assert_not_called()
+        process.assert_not_called()
+        kill.assert_not_called()
+        if expected == "error":
+            assert "identity is unknown" in result["error"]
+            assert not session.exited
+
 
 
 # =========================================================================
@@ -1312,25 +1348,67 @@ class TestTerminateHostPidPosix:
 # kernel start time captured at spawn before any signal is sent.
 # =========================================================================
 
+@pytest.fixture
+def host_process_tree(monkeypatch):
+    """Hermetic psutil/kernel boundary; never inspect or signal host processes."""
+    import psutil
+    import gateway.status as status
+
+    processes = {}
+    signals = []
+
+    class Process:
+        def __init__(self, pid, *, children=()):
+            self.pid = pid
+            self.start = 1000 + pid
+            self.alive = True
+            self.descendants = list(children)
+            processes[pid] = self
+
+        def children(self, recursive=False):
+            assert recursive is True
+            return list(self.descendants)
+
+        def is_running(self):
+            return self.alive
+
+        def status(self):
+            return psutil.STATUS_RUNNING if self.alive else psutil.STATUS_ZOMBIE
+
+        def terminate(self):
+            # Model the original SIGTERM-ignoring daemon without an unbounded
+            # subprocess whose cleanup depends on restricted host inspection.
+            signals.append((self.pid, signal.SIGTERM))
+
+        def kill(self):
+            signals.append((self.pid, signal.SIGKILL))
+            self.alive = False
+
+    def lookup(pid):
+        if pid not in processes:
+            raise AssertionError(f"unexpected host process lookup: {pid}")
+        return processes[pid]
+
+    monkeypatch.setattr(psutil, 'Process', lookup)
+    monkeypatch.setattr(status, '_pid_exists', lambda pid: lookup(pid).alive)
+    monkeypatch.setattr(status, 'get_process_start_time', lambda pid: lookup(pid).start)
+    return Process, signals
+
+
 class TestPidReuseGuard:
-    def test_terminate_refuses_when_start_time_mismatches(self, registry):
+    def test_terminate_refuses_when_start_time_mismatches(self, registry, host_process_tree):
         """A live PID whose start time changed (recycled) is NOT killed."""
-        proc = _spawn_python_sleep(30)
-        try:
-            real_start = ProcessRegistry._safe_host_start_time(proc.pid)
-            assert real_start is not None, "no /proc start time on this platform?"
-            # Simulate recycling: the recorded baseline no longer matches.
-            registry._terminate_host_pid(proc.pid, expected_start=real_start + 1)
-            # The process must still be alive — the guard refused to signal it.
-            assert not _wait_until(lambda: proc.poll() is not None, timeout=0.3)
-            assert proc.poll() is None
-        finally:
-            proc.kill()
-            proc.wait()
+        process, signals = host_process_tree
+        proc = process(101)
+        real_start = ProcessRegistry._safe_host_start_time(proc.pid)
+        assert real_start == proc.start
+        assert registry._terminate_host_pid(proc.pid, expected_start=real_start + 1) is False
+        assert proc.alive and signals == []
 
 
-    def test_refresh_detached_marks_recycled_pid_exited(self, registry):
+    def test_refresh_detached_marks_recycled_pid_exited(self, registry, monkeypatch):
         """A detached session whose PID got recycled is moved to finished."""
+        monkeypatch.setattr('tools.process_registry._IS_DARWIN', False)  # stable kernel ticks
         wrong_start = (ProcessRegistry._safe_host_start_time(os.getpid()) or 0) + 999
         s = _make_session(sid="proc_detached")
         s.pid = os.getpid()          # alive, but...
@@ -1354,53 +1432,23 @@ class TestSigkillEscalation:
     bypassed.
     """
 
-    # A process that traps SIGTERM (ignores it): only SIGKILL stops it.
-    # It prints "ready" AFTER installing the handler so the parent never
-    # signals it during the startup window (before SIG_IGN is in place).
-    _TRAP = (
-        "import signal, sys, time;"
-        "signal.signal(signal.SIGTERM, signal.SIG_IGN);"
-        "sys.stdout.write('ready\\n'); sys.stdout.flush();"
-        "[time.sleep(0.2) for _ in iter(int, 1)]"
-    )
-
-    def _spawn_trap(self):
-        proc = subprocess.Popen(
-            [sys.executable, "-c", self._TRAP],
-            stdout=subprocess.PIPE, text=True,
-        )
-        # Wait until the handler is installed before returning.
-        line = proc.stdout.readline()
-        assert line.strip() == "ready", "trap process failed to start"
-        return proc
-
-    def test_sigterm_ignoring_daemon_is_sigkilled(self, monkeypatch):
+    def test_sigterm_ignoring_daemon_is_sigkilled(self, monkeypatch, host_process_tree):
         monkeypatch.setattr(ProcessRegistry, "_daemon_term_grace_seconds",
-                            staticmethod(lambda: 0.3))
-        proc = self._spawn_trap()
-        try:
-            ProcessRegistry._terminate_host_pid(proc.pid)
-            assert _wait_until(lambda: proc.poll() is not None, timeout=4.0), \
-                "SIGTERM-ignoring daemon should be SIGKILLed after grace"
-        finally:
-            if proc.poll() is None:
-                proc.kill()
-            proc.wait()
+                            staticmethod(lambda: 0.01))
+        process, signals = host_process_tree
+        proc = process(101)
+        ProcessRegistry._terminate_host_pid(proc.pid, expected_start=proc.start)
+        assert not proc.alive
+        assert signals == [(proc.pid, signal.SIGTERM), (proc.pid, signal.SIGKILL)]
 
-    def test_escalation_does_not_bypass_recycled_pid_guard(self, monkeypatch):
+    def test_escalation_does_not_bypass_recycled_pid_guard(self, monkeypatch, host_process_tree):
         """A start-time mismatch must still spare the PID — no SIGTERM, no SIGKILL."""
         monkeypatch.setattr(ProcessRegistry, "_daemon_term_grace_seconds",
-                            staticmethod(lambda: 0.3))
-        proc = self._spawn_trap()
-        try:
-            real_start = ProcessRegistry._safe_host_start_time(proc.pid)
-            ProcessRegistry._terminate_host_pid(
-                proc.pid, expected_start=(real_start or 0) + 1)
-            assert not _wait_until(lambda: proc.poll() is not None, timeout=0.3)
-            assert proc.poll() is None
-        finally:
-            proc.kill()
-            proc.wait()
+                            staticmethod(lambda: 0.01))
+        process, signals = host_process_tree
+        proc = process(101)
+        assert ProcessRegistry._terminate_host_pid(proc.pid, expected_start=proc.start + 1) is False
+        assert proc.alive and signals == []
 
     def test_grace_reader_floors_at_zero(self, monkeypatch):
         """A negative configured grace is clamped to 0 (no escalation)."""
@@ -1409,79 +1457,18 @@ class TestSigkillEscalation:
                             lambda: {"terminal": {"daemon_term_grace_seconds": -5}})
         assert ProcessRegistry._daemon_term_grace_seconds() == 0.0
 
-    @pytest.mark.live_system_guard_bypass
-    def test_entire_tree_is_sigkilled_not_just_parent(self, monkeypatch):
-        """A SIGTERM-ignoring parent + children are ALL force-killed.
-
-        Regression: an earlier implementation trusted psutil.wait_procs's
-        gone/alive partition, which mis-partitioned across a parent/child tree
-        and left survivors un-killed (flaky — sometimes the parent lived,
-        sometimes a child). The escalation now re-probes every target directly.
-        """
-        import psutil
-        # 2.0s grace (not 1.0): with three interpreters mid-startup on a
-        # loaded runner, a 1s SIGTERM->partition window races child spawn and
-        # is how a child PID escaped the live-system guard in CI.
+    def test_entire_tree_is_sigkilled_not_just_parent(self, monkeypatch, host_process_tree):
+        """All captured tree members survive SIGTERM, then receive SIGKILL."""
         monkeypatch.setattr(ProcessRegistry, "_daemon_term_grace_seconds",
-                            staticmethod(lambda: 2.0))
-        # Parent spawns 2 children; all trap SIGTERM. Parent prints child pids
-        # after the handler is installed.
-        parent_src = (
-            "import signal, subprocess, sys, time;"
-            "child='import signal,time\\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\\n"
-            "[time.sleep(0.2) for _ in iter(int,1)]';"
-            "kids=[subprocess.Popen([sys.executable,'-c',child]) for _ in range(2)];"
-            "signal.signal(signal.SIGTERM, signal.SIG_IGN);"
-            "sys.stdout.write(' '.join(str(k.pid) for k in kids)+'\\n'); sys.stdout.flush();"
-            "[time.sleep(0.2) for _ in iter(int,1)]"
-        )
-        parent = subprocess.Popen([sys.executable, "-c", parent_src],
-                                  stdout=subprocess.PIPE, text=True)
-        # Bound the readline: if the parent wedges before printing, fail THIS
-        # test with a clear message instead of letting the per-file timeout
-        # SIGKILL the whole pytest process (opaque rc=124 in CI).
-        import select as _select
-        ready, _, _ = _select.select([parent.stdout], [], [], 20.0)
-        assert ready, "parent process failed to print child pids within 20s"
-        child_pids = [int(x) for x in parent.stdout.readline().split()]
-        all_pids = [parent.pid] + child_pids
-        try:
-            ProcessRegistry._terminate_host_pid(parent.pid)
-
-            def _pid_dead(p: int) -> bool:
-                # A pid is "dead" for our purposes if it no longer exists OR
-                # exists only as an unreaped zombie (already terminated, just
-                # not reaped by its reparented parent yet). psutil can also
-                # raise mid-probe if the pid vanishes between the existence
-                # check and the status read — treat any such race as dead.
-                try:
-                    if not psutil.pid_exists(p):
-                        return True
-                    return not ProcessRegistry._proc_alive(psutil.Process(p))
-                except Exception:
-                    return True
-
-            def _all_dead():
-                return all(_pid_dead(p) for p in all_pids)
-
-            # _terminate_host_pid SIGKILLs synchronously before returning, so
-            # the kill signals are already delivered here. The only remaining
-            # wait is the kernel tearing down 3 processes and the reparented
-            # children transitioning to zombie — which can lag on a loaded CI
-            # runner. Give a generous budget (matches the wait() test's 10s)
-            # so this asserts the escalation BEHAVIOR, not the runner's
-            # scheduling latency. The assertion itself never weakens: every
-            # tree member must end up dead/zombie.
-            assert _wait_until(_all_dead, timeout=15.0, interval=0.02), (
-                "entire SIGTERM-ignoring tree (parent + children) must be SIGKILLed"
-            )
-        finally:
-            for p in all_pids:
-                try:
-                    os.kill(p, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError, OSError):
-                    pass
-            parent.wait()
+                            staticmethod(lambda: 0.01))
+        process, signals = host_process_tree
+        children = [process(102), process(103)]
+        parent = process(101, children=children)
+        ProcessRegistry._terminate_host_pid(parent.pid, expected_start=parent.start)
+        targets = children + [parent]
+        assert signals == ([(p.pid, signal.SIGTERM) for p in targets]
+                           + [(p.pid, signal.SIGKILL) for p in targets])
+        assert all(not p.alive for p in targets)
 
 
 class TestHandleProcessRedaction:
@@ -2117,8 +2104,8 @@ class TestSystemdCgroupIsolation:
 
         stopped = []
         terminated = []
-        monkeypatch.setattr(registry, "_host_pid_is_ours", lambda pid, start: False)
-        monkeypatch.setattr(registry, "_terminate_host_pid", lambda pid, start: terminated.append((pid, start)))
+        monkeypatch.setattr(registry, "_host_pid_is_ours", lambda pid, start, native=None, owned=None: False)
+        monkeypatch.setattr(registry, "_terminate_host_pid", lambda pid, start, native=None, owned=None: terminated.append((pid, start)))
         monkeypatch.setattr("tools.process_registry._stop_systemd_unit", lambda unit: stopped.append(unit) or True)
 
         with patch.object(registry, "_write_checkpoint"):
@@ -2243,3 +2230,146 @@ class TestSystemdCgroupIsolation:
         )
 
         assert pr._stop_systemd_unit("hermes-worker-gone.scope") is True
+
+
+@pytest.mark.parametrize('native', [False, True])
+def test_darwin_clock_drift_does_not_finish_or_signal_unknown_session(monkeypatch, tmp_path, native):
+    import tools.process_registry as pr
+    monkeypatch.setattr(pr, '_IS_DARWIN', True)
+    monkeypatch.setattr(pr, 'CHECKPOINT_PATH', tmp_path / 'processes.json')
+    proof = {'pid': 424242, 'start': 'Wed Sep 23 16:34:17 2026', 'executable': '/fixture/python'}
+    monkeypatch.setattr(pr.ProcessRegistry, '_is_host_pid_alive', staticmethod(lambda pid: True))
+    monkeypatch.setattr(pr.ProcessRegistry, '_safe_host_start_time', staticmethod(lambda pid: 10000))
+    monkeypatch.setattr(pr.ProcessRegistry, '_safe_host_os_identity', staticmethod(lambda pid: dict(proof)))
+    registry = pr.ProcessRegistry()
+    session = ProcessSession(id='drift', command='fixture', pid=424242, detached=True,
+                             host_start_time=10100, host_os_identity=dict(proof) if native else None)
+    registry._running[session.id] = session
+    assert registry._write_checkpoint()
+    recovered = pr.ProcessRegistry()
+    assert recovered.recover_from_checkpoint() == 1
+    current = recovered.get(session.id)
+    assert current and not current.exited
+    assert current.host_os_identity == (proof if native else None)
+    assert recovered.poll(session.id)['status'] == 'running'
+    assert recovered.completion_queue.empty()
+    assert pr.ProcessRegistry._host_pid_identity(424242, 10100, current.host_os_identity) is (True if native else None)
+    if not native:
+        with patch.object(pr.ProcessRegistry, '_terminate_host_pid') as terminate:
+            assert recovered.kill_process(session.id)['status'] == 'error'
+        terminate.assert_not_called()
+        assert not current.exited and recovered.completion_queue.empty()
+
+
+@pytest.mark.parametrize('change,expected', [('start', False), ('executable', None), ('unavailable', None)])
+def test_darwin_native_identity_rechecks_at_signal_boundary(monkeypatch, change, expected):
+    import tools.process_registry as pr
+    monkeypatch.setattr(pr, '_IS_DARWIN', True)
+    proof = {'pid': 424242, 'start': 'Wed Sep 23 16:34:17 2026', 'executable': '/fixture/python'}
+    current = dict(proof)
+    if change != 'unavailable':
+        current[change] = 'changed'
+    monkeypatch.setattr(pr.ProcessRegistry, '_is_host_pid_alive', staticmethod(lambda pid: True))
+    monkeypatch.setattr(pr.ProcessRegistry, '_safe_host_start_time', staticmethod(lambda pid: 10100))
+    monkeypatch.setattr(pr.ProcessRegistry, '_safe_host_os_identity', staticmethod(lambda pid: None if change == 'unavailable' else current))
+    assert pr.ProcessRegistry._host_pid_identity(424242, 10100, proof) is expected
+    with patch('psutil.Process') as process, patch('os.kill') as kill:
+        assert pr.ProcessRegistry._terminate_host_pid(424242, 10100, proof) is False
+    process.assert_not_called()
+    kill.assert_not_called()
+
+
+def test_darwin_spawn_captures_native_identity_in_checkpoint(monkeypatch, tmp_path):
+    import tools.process_registry as pr
+    import hermes_cli.diggr_continuation as dc
+    monkeypatch.setattr(pr, '_IS_DARWIN', True)
+    monkeypatch.setattr(pr, 'CHECKPOINT_PATH', tmp_path / 'processes.json')
+    monkeypatch.setattr(pr.ProcessRegistry, '_safe_host_start_time', staticmethod(lambda pid: 10100))
+    monkeypatch.setattr('gateway.restart.is_gateway_supervisor_process', lambda: False)
+    proof = {'pid': 424242, 'start': 'Wed Sep 23 16:34:17 2026', 'executable': '/fixture/python'}
+    native_lookup = MagicMock(return_value=dict(proof, ppid=12, tty='??'))
+    monkeypatch.setattr(dc, 'process_identity', native_lookup)
+    with patch.object(pr.subprocess, 'Popen', return_value=MagicMock(pid=424242)), patch.object(pr.threading, 'Thread'):
+        registry = pr.ProcessRegistry()
+        session = registry.spawn_local('fixture-only', cwd=str(tmp_path))
+    native_lookup.assert_called_once_with(424242)
+    assert session.host_os_identity == proof
+    saved = json.loads(pr.CHECKPOINT_PATH.read_text())
+    assert saved[0]['host_os_identity'] == proof
+    assert 'ppid' not in saved[0]['host_os_identity']
+
+
+@pytest.mark.skipif(sys.platform != 'darwin', reason='Darwin native executable transition')
+@pytest.mark.parametrize('use_pty', [False, True], ids=['popen', 'pty'])
+def test_owned_popen_exec_transition_remains_stoppable(registry, tmp_path, use_pty):
+    import shlex
+    gate = tmp_path / 'exec-gate'
+    command = (f'while [ ! -f {shlex.quote(str(gate))} ]; do sleep 0.01; done; '
+               f'exec {shlex.quote(sys.executable)} -c "import time; time.sleep(30)"')
+    session = registry.spawn_local(command, cwd=str(tmp_path), use_pty=use_pty)
+    try:
+        if use_pty:
+            assert session._pty is not None and session._pty.isalive()
+            assert session.process is None
+        else:
+            assert session.process.poll() is None
+        assert session.host_os_identity
+        original = dict(session.host_os_identity)
+        gate.touch()
+        deadline = time.monotonic() + 5
+        current = original
+        while time.monotonic() < deadline:
+            current = registry._safe_host_os_identity(session.pid)
+            if current and current['executable'] != original['executable']:
+                break
+            time.sleep(0.01)
+        assert current and current['start'] == original['start']
+        assert current['executable'] != original['executable']
+        assert registry.kill_process(session.id)['status'] == 'killed'
+        if not use_pty:
+            session.process.wait(timeout=5)
+    finally:
+        if use_pty:
+            if session._pty.isalive():
+                session._pty.terminate(force=True)
+            session._reader_thread.join(timeout=5)
+            session._pty.close(force=True)
+        else:
+            if session.process.poll() is None:
+                session.process.kill()
+            session.process.wait(timeout=5)
+
+
+@pytest.mark.parametrize('boundary', ['duck', 'wrong_pid', 'dead', 'lookup_error', 'detached', 'before_terminate', 'fallback'])
+def test_darwin_pty_exec_proof_fails_closed_at_signal_boundaries(registry, monkeypatch, boundary):
+    from types import SimpleNamespace
+    PtyProcess = pytest.importorskip('ptyprocess').PtyProcess
+    import tools.process_registry as pr
+    monkeypatch.setattr(pr, '_IS_DARWIN', True)
+    proof = {'pid': 424242, 'start': 'Wed Sep 23 16:34:17 2026', 'executable': '/fixture/shell'}
+    current = dict(proof, executable='/fixture/python')
+    handle = (SimpleNamespace() if boundary == 'duck' else object.__new__(PtyProcess))
+    handle.closed = True  # No descriptor exists in this proof-boundary fixture.
+    handle.pid = 7 if boundary == 'wrong_pid' else proof['pid']
+    handle.isalive = MagicMock(return_value=boundary != 'dead')
+    if boundary == 'lookup_error':
+        handle.isalive.side_effect = OSError('child identity unavailable')
+    handle.terminate = MagicMock()
+    observations = [dict(current)] * 4
+    if boundary == 'before_terminate':
+        observations[1] = dict(current, start='different birth')
+    if boundary == 'fallback':
+        handle.terminate.side_effect = OSError('synthetic PTY termination failure')
+        observations[2] = dict(current, start='different birth')
+    monkeypatch.setattr(pr.ProcessRegistry, '_safe_host_os_identity', staticmethod(MagicMock(side_effect=observations)))
+    monkeypatch.setattr(pr.ProcessRegistry, '_is_host_pid_alive', staticmethod(lambda pid: True))
+    session = ProcessSession(id='pty-boundary', command='', pid=proof['pid'],
+                             host_os_identity=proof, host_start_time=123,
+                             detached=boundary == 'detached')
+    session._pty = handle
+    registry._running[session.id] = session
+    with patch('os.kill') as signal:
+        assert registry.kill_process(session.id)['status'] == 'error'
+    signal.assert_not_called()
+    assert not session.exited
+    assert handle.terminate.call_count == (1 if boundary == 'fallback' else 0)

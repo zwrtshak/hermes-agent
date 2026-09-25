@@ -4533,12 +4533,16 @@ class TelegramAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None
     ) -> SendResult:
         """Send a message to a Telegram chat."""
+        durable = bool((metadata or {}).get('diggr_durable_delivery'))
+        message_ids = []
         if not self._bot:
-            return SendResult(success=False, error="Not connected")
+            return SendResult(success=False, error="Not connected",
+                              raw_response={"delivery_outcome": "safe_retry"})
 
         # getattr() — tests build adapters via object.__new__() (no __init__).
         if getattr(self, "_send_path_degraded", False):
-            return SendResult(success=False, error="send_path_degraded", retryable=True)
+            return SendResult(success=False, error="send_path_degraded", retryable=True,
+                              raw_response={"delivery_outcome": "safe_retry"} if durable else None)
 
         # Skip whitespace-only text to prevent Telegram 400 empty-text errors.
         if not content or not content.strip():
@@ -4550,7 +4554,7 @@ class TelegramAdapter(BasePlatformAdapter):
             # through to the legacy MarkdownV2 path on permanent/capability
             # errors or DM-topic routing skips; returns directly on success or
             # on a transient failure (which must NOT be legacy-resent).
-            if self._should_attempt_rich(content, metadata=metadata):
+            if not durable and not (metadata or {}).get("strict_topic") and self._should_attempt_rich(content, metadata=metadata):
                 rich_result = await self._try_send_rich(chat_id, content, reply_to, metadata)
                 if rich_result is not None:
                     if rich_result.success:
@@ -4645,9 +4649,20 @@ class TelegramAdapter(BasePlatformAdapter):
                     thread_kwargs = dict(thread_kwargs)
                     thread_kwargs["message_thread_id"] = None
                 effective_thread_id = thread_kwargs.get("message_thread_id")
+                if (metadata or {}).get("strict_topic"):
+                    direct_topic_id = thread_kwargs.get("direct_messages_topic_id")
+                    if direct_topic_id is not None:
+                        # DM topics use a different Telegram API field. Require
+                        # that exact selected route, never two destinations.
+                        route_matches = (effective_thread_id is None and bool(thread_id)
+                                         and direct_topic_id == int(thread_id))
+                    else:
+                        route_matches = effective_thread_id == requested_thread_id
+                    if not route_matches:
+                        return SendResult(success=False, error="strict topic route unavailable", retryable=False)
 
                 msg = None
-                for _send_attempt in range(3):
+                for _send_attempt in range(1 if durable else 3):
                     try:
                         # Try Markdown first, fall back to plain text if it fails
                         try:
@@ -4662,7 +4677,7 @@ class TelegramAdapter(BasePlatformAdapter):
                             )
                         except Exception as md_error:
                             # Markdown parsing failed, try plain text
-                            if "parse" in str(md_error).lower() or "markdown" in str(md_error).lower():
+                            if (not durable or (_BadReq and isinstance(md_error, _BadReq))) and ("parse" in str(md_error).lower() or "markdown" in str(md_error).lower()):
                                 logger.warning("[%s] MarkdownV2 parse failed, falling back to plain text: %s", self.name, md_error)
                                 plain_chunk = _strip_mdv2(chunk)
                                 msg = await self._bot.send_message(
@@ -4678,13 +4693,15 @@ class TelegramAdapter(BasePlatformAdapter):
                                 raise
                         break  # success
                     except _NetErr as send_err:
+                        if durable:
+                            raise  # Outbox owns retries; never drop its bound topic.
                         # BadRequest is a subclass of NetworkError in
                         # python-telegram-bot but represents permanent errors
                         # (not transient network issues). Detect and handle
                         # specific cases instead of blindly retrying.
                         if _BadReq and isinstance(send_err, _BadReq):
                             if self._is_thread_not_found_error(send_err) and effective_thread_id is not None:
-                                if private_dm_topic_send or (metadata and metadata.get("telegram_dm_topic_created_for_send")):
+                                if private_dm_topic_send or (metadata and (metadata.get("strict_topic") or metadata.get("telegram_dm_topic_created_for_send"))):
                                     return SendResult(
                                         success=False,
                                         error=str(send_err),
@@ -4722,7 +4739,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                 continue
                             err_lower = str(send_err).lower()
                             if "message to be replied not found" in err_lower and reply_to_id is not None:
-                                if private_dm_topic_send:
+                                if private_dm_topic_send or (metadata or {}).get("strict_topic"):
                                     safe_send_error = _redact_telegram_error_text(send_err)
                                     return SendResult(
                                         success=False,
@@ -4780,6 +4797,8 @@ class TelegramAdapter(BasePlatformAdapter):
                         else:
                             raise
                     except Exception as send_err:
+                        if durable:
+                            raise  # Preserve unknown effects; do not retry internally.
                         retry_after = getattr(send_err, "retry_after", None)
                         if retry_after is not None or "retry after" in str(send_err).lower():
                             if _send_attempt < 2:
@@ -4828,6 +4847,28 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.error("[%s] Failed to send Telegram message: %s", self.name, safe_error)
             err_str = str(e).lower()
             error_kind = classify_send_error(e)
+            if durable:
+                # retryable alone does not prove non-delivery. Classify the actual
+                # Telegram exception, and retain every acknowledged partial chunk.
+                import telegram.error as tg_errors
+                def is_error(name):
+                    cls = getattr(tg_errors, name, None)
+                    return isinstance(cls, type) and isinstance(e, cls)
+                outcome = 'uncertain'
+                if not message_ids:
+                    if is_error('BadRequest') or is_error('Forbidden'):
+                        outcome = 'rejected'
+                    elif (is_error('RetryAfter') or self._looks_like_connect_timeout(e)
+                          or self._looks_like_pool_timeout(e)):
+                        outcome = 'safe_retry'
+                retry_delay = getattr(e, 'retry_after', None) if is_error('RetryAfter') else None
+                if hasattr(retry_delay, 'total_seconds'):
+                    retry_delay = retry_delay.total_seconds()
+                return SendResult(success=False, error=safe_error,
+                                  retryable=outcome == 'safe_retry', error_kind=error_kind,
+                                  retry_after=float(retry_delay) if retry_delay is not None else None,
+                                  raw_response={'delivery_outcome': outcome,
+                                                'message_ids': list(message_ids)})
             # Message too long — content exceeded 4096 chars. Return failure so
             # stream consumer enters fallback mode and sends the remainder.
             if "message_too_long" in err_str or "too long" in err_str:
@@ -8953,6 +8994,8 @@ class TelegramAdapter(BasePlatformAdapter):
         await self._ensure_forum_commands(msg)
 
         event = self._build_message_event(msg, MessageType.COMMAND, update_id=update.update_id)
+        from hermes_cli.diggr_owner import stamp_telegram
+        stamp_telegram(event, msg, update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
         await self._cache_replied_media(msg, event)
         event = self._apply_telegram_group_observe_attribution(event)
