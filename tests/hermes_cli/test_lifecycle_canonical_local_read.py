@@ -6,8 +6,8 @@ Dangerous candidates below are classified only, never executed.
 import json
 import os
 import shlex
-import subprocess
 import sys
+from unittest.mock import Mock
 
 import pytest
 
@@ -24,6 +24,19 @@ def canonical(body, delimiter="'PY'"):
 @pytest.fixture
 def terminal_boundary(tmp_path, monkeypatch):
     import tools.terminal_tool as tt
+    from tools.environments.local import LocalEnvironment
+    from tools.environments.ssh import SSHEnvironment
+
+    # Do not source the operator's login/rc files. Only snapshot bootstrap is
+    # disabled; execute, preparation, wrapping, bash and output handling run.
+    def isolated_session(env):
+        env._prefer_nonlogin = True
+
+    monkeypatch.setattr(LocalEnvironment, "init_session", isolated_session)
+    local = LocalEnvironment(cwd=str(tmp_path), timeout=10)
+    real_execute = local.execute
+    real_prepare = local._prepare_command
+    real_run_bash = local._run_bash
 
     class Boundary:
         env = {}
@@ -33,39 +46,69 @@ def terminal_boundary(tmp_path, monkeypatch):
         def __init__(self):
             self.calls = []
             self.remote_files = {}
+            self.prepared = []
+            self.launches = []
 
         def execute(self, command, **kwargs):
             self.calls.append(command)
             if command == self.expected_read:
                 # Only explicitly selected harmless read programs get a child.
-                result = subprocess.run(
-                    ["/bin/sh", "-c", command], cwd=tmp_path,
-                    env={"PATH": "/usr/bin:/bin"},
-                    capture_output=True, text=True, timeout=10,
-                )
-                return {"output": result.stdout + result.stderr, "returncode": result.returncode}
+                return real_execute(command, **kwargs)
             if command.startswith("head -c "):
                 return {"output": self.remote_files.get(shlex.split(command)[-1], ""), "returncode": 0}
             # Never execute an unexpected or dangerous command, even on failure.
             return {"output": "unexpected execution boundary", "returncode": 0}
 
     boundary = Boundary()
+
+    def prepare(command):
+        result = real_prepare(command)
+        boundary.prepared.append((command, result))
+        return result
+
+    def run_bash(command, **kwargs):
+        assert not kwargs.get("login"), "must never read private shell profiles"
+        boundary.launches.append((command, kwargs.get("stdin_data")))
+        return real_run_bash(command, **kwargs)
+
+    monkeypatch.setattr(local, "execute", boundary.execute)
+    monkeypatch.setattr(local, "_prepare_command", prepare)
+    monkeypatch.setattr(local, "_run_bash", run_bash)
+    # A real SSH type without construction, connection, sync or cleanup.
+    ssh = object.__new__(SSHEnvironment)
+    ssh.cwd = str(tmp_path)
+    ssh.env = {}
+    ssh.execute = boundary.execute
+    ssh.cleanup = lambda: None
+    # An unknown object can claim any name/attribute without proving locality.
+    unknown = type("LocalEnvironment", (), {})()
+    unknown.cwd = str(tmp_path)
+    unknown.env = {}
+    unknown.env_type = "local"
+    unknown.is_local = True
+    unknown.execute = boundary.execute
+    environments = {"local": local, "ssh": ssh, "unknown": unknown, "docker": unknown}
+    boundary.environments = environments
+    cache = {"default": local}
     config = {"env_type": "local", "cwd": str(tmp_path), "timeout": 30,
               "lifetime_seconds": 3600, "docker_image": "synthetic-unused"}
-    monkeypatch.setattr(tt, "_active_environments", {"default": boundary})
+    monkeypatch.setattr(tt, "_active_environments", cache)
     monkeypatch.setattr(tt, "_last_activity", {"default": 0.0})
     monkeypatch.setattr(tt, "_task_env_overrides", {})
+    monkeypatch.setattr(tt, "_start_cleanup_thread", lambda: None)
     monkeypatch.setattr(tt, "_get_env_config", lambda: config)
     monkeypatch.setattr(tt, "get_session_cwd", lambda key: None)
     monkeypatch.setattr(tt, "record_session_cwd", lambda *args: None)
     monkeypatch.setenv("_HERMES_GATEWAY", "1")
 
-    def run(command, backend="local", execute_read=False):
+    def run(command, backend="local", execute_read=False, cached_backend=None):
         config["env_type"] = backend
+        cache["default"] = environments[cached_backend or backend]
         boundary.expected_read = command if execute_read else None
         return json.loads(tt.terminal_tool(command=command, force=True))
 
-    return run, boundary
+    yield run, boundary
+    local.cleanup()
 
 
 @pytest.fixture
@@ -92,6 +135,128 @@ def test_canonical_local_read_form_real_reads_at_terminal_boundary(read_data, te
     assert result["exit_code"] == 0, result
     assert ("hermes gateway restart" if kind == "json" else "entry.txt") in result["output"]
     assert boundary.calls == [command]
+    assert boundary.prepared == [(command, (command, None))]
+    assert len(boundary.launches) == 1
+    assert boundary.launches[0][1] is None
+
+
+@pytest.mark.parametrize("kind", ["json", "directory"])
+@pytest.mark.parametrize("delimiter", ["'PY'", '"PY"', "\\PY", "P'Y'"])
+@pytest.mark.parametrize("sudo_form", ["name", "data"])
+@pytest.mark.parametrize("password", [None, "synthetic-test-password"])
+def test_canonical_reads_survive_real_backend_sudo_preparation(
+    read_data, terminal_boundary, monkeypatch, kind, delimiter, sudo_form, password,
+):
+    import tools.terminal_tool as tt
+
+    data, directory = read_data
+    expression = (
+        f"json.loads(Path({str(data)!r}).read_text())['example']"
+        if kind == "json" else f"list(Path({str(directory)!r}).iterdir())"
+    )
+    body = "from pathlib import Path\nimport json\n"
+    if sudo_form == "name":
+        body += f"sudo = {expression}\nprint(sudo)"
+    else:
+        # Valid Python string quotes need not form balanced shell tokens.
+        body += f"print({expression})\n" + 'message = """diagnostic "\nsudo data\n"""\nprint(json.dumps(message))'
+    command = canonical(body, delimiter)
+    assert _is_canonical_python_read(command) is True
+    if password is None:
+        monkeypatch.delenv("SUDO_PASSWORD", raising=False)
+    else:
+        monkeypatch.setenv("SUDO_PASSWORD", password)
+    monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+    monkeypatch.setattr(tt, "_sudo_password_cache", {})
+    prompt = Mock(return_value="")
+    probe = Mock(return_value=False)
+    monkeypatch.setattr(tt, "_prompt_for_sudo_password", prompt)
+    monkeypatch.setattr(tt, "_sudo_nopasswd_works", probe)
+    run, boundary = terminal_boundary
+    result = run(command, execute_read=True)
+    assert result["exit_code"] == 0, result
+    assert ("hermes gateway restart" if kind == "json" else "entry.txt") in result["output"]
+    if sudo_form == "data":
+        assert json.dumps('diagnostic "\nsudo data\n') in result["output"]
+    assert boundary.calls == [command]
+    assert boundary.prepared == [(command, (command, None))]
+    assert len(boundary.launches) == 1
+    assert boundary.launches[0][1] is None
+    prompt.assert_not_called()
+    probe.assert_not_called()
+
+
+@pytest.mark.parametrize("cached_backend", ["ssh", "unknown"])
+@pytest.mark.parametrize("command_kind", ["canonical-read", "script", "control"])
+def test_local_config_cannot_grant_cached_foreign_backend_locality(
+    tmp_path, terminal_boundary, monkeypatch, cached_backend, command_kind,
+):
+    import cron.lifecycle_guard as guard
+    from pathlib import Path
+
+    path = tmp_path / ("data.json" if command_kind == "canonical-read" else "control.sh")
+    path.write_text("printf harmless\n", encoding="utf-8")
+    run, boundary = terminal_boundary
+    boundary.remote_files[str(path)] = "hermes gateway stop\n"
+    local_read = Mock(side_effect=AssertionError("foreign references must not read host files"))
+    monkeypatch.setattr(guard, "_read_referenced_script", local_read)
+    monkeypatch.setattr(Path, "read_bytes", local_read)
+    command = {
+        "canonical-read": canonical(read_body(path)),
+        "script": f"bash {shlex.quote(str(path))}",
+        "control": "hermes gateway stop",
+    }[command_kind]
+    result = run(command, backend="local", cached_backend=cached_backend)
+    assert result["exit_code"] == 1, result
+    assert command not in boundary.calls
+    assert "no canonical Python read exemption" in result["error"]
+    assert shlex.quote(os.path.realpath(sys.executable)) not in result["error"]
+    if command_kind != "control":
+        assert any(shlex.split(call)[-1] == str(path) for call in boundary.calls)
+    local_read.assert_not_called()
+
+
+def test_proven_read_data_is_unchanged_by_background_preparation(read_data, terminal_boundary):
+    data, _ = read_data
+    command = canonical(read_body(data) + '\nmessage = """one" && two & """\nprint(message)')
+    assert _is_canonical_python_read(command) is True
+    run, boundary = terminal_boundary
+    # The caller still conservatively rejects this unusual shell-like string.
+    # Exercise the same harmless program directly at the backend boundary to
+    # cover the second rewrite in BaseEnvironment.execute as well.
+    assert run(command, execute_read=True)["exit_code"] == -1
+    assert boundary.calls == []
+    result = boundary.execute(command)
+    assert result["returncode"] == 0, result
+    assert 'one" && two & ' in result["output"]
+    assert boundary.calls == [command]
+    assert boundary.prepared == [(command, (command, None))]
+
+
+@pytest.mark.parametrize("backend, form", [
+    ("local", "sudo-command"), ("local", "unproven-python"),
+    ("local", "wrapped-python"), ("ssh", "proven-python"),
+    ("unknown", "proven-python"),
+])
+def test_backend_preparation_keeps_sudo_handling_outside_proven_local_read(
+    terminal_boundary, monkeypatch, backend, form,
+):
+    from tools.environments.base import BaseEnvironment
+
+    _, boundary = terminal_boundary
+    monkeypatch.setenv("SUDO_PASSWORD", "synthetic-test-password")
+    command = canonical("sudo = 'data'\nprint(sudo)")
+    if form == "sudo-command":
+        command = "sudo printf harmless"
+    elif form == "unproven-python":
+        command = canonical("import os\nsudo = 'data'\nprint(sudo)")
+    elif form == "wrapped-python":
+        command = "sudo " + command
+    # Preparation only: no sudo, remote backend or unproven code is executed.
+    transformed, stdin = BaseEnvironment._prepare_command(boundary.environments[backend], command)
+    assert transformed != command
+    assert "sudo -S -p ''" in transformed
+    assert stdin and set(stdin.splitlines()) == {"synthetic-test-password"}
 
 
 @pytest.mark.parametrize("kind", ["json", "directory"])

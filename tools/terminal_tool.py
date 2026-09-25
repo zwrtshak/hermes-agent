@@ -2807,6 +2807,10 @@ def terminal_tool(
                     ),
                     "status": "error",
                 }, ensure_ascii=False)
+            # Config may have changed since this cached environment was
+            # created. Only the concrete local implementation proves locality;
+            # names, callbacks and backend-supplied attributes do not.
+            guard_is_local = type(env) is _LocalEnvironment
             guard_cwd_base = get_session_cwd(session_key)
             if guard_cwd_base is None:
                 guard_cwd_base = getattr(env, "cwd", None) or cwd
@@ -2830,7 +2834,7 @@ def terminal_tool(
                     local_path = Path(script_path).expanduser()
                     if not local_path.is_absolute():
                         local_path = Path(guard_cwd) / local_path
-                    if env_type == "local" and local_path.is_file():
+                    if guard_is_local and local_path.is_file():
                         metadata = local_path.stat()
                         if stat.S_ISREG(metadata.st_mode) and metadata.st_size <= _MAX_REFERENCED_SCRIPT_BYTES:
                             data = local_path.read_bytes()
@@ -2876,13 +2880,13 @@ def terminal_tool(
                 command,
                 cwd=guard_cwd,
                 read_remote_script=_read_script_in_env,
-                is_local=env_type == "local",
+                is_local=guard_is_local,
             ):
                 diagnostic_hint = (
                     "This backend has no canonical Python read exemption; "
                     "do not substitute a local interpreter path for a remote diagnostic. "
                 )
-                if env_type == "local":
+                if guard_is_local:
                     try:
                         interpreter = Path(sys.executable).resolve(strict=True)
                         if not interpreter.is_file():

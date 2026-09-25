@@ -79,6 +79,21 @@ def test_command_after_heredoc_delimiter_remains_visible(tmp_path, control, body
     assert classify(command, cwd=str(tmp_path))
 
 
+@pytest.mark.parametrize("body", ["'", '"'])
+@pytest.mark.parametrize("tail", ["cat <<'B'\ntext\n", "cat <<-'B'\n\ttext", "cat <<'B' <<'C'\ntext\nB\ntext\n"])
+def test_open_later_heredoc_keeps_known_execution_boundary(tmp_path, control, body, tail):
+    # First row is the review reproduction verbatim, with only cwd in tmp_path.
+    # Shells can execute control.sh before reaching the unfinished next body.
+    command = f"cat <<'A'\n{body}\nA\nbash control.sh\n{tail}"
+    assert classify(command, cwd=str(tmp_path), is_local=True)
+
+
+@pytest.mark.parametrize("tail", ["cat <<'B'\ntext\n", "unknown-consumer <<'B'\ntext\n"])
+def test_open_later_heredoc_keeps_unknown_consumer_body(tmp_path, control, tail):
+    command = "unknown-consumer <<'A'\nbash control.sh\nA\n" + tail
+    assert classify(command, cwd=str(tmp_path), is_local=True)
+
+
 @pytest.mark.parametrize("delimiter", ["PY", "'PY'"])
 def test_python_heredoc_literal_lifecycle_stays_blocked(tmp_path, delimiter):
     command = f"python3 <<{delimiter}\nimport os\nos.system('hermes gateway stop')\nPY\n"

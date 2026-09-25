@@ -21,8 +21,12 @@ its standard library remain trusted dependencies.
 
 The whole command must have this form: no wrappers, pipes, other redirections,
 additional heredocs, shell prefix/suffix or unquoted delimiter. Remote and
-unknown backends have no exemption. A script-reader callback alone does not
-identify a remote backend.
+unknown backends have no exemption. Locality requires the selected concrete
+`LocalEnvironment` implementation, including when an environment is cached.
+Current configuration, backend names, callbacks and arbitrary attributes do
+not prove locality. Foreign references are read through their backend, never
+through same-named host files; only an actual local backend supplies the local
+interpreter hint.
 
 The entire Python program must pass a bounded static read proof. Supported
 operations include unaliased `pathlib`/`Path` and `json` imports, literal data,
@@ -35,11 +39,20 @@ targets are accepted. Proof limits are 1 MiB of command text, 4096 AST nodes
 and 64 expression levels. A rejected proof in this exact local form blocks
 the command; it does not fall back to the less precise shell scan.
 
+The real local execution path repeats this proof before command preparation.
+Proven programs retain their stdin text through sudo and compound-background
+preparation. A Python variable or data string named `sudo` does not trigger a
+password probe, prompt or injection. Other invocations and backends keep the
+existing sudo handling.
+
 Direct lifecycle checks still run. A JSON file containing example lifecycle
 text can be read, but an inline lifecycle-command string may still be rejected
 conservatively. Shell wrappers, substitutions, referenced scripts and commands
 after heredoc boundaries retain their separate checks; file permissions do not
 grant an exemption.
+An unfinished later heredoc retains previously established boundaries and the
+unfinished body in the conservative scan. Unknown consumers never receive a
+body exemption.
 
 Other Python invocation forms retain the existing conservative classification
 and may reject harmless reads. This is not a general Python sandbox or a

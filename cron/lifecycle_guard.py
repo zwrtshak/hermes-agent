@@ -161,7 +161,7 @@ _HEREDOC_START = re.compile(r"<<(-?)[ \t]*(" + _LITERAL_HEREDOC_WORD + r")(?=[ \
 
 
 def _heredoc_scan_parts(command: str) -> list[str]:
-    """Expose complete literal heredoc boundaries without exempting any body.
+    """Expose known literal heredoc boundaries without exempting any body.
 
     This is an ADDITIONAL scan: the original text still goes through all the
     existing checks. Quotes in stdin data cannot hide commands after its real
@@ -208,7 +208,10 @@ def _heredoc_scan_parts(command: str) -> list[str]:
                         break
                     index = end + 1
                 else:
-                    return []  # No trustworthy closing boundary.
+                    # An unfinished later body cannot erase earlier shell
+                    # boundaries. Keep its text too: an unknown consumer may
+                    # execute stdin even without a closing delimiter.
+                    return [*parts, command[start:]]
             pending = []
             start = index
             continue
