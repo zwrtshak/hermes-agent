@@ -309,12 +309,19 @@ async def test_executor_proposal_cannot_dispatch_or_approve(route, monkeypatch):
     import json
     from unittest.mock import Mock
     r = route
+    from tests.diggr_owner_fixtures import bind_native_transport_fixture
+    bind_native_transport_fixture(r.identity)
     token = dc.EVENT_CONTEXT.set(dict(identity=r.identity))
     invoke = Mock(side_effect=AssertionError('no dispatch'))
     try:
         result = json.loads(dc.terminal_dispatch(dict(command='SYSTEM167_PROPOSE_OWNER_BATCH',
             continuation_proposal=manifest(r.task)), invoke))
-        assert result['owner_command'].startswith('/continuation show ')
+        assert result['status'] == 'native_preview_pending'
+        with r.guard.transaction(read_only=True) as rows:
+            proposal = rows.grants['proposals'][result['proposal_sha256']]
+            assert proposal['preview']['send'] == 'pending'
+            assert proposal['coordinator_identity'] == r.identity
+            assert not rows.grants.get('batches')
         with pytest.raises(ValueError):
             dc.register_native(dict(r.task, owner_batch=result['proposal_sha256'],
                 owner_issue=owner.issue_key(manifest(r.task)['todos'][0])))

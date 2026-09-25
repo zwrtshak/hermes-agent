@@ -5590,6 +5590,42 @@ class TelegramAdapter(BasePlatformAdapter):
     def _ea_escape(self, text: str) -> str:
         return _html.escape(text)
 
+    async def send_owner_preview(self, chat_id, text, metadata):
+        """One original message, no keyboard, no retry/fallback into another topic."""
+        kwargs = self._thread_kwargs_for_send(chat_id, self._metadata_thread_id(metadata), metadata,
+            reply_to_message_id=None, reply_to_mode='off')
+        message = await self._bot.send_message(chat_id=normalize_telegram_chat_id(chat_id),
+            text=text + '\n\nFreigabe ausstehend. Buttons erst nach nativer Bindung verfügbar.',
+            parse_mode=None, reply_markup=None, **kwargs)
+        return str(message.message_id) if message and message.message_id else None
+
+    async def edit_owner_preview(self, chat_id, preview):
+        """Idempotent UI only. Persisted owner state, never the displayed buttons, authorizes."""
+        from telegram.error import BadRequest
+        states = {'open': 'Freigabe offen (5 Minuten).',
+                  'expired': 'Vorschau abgelaufen. Erneuern, danach einmal freigeben.',
+                  'confirmed': 'Bestätigt. Ausführung unterliegt nativen Prüfungen; dies ist kein Start- oder Zustellnachweis.',
+                  'declined': 'Abgelehnt. Keine Freigabe erteilt.',
+                  'revoked': 'Widerrufen. Keine weitere Freigabe oder Fortsetzung.'}
+        state = preview['state']
+        choices = [('Freigeben', 'a'), ('Ablehnen', 'd')] if state == 'open' else (
+            [('Vorschau erneuern', 'r')] if state == 'expired' else [])
+        markup = InlineKeyboardMarkup([[InlineKeyboardButton(label,
+            callback_data=f"og:{preview['version']}:{action}:{preview['ref']}") for label, action in choices]]) if choices else None
+        # Remove old controls before attaching the requested revision. A crash here
+        # leaves no active button; the existing idle tick retries the same edit.
+        for method, kwargs in (
+            (self._bot.edit_message_text, dict(text=preview['text'] + '\n\n' + states[state], parse_mode=None,
+                                               reply_markup=None)),
+            (self._bot.edit_message_reply_markup, dict(reply_markup=markup)),
+        ):
+            try:
+                await method(chat_id=normalize_telegram_chat_id(chat_id),
+                    message_id=int(preview['message_id']), **kwargs)
+            except BadRequest as exc:
+                if 'message is not modified' not in str(exc).lower():
+                    raise
+
     async def send_exec_approval(
         self, chat_id: str, command: str, session_key: str,
         description: str = "dangerous command",
@@ -6472,6 +6508,45 @@ class TelegramAdapter(BasePlatformAdapter):
         query_chat_type = getattr(query_chat, "type", None)
         query_thread_id = getattr(query_message, "message_thread_id", None)
         query_user_name = getattr(query.from_user, "first_name", None)
+
+        # Owner grants are deliberately separate from exec approval (ea:*).
+        if isinstance(data, str) and data.startswith('og:'):
+            from hermes_cli import diggr_owner as owner, diggr_delivery as delivery
+            from hermes_cli.diggr_continuation import runtime_guard
+            proof = owner.telegram_callback(self, update)
+            if proof is None:
+                # Inaccessible/absent messages and untrusted objects never mint a proof.
+                from telegram import CallbackQuery
+                if type(query) is CallbackQuery:
+                    try:
+                        await query.answer(text='Keine gültige native Owner-Vorschau.', show_alert=True)
+                    except Exception:
+                        pass
+                return
+            try:
+                # Clear the Telegram spinner promptly; this is not a success claim.
+                await query.answer(text='Eingang wird geprüft.')
+            except Exception:
+                pass  # Telegram acknowledgement is not authority or a grant transaction.
+            try:
+                _, identity = await owner.handle_callback(self.gateway_runner, proof)
+            except ValueError as exc:
+                try:
+                    await query.answer(text=str(exc)[:180], show_alert=True)
+                except Exception:
+                    pass
+                return
+            except Exception:
+                # No query, code, contract or transport exception in logs.
+                logger.warning('Native owner callback could not be committed')
+                return
+            try:
+                guard = runtime_guard(identity['home'])
+                if guard is not None:
+                    await delivery.deliver_previews(self.gateway_runner, guard, identity)
+            except Exception:
+                logger.warning('Native owner preview update deferred to idle delivery')
+            return
 
         # --- Model picker callbacks ---
         if data.startswith(("mp:", "mpg:", "mpv:", "mm:", "mc:", "mb", "mx", "mg:")):
