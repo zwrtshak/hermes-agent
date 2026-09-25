@@ -41,6 +41,9 @@ _IS_WINDOWS = sys.platform == "win32"
 _UNSET = object()
 _GATEWAY_LOCK_FILENAME = "gateway.lock"
 _gateway_lock_handle = None
+# DIGGR checkpoint commits must finish before the runtime lock is released.
+# Other profiles do not take this gate for their legacy checkpoint writes.
+_gateway_checkpoint_commit_lock = threading.RLock()
 # Windows byte-range locks are mandatory for other readers. Lock a byte well
 # past the JSON payload so runtime status / PID readers can still read the file
 # while another process holds the mutual-exclusion lock.
@@ -904,6 +907,11 @@ def acquire_gateway_runtime_lock() -> bool:
 
 def release_gateway_runtime_lock() -> None:
     """Release the gateway runtime lock when owned by this process."""
+    with _gateway_checkpoint_commit_lock:
+        _release_gateway_runtime_lock_after_commits()
+
+
+def _release_gateway_runtime_lock_after_commits() -> None:
     global _gateway_lock_handle
     handle = _gateway_lock_handle
     if handle is None:

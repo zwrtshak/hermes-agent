@@ -2568,6 +2568,19 @@ class ProcessRegistry:
         *,
         receipt_update=None,
     ):
+        # Reject a fork before touching an inherited, possibly locked mutex.
+        if not self._owns_gateway_checkpoint():
+            return False
+        if self._checkpoint_owner is None and not self.requires_gateway_checkpoint():
+            return self._write_checkpoint_owned(extra_entries, receipt_update=receipt_update)
+        from gateway import status
+        # Lock order: gateway lifetime gate, then this registry's data lock.
+        # Runtime-lock release takes the same gate and therefore cannot let a
+        # replacement gateway start until this full atomic commit has ended.
+        with status._gateway_checkpoint_commit_lock:
+            return self._write_checkpoint_owned(extra_entries, receipt_update=receipt_update)
+
+    def _write_checkpoint_owned(self, extra_entries=None, *, receipt_update=None):
         """Write running processes and bounded completed receipt records atomically."""
         if not self._owns_gateway_checkpoint():
             return False
