@@ -585,6 +585,17 @@ def _export_dump_excluding_session_vars(
 # ---------------------------------------------------------------------------
 
 
+def _is_proven_local_python_read(environment, command: str) -> bool:
+    """Protect proven stdin data from shell rewrites on the concrete local backend."""
+    from tools.environments.local import LocalEnvironment
+
+    if type(environment) is not LocalEnvironment:
+        return False
+    from cron.lifecycle_guard import _is_canonical_python_read
+
+    return _is_canonical_python_read(command) is True
+
+
 class BaseEnvironment(ABC):
     """Common interface and unified execution flow for all Hermes backends.
 
@@ -1407,7 +1418,7 @@ class BaseEnvironment(ABC):
         # Guard against the `A && B &` subshell-wait trap by default.
         # Some callers (spawn_via_env) already produce shell-safe wrappers and
         # pass rewrite_compound_background=False.
-        if rewrite_compound_background:
+        if rewrite_compound_background and not _is_proven_local_python_read(self, exec_command):
             from tools.terminal_tool import _rewrite_compound_background
             exec_command = _rewrite_compound_background(exec_command)
         effective_timeout = timeout or self.timeout
@@ -1458,6 +1469,10 @@ class BaseEnvironment(ABC):
 
     def _prepare_command(self, command: str) -> tuple[str, str | None]:
         """Transform sudo commands if SUDO_PASSWORD is available."""
+        # The entire exact invocation has no shell sudo command. Treat its
+        # proven Python stdin as data before probing or prompting for sudo.
+        if _is_proven_local_python_read(self, command):
+            return command, None
         from tools.terminal_tool import _transform_sudo_command
 
         return _transform_sudo_command(command)

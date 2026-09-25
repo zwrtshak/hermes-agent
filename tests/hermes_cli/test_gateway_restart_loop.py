@@ -254,10 +254,19 @@ class TestTerminalToolGatewayLifecycleGuard:
 
     def _patch_env(self, monkeypatch, fake_env, *, inside_gateway: bool):
         import tools.terminal_tool as tt
+        from tools.environments.local import LocalEnvironment
+
+        # Locality comes from the real backend type. Keep execution inert and
+        # skip snapshot bootstrap so no private shell profiles are sourced.
+        monkeypatch.setattr(LocalEnvironment, "init_session", lambda self: None)
+        local = LocalEnvironment(cwd=getattr(fake_env, "cwd", "/tmp"), timeout=60)
+        monkeypatch.setattr(local, "execute", fake_env.execute)
         eid = "default"
-        monkeypatch.setattr(tt, "_active_environments", {eid: fake_env})
+        monkeypatch.setattr(tt, "_active_environments", {eid: local})
         monkeypatch.setattr(tt, "_last_activity", {eid: 0.0})
         monkeypatch.setattr(tt, "_task_env_overrides", {})
+        monkeypatch.setattr(tt, "_session_cwd", {})
+        monkeypatch.setattr(tt, "_start_cleanup_thread", lambda: None)
         monkeypatch.setattr(tt, "_get_env_config", self._minimal_config)
         if inside_gateway:
             monkeypatch.setenv("_HERMES_GATEWAY", "1")
