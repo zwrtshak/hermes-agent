@@ -129,8 +129,8 @@ def test_repeated_review_requests_never_triage(kanban_home: Path) -> None:
         tid = kb.create_task(conn, title="cycle me", assignee="worker")
 
         for _ in range(4):
-            # Executor claims (ready->running or review->running) and finishes
-            # with a review request. claim_review_task handles review->running.
+            # Separate role-pure runs: reviewer requests changes, then a
+            # fresh implementer claims rework and requests review again.
             task = kb.get_task(conn, tid)
             if task.status == "ready":
                 kb.claim_task(conn, tid)
@@ -138,11 +138,17 @@ def test_repeated_review_requests_never_triage(kanban_home: Path) -> None:
                 assert task.status == "review"
                 claimed = kb.claim_review_task(conn, tid)
                 assert claimed is not None
+                assert kb.request_changes(
+                    conn, tid, reason="Fix the regression",
+                    expected_run_id=claimed.current_run_id,
+                )[0]
+                assert kb.claim_task(conn, tid) is not None
 
             run_id = kb.get_task(conn, tid).current_run_id
             ok = kb.request_review(
                 conn, tid,
                 summary="pass complete",
+                reviewer="reviewer",
                 expected_run_id=run_id,
             )
             assert ok is True

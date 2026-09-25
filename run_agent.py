@@ -7775,6 +7775,11 @@ class AIAgent:
         New DELEGATE_TASK_SCHEMA fields only need to be added here to reach all
         invocation paths (concurrent, sequential, inline).
         """
+        from tools.kanban_tools import review_tool_rejection
+
+        role_error = review_tool_rejection("delegate_task", function_args)
+        if role_error:
+            return role_error
         from tools.delegate_tool import (
             _strip_model_hidden_task_fields,
             delegate_task as _delegate_task,
