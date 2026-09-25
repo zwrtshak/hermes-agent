@@ -724,3 +724,90 @@ async def test_thread_fallback_only_fires_once():
     # The key point: the message was delivered despite the invalid thread
 
 
+
+
+@pytest.mark.asyncio
+async def test_completion_strict_topic_never_sends_to_root():
+    adapter = _make_adapter()
+    calls = []
+    async def send_message(**kwargs):
+        calls.append(kwargs)
+        if kwargs.get('message_thread_id'):
+            raise FakeBadRequest('Message thread not found')
+        return SimpleNamespace(message_id=42)
+    adapter._bot = SimpleNamespace(send_message=send_message)
+    result = await adapter.send('-100123', 'completion-probe: finished',
+                                metadata={'thread_id': '77', 'strict_topic': True})
+    assert result.success is False
+    assert calls and all(call.get('message_thread_id') == 77 for call in calls)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('seconds', [7, __import__('datetime').timedelta(seconds=9)])
+async def test_durable_completion_propagates_retry_after_without_hidden_retry(monkeypatch, seconds):
+    monkeypatch.setattr(_fake_telegram_error, 'RetryAfter', FakeRetryAfter, raising=False)
+    adapter = _make_adapter()
+    adapter._bot = SimpleNamespace(send_message=AsyncMock(side_effect=FakeRetryAfter(seconds)))
+    result = await adapter.send('-100123', 'task: process ended',
+        metadata={'thread_id': '77', 'strict_topic': True, 'diggr_durable_delivery': True})
+    adapter._bot.send_message.assert_awaited_once()
+    assert not result.success
+    assert result.raw_response['delivery_outcome'] == 'safe_retry'
+    assert result.retry_after == (seconds.total_seconds() if hasattr(seconds, 'total_seconds') else seconds)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('failure', [FakeTimedOut('timed out'), FakeNetworkError('connection reset after request')])
+async def test_durable_completion_unknown_effect_never_retries_inside_adapter(failure):
+    adapter = _make_adapter()
+    adapter._bot = SimpleNamespace(send_message=AsyncMock(side_effect=failure))
+    result = await adapter.send('-100123', 'task: process ended',
+        metadata={'thread_id': '77', 'strict_topic': True, 'diggr_durable_delivery': True})
+    adapter._bot.send_message.assert_awaited_once()
+    assert result.raw_response['delivery_outcome'] == 'uncertain'
+    assert not result.retryable
+
+
+@pytest.mark.asyncio
+async def test_durable_completion_general_topic_uses_supported_root_encoding():
+    adapter = _make_adapter()
+    adapter._bot = SimpleNamespace(send_message=AsyncMock(return_value=SimpleNamespace(message_id=42)))
+    adapter.send_typing = AsyncMock()
+    result = await adapter.send('-100123', 'task: process ended',
+        metadata={'thread_id': '1', 'strict_topic': True, 'diggr_durable_delivery': True})
+    assert result.success and result.message_id == '42'
+    adapter._bot.send_message.assert_awaited_once()
+    assert adapter._bot.send_message.await_args.kwargs.get('message_thread_id') is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('anchor', [None, '19'])
+@pytest.mark.parametrize('rejected', [False, True])
+async def test_strict_dm_topic_keeps_selected_route_without_fallback(anchor, rejected):
+    adapter = _make_adapter()
+    adapter._bot = SimpleNamespace(send_message=AsyncMock(
+        side_effect=FakeBadRequest('Message thread not found') if rejected else None,
+        return_value=SimpleNamespace(message_id=42)))
+    metadata = {'thread_id': '73', 'direct_messages_topic_id': '73',
+                'telegram_dm_topic_reply_fallback': True, 'strict_topic': True,
+                'diggr_durable_delivery': True}
+    if anchor:
+        metadata['telegram_reply_to_message_id'] = anchor
+    result = await adapter.send('123', 'completion', metadata=metadata)
+    assert result.success is not rejected
+    adapter._bot.send_message.assert_awaited_once()
+    sent = adapter._bot.send_message.await_args.kwargs
+    assert sent.get('message_thread_id') == (73 if anchor else None)
+    assert sent.get('direct_messages_topic_id') == (None if anchor else 73)
+    assert sent.get('reply_to_message_id') == (19 if anchor else None)
+
+
+@pytest.mark.asyncio
+async def test_strict_dm_topic_rejects_conflicting_destination_before_send():
+    adapter = _make_adapter()
+    adapter._bot = SimpleNamespace(send_message=AsyncMock())
+    result = await adapter.send('123', 'completion', metadata={
+        'thread_id': '73', 'direct_messages_topic_id': '99',
+        'strict_topic': True, 'diggr_durable_delivery': True})
+    assert not result.success
+    adapter._bot.send_message.assert_not_awaited()

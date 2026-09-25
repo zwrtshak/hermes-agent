@@ -1024,6 +1024,7 @@ class TestKillProcess:
         s = _make_session(sid="proc_detached", command="sleep 999")
         s.pid = 424242
         s.detached = True
+        s.host_start_time = 12345
         registry._running[s.id] = s
 
         terminate_calls = []
@@ -1047,6 +1048,7 @@ class TestKillProcess:
             # SIGKILL-escalation step (grace=0) so it doesn't call
             # ``psutil.wait_procs`` on the FakeProcess.
             with patch("gateway.status._pid_exists", return_value=True), \
+                 patch.object(ProcessRegistry, "_safe_host_start_time", return_value=12345), \
                  patch.object(ProcessRegistry, "_daemon_term_grace_seconds",
                               staticmethod(lambda: 0.0)), \
                  patch.object(_psutil, "Process", side_effect=lambda pid: FakeProcess(pid)):
@@ -1056,6 +1058,32 @@ class TestKillProcess:
             assert ("terminate", 424242) in terminate_calls
         finally:
             registry._running.pop(s.id, None)
+
+
+    @pytest.mark.parametrize("recorded,current,expected", [
+        (None, 12345, "error"),
+        (12345, None, "error"),
+        (12345, 67890, "already_exited"),
+    ])
+    def test_detached_unknown_or_reused_identity_never_signaled(self, registry, recorded, current, expected):
+        session = _make_session(sid="proc_identity_fixture")
+        session.pid = 424242
+        session.detached = True
+        session.host_start_time = recorded
+        registry._running[session.id] = session
+        with patch("gateway.status._pid_exists", return_value=True), \
+             patch.object(ProcessRegistry, "_safe_host_start_time", return_value=current), \
+             patch.object(ProcessRegistry, "_terminate_host_pid") as terminate, \
+             patch("psutil.Process") as process, patch("os.kill") as kill:
+            result = registry.kill_process(session.id)
+        assert result["status"] == expected
+        terminate.assert_not_called()
+        process.assert_not_called()
+        kill.assert_not_called()
+        if expected == "error":
+            assert "identity is unknown" in result["error"]
+            assert not session.exited
+
 
 
 # =========================================================================
@@ -1312,21 +1340,62 @@ class TestTerminateHostPidPosix:
 # kernel start time captured at spawn before any signal is sent.
 # =========================================================================
 
+@pytest.fixture
+def host_process_tree(monkeypatch):
+    """Hermetic psutil/kernel boundary; never inspect or signal host processes."""
+    import psutil
+    import gateway.status as status
+
+    processes = {}
+    signals = []
+
+    class Process:
+        def __init__(self, pid, *, children=()):
+            self.pid = pid
+            self.start = 1000 + pid
+            self.alive = True
+            self.descendants = list(children)
+            processes[pid] = self
+
+        def children(self, recursive=False):
+            assert recursive is True
+            return list(self.descendants)
+
+        def is_running(self):
+            return self.alive
+
+        def status(self):
+            return psutil.STATUS_RUNNING if self.alive else psutil.STATUS_ZOMBIE
+
+        def terminate(self):
+            # Model the original SIGTERM-ignoring daemon without an unbounded
+            # subprocess whose cleanup depends on restricted host inspection.
+            signals.append((self.pid, signal.SIGTERM))
+
+        def kill(self):
+            signals.append((self.pid, signal.SIGKILL))
+            self.alive = False
+
+    def lookup(pid):
+        if pid not in processes:
+            raise AssertionError(f"unexpected host process lookup: {pid}")
+        return processes[pid]
+
+    monkeypatch.setattr(psutil, 'Process', lookup)
+    monkeypatch.setattr(status, '_pid_exists', lambda pid: lookup(pid).alive)
+    monkeypatch.setattr(status, 'get_process_start_time', lambda pid: lookup(pid).start)
+    return Process, signals
+
+
 class TestPidReuseGuard:
-    def test_terminate_refuses_when_start_time_mismatches(self, registry):
+    def test_terminate_refuses_when_start_time_mismatches(self, registry, host_process_tree):
         """A live PID whose start time changed (recycled) is NOT killed."""
-        proc = _spawn_python_sleep(30)
-        try:
-            real_start = ProcessRegistry._safe_host_start_time(proc.pid)
-            assert real_start is not None, "no /proc start time on this platform?"
-            # Simulate recycling: the recorded baseline no longer matches.
-            registry._terminate_host_pid(proc.pid, expected_start=real_start + 1)
-            # The process must still be alive — the guard refused to signal it.
-            assert not _wait_until(lambda: proc.poll() is not None, timeout=0.3)
-            assert proc.poll() is None
-        finally:
-            proc.kill()
-            proc.wait()
+        process, signals = host_process_tree
+        proc = process(101)
+        real_start = ProcessRegistry._safe_host_start_time(proc.pid)
+        assert real_start == proc.start
+        assert registry._terminate_host_pid(proc.pid, expected_start=real_start + 1) is False
+        assert proc.alive and signals == []
 
 
     def test_refresh_detached_marks_recycled_pid_exited(self, registry):
@@ -1354,53 +1423,23 @@ class TestSigkillEscalation:
     bypassed.
     """
 
-    # A process that traps SIGTERM (ignores it): only SIGKILL stops it.
-    # It prints "ready" AFTER installing the handler so the parent never
-    # signals it during the startup window (before SIG_IGN is in place).
-    _TRAP = (
-        "import signal, sys, time;"
-        "signal.signal(signal.SIGTERM, signal.SIG_IGN);"
-        "sys.stdout.write('ready\\n'); sys.stdout.flush();"
-        "[time.sleep(0.2) for _ in iter(int, 1)]"
-    )
-
-    def _spawn_trap(self):
-        proc = subprocess.Popen(
-            [sys.executable, "-c", self._TRAP],
-            stdout=subprocess.PIPE, text=True,
-        )
-        # Wait until the handler is installed before returning.
-        line = proc.stdout.readline()
-        assert line.strip() == "ready", "trap process failed to start"
-        return proc
-
-    def test_sigterm_ignoring_daemon_is_sigkilled(self, monkeypatch):
+    def test_sigterm_ignoring_daemon_is_sigkilled(self, monkeypatch, host_process_tree):
         monkeypatch.setattr(ProcessRegistry, "_daemon_term_grace_seconds",
-                            staticmethod(lambda: 0.3))
-        proc = self._spawn_trap()
-        try:
-            ProcessRegistry._terminate_host_pid(proc.pid)
-            assert _wait_until(lambda: proc.poll() is not None, timeout=4.0), \
-                "SIGTERM-ignoring daemon should be SIGKILLed after grace"
-        finally:
-            if proc.poll() is None:
-                proc.kill()
-            proc.wait()
+                            staticmethod(lambda: 0.01))
+        process, signals = host_process_tree
+        proc = process(101)
+        ProcessRegistry._terminate_host_pid(proc.pid, expected_start=proc.start)
+        assert not proc.alive
+        assert signals == [(proc.pid, signal.SIGTERM), (proc.pid, signal.SIGKILL)]
 
-    def test_escalation_does_not_bypass_recycled_pid_guard(self, monkeypatch):
+    def test_escalation_does_not_bypass_recycled_pid_guard(self, monkeypatch, host_process_tree):
         """A start-time mismatch must still spare the PID — no SIGTERM, no SIGKILL."""
         monkeypatch.setattr(ProcessRegistry, "_daemon_term_grace_seconds",
-                            staticmethod(lambda: 0.3))
-        proc = self._spawn_trap()
-        try:
-            real_start = ProcessRegistry._safe_host_start_time(proc.pid)
-            ProcessRegistry._terminate_host_pid(
-                proc.pid, expected_start=(real_start or 0) + 1)
-            assert not _wait_until(lambda: proc.poll() is not None, timeout=0.3)
-            assert proc.poll() is None
-        finally:
-            proc.kill()
-            proc.wait()
+                            staticmethod(lambda: 0.01))
+        process, signals = host_process_tree
+        proc = process(101)
+        assert ProcessRegistry._terminate_host_pid(proc.pid, expected_start=proc.start + 1) is False
+        assert proc.alive and signals == []
 
     def test_grace_reader_floors_at_zero(self, monkeypatch):
         """A negative configured grace is clamped to 0 (no escalation)."""
@@ -1409,79 +1448,18 @@ class TestSigkillEscalation:
                             lambda: {"terminal": {"daemon_term_grace_seconds": -5}})
         assert ProcessRegistry._daemon_term_grace_seconds() == 0.0
 
-    @pytest.mark.live_system_guard_bypass
-    def test_entire_tree_is_sigkilled_not_just_parent(self, monkeypatch):
-        """A SIGTERM-ignoring parent + children are ALL force-killed.
-
-        Regression: an earlier implementation trusted psutil.wait_procs's
-        gone/alive partition, which mis-partitioned across a parent/child tree
-        and left survivors un-killed (flaky — sometimes the parent lived,
-        sometimes a child). The escalation now re-probes every target directly.
-        """
-        import psutil
-        # 2.0s grace (not 1.0): with three interpreters mid-startup on a
-        # loaded runner, a 1s SIGTERM->partition window races child spawn and
-        # is how a child PID escaped the live-system guard in CI.
+    def test_entire_tree_is_sigkilled_not_just_parent(self, monkeypatch, host_process_tree):
+        """All captured tree members survive SIGTERM, then receive SIGKILL."""
         monkeypatch.setattr(ProcessRegistry, "_daemon_term_grace_seconds",
-                            staticmethod(lambda: 2.0))
-        # Parent spawns 2 children; all trap SIGTERM. Parent prints child pids
-        # after the handler is installed.
-        parent_src = (
-            "import signal, subprocess, sys, time;"
-            "child='import signal,time\\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\\n"
-            "[time.sleep(0.2) for _ in iter(int,1)]';"
-            "kids=[subprocess.Popen([sys.executable,'-c',child]) for _ in range(2)];"
-            "signal.signal(signal.SIGTERM, signal.SIG_IGN);"
-            "sys.stdout.write(' '.join(str(k.pid) for k in kids)+'\\n'); sys.stdout.flush();"
-            "[time.sleep(0.2) for _ in iter(int,1)]"
-        )
-        parent = subprocess.Popen([sys.executable, "-c", parent_src],
-                                  stdout=subprocess.PIPE, text=True)
-        # Bound the readline: if the parent wedges before printing, fail THIS
-        # test with a clear message instead of letting the per-file timeout
-        # SIGKILL the whole pytest process (opaque rc=124 in CI).
-        import select as _select
-        ready, _, _ = _select.select([parent.stdout], [], [], 20.0)
-        assert ready, "parent process failed to print child pids within 20s"
-        child_pids = [int(x) for x in parent.stdout.readline().split()]
-        all_pids = [parent.pid] + child_pids
-        try:
-            ProcessRegistry._terminate_host_pid(parent.pid)
-
-            def _pid_dead(p: int) -> bool:
-                # A pid is "dead" for our purposes if it no longer exists OR
-                # exists only as an unreaped zombie (already terminated, just
-                # not reaped by its reparented parent yet). psutil can also
-                # raise mid-probe if the pid vanishes between the existence
-                # check and the status read — treat any such race as dead.
-                try:
-                    if not psutil.pid_exists(p):
-                        return True
-                    return not ProcessRegistry._proc_alive(psutil.Process(p))
-                except Exception:
-                    return True
-
-            def _all_dead():
-                return all(_pid_dead(p) for p in all_pids)
-
-            # _terminate_host_pid SIGKILLs synchronously before returning, so
-            # the kill signals are already delivered here. The only remaining
-            # wait is the kernel tearing down 3 processes and the reparented
-            # children transitioning to zombie — which can lag on a loaded CI
-            # runner. Give a generous budget (matches the wait() test's 10s)
-            # so this asserts the escalation BEHAVIOR, not the runner's
-            # scheduling latency. The assertion itself never weakens: every
-            # tree member must end up dead/zombie.
-            assert _wait_until(_all_dead, timeout=15.0, interval=0.02), (
-                "entire SIGTERM-ignoring tree (parent + children) must be SIGKILLed"
-            )
-        finally:
-            for p in all_pids:
-                try:
-                    os.kill(p, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError, OSError):
-                    pass
-            parent.wait()
+                            staticmethod(lambda: 0.01))
+        process, signals = host_process_tree
+        children = [process(102), process(103)]
+        parent = process(101, children=children)
+        ProcessRegistry._terminate_host_pid(parent.pid, expected_start=parent.start)
+        targets = children + [parent]
+        assert signals == ([(p.pid, signal.SIGTERM) for p in targets]
+                           + [(p.pid, signal.SIGKILL) for p in targets])
+        assert all(not p.alive for p in targets)
 
 
 class TestHandleProcessRedaction:
