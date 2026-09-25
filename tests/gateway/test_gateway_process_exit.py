@@ -88,4 +88,4 @@ def test_exit_backstop_releases_pid_file_and_runtime_lock(monkeypatch):
 
     assert exc_info.value.code == 78
     remove_pid.assert_called_once_with()
-    release_lock.assert_called_once_with()
+    release_lock.assert_called_once_with(blocking=False)

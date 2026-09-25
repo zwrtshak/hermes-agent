@@ -2300,14 +2300,20 @@ def test_darwin_spawn_captures_native_identity_in_checkpoint(monkeypatch, tmp_pa
 
 
 @pytest.mark.skipif(sys.platform != 'darwin', reason='Darwin native executable transition')
-def test_owned_popen_exec_transition_remains_stoppable(registry, tmp_path):
+@pytest.mark.parametrize('use_pty', [False, True], ids=['popen', 'pty'])
+def test_owned_popen_exec_transition_remains_stoppable(registry, tmp_path, use_pty):
     import shlex
     gate = tmp_path / 'exec-gate'
     command = (f'while [ ! -f {shlex.quote(str(gate))} ]; do sleep 0.01; done; '
                f'exec {shlex.quote(sys.executable)} -c "import time; time.sleep(30)"')
-    session = registry.spawn_local(command, cwd=str(tmp_path))
+    session = registry.spawn_local(command, cwd=str(tmp_path), use_pty=use_pty)
     try:
-        assert session.host_os_identity and session.process.poll() is None
+        if use_pty:
+            assert session._pty is not None and session._pty.isalive()
+            assert session.process is None
+        else:
+            assert session.process.poll() is None
+        assert session.host_os_identity
         original = dict(session.host_os_identity)
         gate.touch()
         deadline = time.monotonic() + 5
@@ -2320,8 +2326,50 @@ def test_owned_popen_exec_transition_remains_stoppable(registry, tmp_path):
         assert current and current['start'] == original['start']
         assert current['executable'] != original['executable']
         assert registry.kill_process(session.id)['status'] == 'killed'
-        session.process.wait(timeout=5)
+        if not use_pty:
+            session.process.wait(timeout=5)
     finally:
-        if session.process.poll() is None:
-            session.process.kill()
-        session.process.wait(timeout=5)
+        if use_pty:
+            if session._pty.isalive():
+                session._pty.terminate(force=True)
+            session._reader_thread.join(timeout=5)
+            session._pty.close(force=True)
+        else:
+            if session.process.poll() is None:
+                session.process.kill()
+            session.process.wait(timeout=5)
+
+
+@pytest.mark.parametrize('boundary', ['duck', 'wrong_pid', 'dead', 'lookup_error', 'detached', 'before_terminate', 'fallback'])
+def test_darwin_pty_exec_proof_fails_closed_at_signal_boundaries(registry, monkeypatch, boundary):
+    from types import SimpleNamespace
+    PtyProcess = pytest.importorskip('ptyprocess').PtyProcess
+    import tools.process_registry as pr
+    monkeypatch.setattr(pr, '_IS_DARWIN', True)
+    proof = {'pid': 424242, 'start': 'Wed Sep 23 16:34:17 2026', 'executable': '/fixture/shell'}
+    current = dict(proof, executable='/fixture/python')
+    handle = (SimpleNamespace() if boundary == 'duck' else object.__new__(PtyProcess))
+    handle.closed = True  # No descriptor exists in this proof-boundary fixture.
+    handle.pid = 7 if boundary == 'wrong_pid' else proof['pid']
+    handle.isalive = MagicMock(return_value=boundary != 'dead')
+    if boundary == 'lookup_error':
+        handle.isalive.side_effect = OSError('child identity unavailable')
+    handle.terminate = MagicMock()
+    observations = [dict(current)] * 4
+    if boundary == 'before_terminate':
+        observations[1] = dict(current, start='different birth')
+    if boundary == 'fallback':
+        handle.terminate.side_effect = OSError('synthetic PTY termination failure')
+        observations[2] = dict(current, start='different birth')
+    monkeypatch.setattr(pr.ProcessRegistry, '_safe_host_os_identity', staticmethod(MagicMock(side_effect=observations)))
+    monkeypatch.setattr(pr.ProcessRegistry, '_is_host_pid_alive', staticmethod(lambda pid: True))
+    session = ProcessSession(id='pty-boundary', command='', pid=proof['pid'],
+                             host_os_identity=proof, host_start_time=123,
+                             detached=boundary == 'detached')
+    session._pty = handle
+    registry._running[session.id] = session
+    with patch('os.kill') as signal:
+        assert registry.kill_process(session.id)['status'] == 'error'
+    signal.assert_not_called()
+    assert not session.exited
+    assert handle.terminate.call_count == (1 if boundary == 'fallback' else 0)

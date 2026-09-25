@@ -28580,14 +28580,13 @@ def _exit_after_graceful_shutdown(exit_code: int) -> None:
             stream.flush()
         except Exception:
             pass
-    # Release PID + runtime lock BEFORE the log drain: the drain is bounded but
-    # could still take up to its timeout on a wedged disk, and these locks must
-    # never be stranded. os._exit skips atexit, and the early SystemExit exit
-    # paths never run _stop_impl, so release here (idempotent).
+    # Never wait behind a wedged checkpoint in this hard-exit backstop.
+    # If a commit is busy, retain the runtime lock until os._exit closes it;
+    # unlocking while its writer still runs would permit stale replacement.
     try:
         from gateway.status import remove_pid_file, release_gateway_runtime_lock
         remove_pid_file()
-        release_gateway_runtime_lock()
+        release_gateway_runtime_lock(blocking=False)
     except Exception:
         pass
     # Mark this life cleanly exited in the lifecycle sentinel (NS-608). This

@@ -125,9 +125,10 @@ async def test_ordinary_compressed_turn_uses_its_current_session(tmp_path, monke
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('field', ['bot_id', 'chat_id', 'profile_home', 'session_key'])
+@pytest.mark.parametrize('field', ['bot_id', 'chat_id', 'profile_home', 'session_key',
+    'metadata.thread_id', 'metadata.direct_messages_topic_id', 'metadata.telegram_dm_topic_reply_fallback'])
 async def test_native_tool_context_refuses_transport_substitution(tmp_path, monkeypatch, field):
-    r = await setup(tmp_path, monkeypatch)
+    r = await setup(tmp_path, monkeypatch, topic='73')
     result(r)
     jobs = []
     r.adapter.get_pending_message = lambda key: r.adapter._pending_messages.pop(key, None)
@@ -141,7 +142,11 @@ async def test_native_tool_context_refuses_transport_substitution(tmp_path, monk
     def changed_transport(context):
         tokens = actual_setup(context)
         binding, schedule = completion_launch_context.get()
-        completion_launch_context.set((dict(binding, **{field: 'foreign'}), schedule))
+        if field.startswith('metadata.'):
+            changed = dict(binding, metadata=dict(binding['metadata'], **{field.split('.', 1)[1]: 'foreign'}))
+        else:
+            changed = dict(binding, **{field: 'foreign'})
+        completion_launch_context.set((changed, schedule))
         return tokens
     monkeypatch.setattr(r.runner, '_set_session_env', changed_transport)
     before = r.guard.path.read_bytes()
@@ -150,3 +155,66 @@ async def test_native_tool_context_refuses_transport_substitution(tmp_path, monk
     assert dc.EVENT_CONTEXT.get() is None
     assert completion_launch_context.get() is None
     assert r.guard.path.read_bytes() == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('compressed', [False, True])
+@pytest.mark.parametrize('topic', ['1', '73'])
+async def test_message_b_admission_wake_keeps_reply_anchor_with_message_a_origin(tmp_path, monkeypatch, compressed, topic):
+    from dataclasses import replace
+    from tests.gateway import test_diggr_origin_delivery as fixtures
+    source_type = fixtures.SessionSource
+    monkeypatch.setattr(fixtures, 'SessionSource', lambda **kwargs: source_type(**kwargs, message_id='101'))
+    r = await setup(tmp_path, monkeypatch, topic=topic, register=False)
+    db = SessionDB(db_path=tmp_path / 'message-lineage.db')
+    r.runner._session_db = AsyncSessionDB(db)
+    parent = r.identity['session']
+    db.create_session(parent, source='telegram')
+    message_b = replace(r.source, message_id='202')
+    entry = await r.runner.async_session_store.get_or_create_session(message_b)
+    assert entry.origin.message_id == '101'
+    tokens = await delivery.set_tool_context(r.runner, SimpleNamespace(source=message_b),
+        build_session_context(message_b, r.runner.config, entry), entry)
+    try:
+        dc.register_native(r.task)
+    finally:
+        r.runner._clear_session_env(tokens)
+    original = r.guard.get(r.task['task'])['native_transport']
+    assert original['metadata']['telegram_reply_to_message_id'] == '202'
+    result(r)
+    try:
+        if compressed:
+            db.end_session(parent, end_reason='compression')
+            db.create_session('child', source='telegram', parent_session_id=parent)
+            await r.runner.async_session_store.switch_session(r.identity['session_key'], 'child')
+        jobs = []
+        r.adapter.get_pending_message = lambda key: r.adapter._pending_messages.pop(key, None)
+        r.adapter._start_session_processing = lambda event, key: jobs.append(event)
+        await r.runner._diggr_tick(r.source, parent, idle=True)
+        assert len(jobs) == 1
+        event = jobs[0]
+        assert event.source.message_id == '101'  # Actual route_scope retained session origin A.
+        assert await r.runner._diggr_accept(event)
+        entry = await r.runner.async_session_store.get_or_create_session(event.source)
+        context = build_session_context(event.source, r.runner.config, entry)
+        before = r.guard.path.read_bytes()
+        tokens = await delivery.set_tool_context(r.runner, event, context, entry)
+        try:
+            binding = completion_launch_context.get()[0]
+            assert binding == original
+            assert binding['metadata']['telegram_reply_to_message_id'] == '202'
+            assert binding['thread_id'] == topic
+            assert dc.register_native(r.task)[1]['_native_admission_replayed']
+            assert r.guard.path.read_bytes() == before
+        finally:
+            r.runner._clear_session_env(tokens)
+        # Reject genuine source rerouting, not merely injected binding dictionaries.
+        for field, value in [('profile', 'foreign'), ('thread_id', '999'), ('chat_id', 'foreign'), ('user_id', 'foreign')]:
+            forged_source = replace(event.source, **{field: value})
+            bad_event = SimpleNamespace(source=forged_source, _diggr_wake=event._diggr_wake)
+            with pytest.raises(ValueError):
+                await delivery.set_tool_context(r.runner, bad_event,
+                    build_session_context(forged_source, r.runner.config, entry), entry)
+            assert r.guard.path.read_bytes() == before
+    finally:
+        db.close()

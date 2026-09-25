@@ -354,7 +354,17 @@ async def set_tool_context(runner, event, context, entry):
                 raise ValueError('native wake transport unavailable at tool setup')
             binding, schedule = current
             bound = dict(binding, parent_session_id=identity['session'])
-            if bound != original:
+            expected = dict(original)
+            # SessionEntry.origin may still describe opening message A while
+            # admission came from B. The reply anchor is per-message, not
+            # route authority. Keep every other routing field exact and use
+            # the persisted admission metadata (including B) below.
+            for candidate in (bound, expected):
+                metadata = candidate.get('metadata')
+                if isinstance(metadata, dict):
+                    candidate['metadata'] = {key: value for key, value in metadata.items()
+                                             if key != 'telegram_reply_to_message_id'}
+            if bound != expected:
                 raise ValueError('native wake transport changed during tool setup')
             completion_launch_context.set((json.loads(json.dumps(original)), schedule))
         if guard is not None:

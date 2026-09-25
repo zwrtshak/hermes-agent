@@ -905,10 +905,18 @@ def acquire_gateway_runtime_lock() -> bool:
     return True
 
 
-def release_gateway_runtime_lock() -> None:
-    """Release the gateway runtime lock when owned by this process."""
-    with _gateway_checkpoint_commit_lock:
+def release_gateway_runtime_lock(*, blocking: bool = True) -> None:
+    """Release after commits; hard-exit callers may leave a busy lock to the OS."""
+    if blocking:
+        with _gateway_checkpoint_commit_lock:
+            _release_gateway_runtime_lock_after_commits()
+        return
+    if not _gateway_checkpoint_commit_lock.acquire(blocking=False):
+        return
+    try:
         _release_gateway_runtime_lock_after_commits()
+    finally:
+        _gateway_checkpoint_commit_lock.release()
 
 
 def _release_gateway_runtime_lock_after_commits() -> None:

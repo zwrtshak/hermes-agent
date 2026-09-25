@@ -767,7 +767,7 @@ class ProcessRegistry:
         return None
 
     @classmethod
-    def _host_pid_identity(cls, pid: Optional[int], expected_start: Optional[int], expected_os=None, owned_process=None) -> Optional[bool]:
+    def _host_pid_identity(cls, pid: Optional[int], expected_start: Optional[int], expected_os=None, owned_process=None, owned_pty=None) -> Optional[bool]:
         """True: matching live process; False: dead/reused; None: unknown.
 
         Unknown is neither evidence of exit nor permission to signal.
@@ -787,11 +787,19 @@ class ProcessRegistry:
             if current['executable'] == expected_os['executable']:
                 return True
             # An unreaped, still-running child cannot have had its PID reused.
-            # This exception is only available to the original Popen owner;
+            # This exception is only available to the original waitable owner;
             # recovered sessions have no waitable handle and stay unknown.
             if owned_process is not None:
                 try:
                     if owned_process.pid == pid and owned_process.poll() is None:
+                        return True
+                except Exception:
+                    pass
+            if owned_pty is not None:
+                try:
+                    from ptyprocess import PtyProcess
+                    if (isinstance(owned_pty, PtyProcess) and owned_pty.pid == pid
+                            and owned_pty.isalive() is True):
                         return True
                 except Exception:
                     pass
@@ -2111,7 +2119,9 @@ class ProcessRegistry:
             return result
 
         if session.pid_scope == "host" and session.pid:
-            identity = self._host_pid_identity(session.pid, session.host_start_time, session.host_os_identity, session.process)
+            identity = self._host_pid_identity(
+                session.pid, session.host_start_time, session.host_os_identity,
+                session.process, session._pty if not session.detached else None)
             if identity is None:
                 return {"status": "error", "error": "Process identity is unknown; refusing to signal"}
             if identity is False:
@@ -2134,10 +2144,18 @@ class ProcessRegistry:
         try:
             if session._pty:
                 # PTY process -- terminate via ptyprocess
+                if session.pid_scope == "host" and self._host_pid_identity(
+                        session.pid, session.host_start_time, session.host_os_identity,
+                        owned_pty=session._pty if not session.detached else None) is not True:
+                    return {"status": "error", "error": "Process identity changed; termination refused"}
                 try:
                     session._pty.terminate(force=True)
                 except Exception:
                     if session.pid:
+                        if self._host_pid_identity(
+                                session.pid, session.host_start_time, session.host_os_identity,
+                                owned_pty=session._pty if not session.detached else None) is not True:
+                            return {"status": "error", "error": "Process identity changed; termination refused"}
                         os.kill(session.pid, signal.SIGTERM)
             elif session.process:
                 # Local process -- kill the process tree. On Windows this

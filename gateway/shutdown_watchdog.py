@@ -397,14 +397,14 @@ def arm_shutdown_watchdog(
                 stream.flush()
             except Exception:
                 pass
-        # Mirror _exit_after_graceful_shutdown: release PID file + runtime
-        # lock BEFORE the log drain (locks must never be stranded), then
+        # Mirror _exit_after_graceful_shutdown: release PID file and an idle
+        # runtime lock, but leave a busy commit's lock to OS process exit. Then
         # drain the async log queue so the logger.critical above actually
         # reaches the file before os._exit bypasses atexit. (#66892)
         try:
             from gateway.status import remove_pid_file, release_gateway_runtime_lock
             remove_pid_file()
-            release_gateway_runtime_lock()
+            release_gateway_runtime_lock(blocking=False)
         except Exception:
             pass
         try:
