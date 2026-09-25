@@ -1,7 +1,8 @@
 # Local Python read diagnostics inside the gateway
 
 The terminal lifecycle guard supports a deliberately narrow read-only Python
-form on explicitly local backends. Its rejection message supplies the actual
+form for gateway **foreground execution** on explicitly local backends
+(`background=false`). Its rejection message supplies the actual
 shell-quoted canonical interpreter path at runtime. Use that path with exactly
 `-I -S -`, followed by one literal quoted heredoc:
 
@@ -39,7 +40,14 @@ targets are accepted. Proof limits are 1 MiB of command text, 4096 AST nodes
 and 64 expression levels. A rejected proof in this exact local form blocks
 the command; it does not fall back to the less precise shell scan.
 
-The real local execution path repeats this proof before command preparation.
+Canonical proven local reads with `background=true` are rejected before either
+registry spawn route, including with `force=true` or `pty=true` and when a cached
+local environment outlives a change to remote configuration. Background
+preparation can change the verified Python input. Run these diagnostics in the
+foreground; `pty=true` without background still uses the foreground path.
+Ordinary background commands keep their existing dispatch and rewriting.
+
+The real local foreground path repeats this proof before command preparation.
 Proven programs retain their stdin text through sudo and compound-background
 preparation. A Python variable or data string named `sudo` does not trigger a
 password probe, prompt or injection. Other invocations and backends keep the
@@ -55,7 +63,9 @@ unfinished body in the conservative scan. Unknown consumers never receive a
 body exemption.
 
 Other Python invocation forms retain the existing conservative classification
-and may reject harmless reads. This is not a general Python sandbox or a
+and may reject harmless reads. Existing foreground checks can also reject
+shell-like data strings; the canonical form does not bypass those checks.
+This is not a general Python sandbox or a
 complete shell/interpreter analyzer. File reads can still fail or block on
 filesystem resources; normal terminal timeouts apply. Genuine gateway control
 must use the external operator path rather than a command inside the gateway.

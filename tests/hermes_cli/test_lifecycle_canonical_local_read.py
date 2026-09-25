@@ -233,6 +233,169 @@ def test_proven_read_data_is_unchanged_by_background_preparation(read_data, term
     assert boundary.prepared == [(command, (command, None))]
 
 
+@pytest.mark.parametrize("pty", [False, True])
+def test_gateway_canonical_background_stops_before_actual_spawn(
+    read_data, terminal_boundary, monkeypatch, pty,
+):
+    import tools.process_registry as pr
+    import tools.terminal_tool as tt
+
+    data, _ = read_data
+    _, boundary = terminal_boundary
+    command = canonical(read_body(data) + '\nmessage = """one" && two & """\nprint(message)')
+    assert _is_canonical_python_read(command) is True
+    # Demonstrate the existing text mutation without executing the program.
+    rewritten = tt._rewrite_compound_background(command)
+    assert rewritten == command.replace('one" && two & ', 'one" && { two & } ')
+
+    class SpawnIntercepted(BaseException):
+        """Stop before process creation, including the PTY fallback handler."""
+
+    captured = []
+
+    def intercept(argv, **kwargs):
+        captured.append(argv)
+        raise SpawnIntercepted
+
+    monkeypatch.setattr(pr, "_find_shell", lambda: "/bin/bash")
+    monkeypatch.setattr(pr, "_is_supervised_gateway_process", lambda: False)
+    monkeypatch.setattr(pr.subprocess, "Popen", intercept)
+    if pty:
+        if os.name == "nt":
+            from winpty import PtyProcess
+        else:
+            from ptyprocess import PtyProcess
+        monkeypatch.setattr(PtyProcess, "spawn", intercept)
+    spawn_local = Mock(wraps=pr.process_registry.spawn_local)
+    spawn_via_env = Mock(side_effect=SpawnIntercepted)
+    monkeypatch.setattr(pr.process_registry, "spawn_local", spawn_local)
+    monkeypatch.setattr(pr.process_registry, "spawn_via_env", spawn_via_env)
+
+    result = None
+    try:
+        result = json.loads(tt.terminal_tool(command, background=True, force=True, pty=pty))
+    except SpawnIntercepted:
+        pass
+    assert captured == [], f"Background launch reached with mutated argv: {captured!r}"
+    spawn_local.assert_not_called()
+    spawn_via_env.assert_not_called()
+    assert result["exit_code"] == 1, result
+    assert "foreground" in result["error"].lower()
+    assert "background=false" in result["error"]
+    assert boundary.calls == []
+    assert boundary.launches == []
+
+
+@pytest.fixture
+def background_spawns(monkeypatch):
+    import tools.process_registry as pr
+    import tools.terminal_tool as tt
+
+    # Capture both dispatch routes without a registry process or checkpoint.
+    spawns = tuple(Mock(side_effect=RuntimeError("spawn intercepted")) for _ in range(2))
+    monkeypatch.setattr(pr.process_registry, "spawn_local", spawns[0])
+    monkeypatch.setattr(pr.process_registry, "spawn_via_env", spawns[1])
+    monkeypatch.setattr(tt, "_check_all_guards", Mock(return_value={"approved": True}))
+    return spawns
+
+
+@pytest.mark.parametrize("backend", ["local", "ssh"])
+@pytest.mark.parametrize("pty", [False, True])
+@pytest.mark.parametrize("force", [False, True])
+@pytest.mark.parametrize("shell_like_data", [False, True])
+def test_gateway_canonical_background_requires_foreground_on_cached_local(
+    read_data, terminal_boundary, background_spawns, backend, pty, force, shell_like_data,
+):
+    import tools.terminal_tool as tt
+
+    data, _ = read_data
+    _, boundary = terminal_boundary
+    body = read_body(data)
+    if shell_like_data:
+        body += '\nmessage = """one" && two & """\nprint(message)'
+    command = canonical(body)
+    assert _is_canonical_python_read(command) is True
+    # Keep the real cached LocalEnvironment while changing dispatch config.
+    tt._get_env_config()["env_type"] = backend
+    result = json.loads(tt.terminal_tool(command, background=True, force=force, pty=pty))
+    for spawn in background_spawns:
+        spawn.assert_not_called()
+    assert result["exit_code"] == 1, result
+    assert "foreground" in result["error"].lower()
+    assert "background=false" in result["error"]
+    assert boundary.calls == []
+    assert boundary.launches == []
+
+
+@pytest.mark.parametrize("cached_backend", ["ssh", "unknown"])
+@pytest.mark.parametrize("pty", [False, True])
+def test_gateway_background_local_config_does_not_exempt_cached_foreign(
+    read_data, terminal_boundary, background_spawns, cached_backend, pty,
+):
+    import tools.terminal_tool as tt
+
+    data, _ = read_data
+    _, boundary = terminal_boundary
+    command = canonical(read_body(data))
+    boundary.remote_files[str(data)] = '{"example": "hermes gateway restart"}'
+    tt._active_environments["default"] = boundary.environments[cached_backend]
+    result = json.loads(tt.terminal_tool(command, background=True, force=True, pty=pty))
+    for spawn in background_spawns:
+        spawn.assert_not_called()
+    assert result["exit_code"] == 1, result
+    assert "no canonical Python read exemption" in result["error"]
+    assert "background=false" not in result["error"]
+    assert command not in boundary.calls
+    assert any(call.startswith("head -c ") for call in boundary.calls)
+    assert boundary.launches == []
+
+
+@pytest.mark.parametrize("form", ["ordinary", "bare-python", "outside-gateway"])
+def test_background_dispatch_outside_gateway_canonical_exemption_is_unchanged(
+    terminal_boundary, background_spawns, monkeypatch, form,
+):
+    import tools.terminal_tool as tt
+
+    command = "printf ready && printf done &"
+    if form == "bare-python":
+        command = "python3 - <<'PY'\nprint('synthetic')\nPY\n"
+    elif form == "outside-gateway":
+        monkeypatch.delenv("_HERMES_GATEWAY")
+        command = canonical("print('synthetic')")
+    result = json.loads(tt.terminal_tool(command, background=True, force=True))
+    spawn_local, spawn_via_env = background_spawns
+    spawn_local.assert_called_once()
+    assert spawn_local.call_args.kwargs["command"] == command
+    spawn_via_env.assert_not_called()
+    assert "spawn intercepted" in result["error"]
+
+
+@pytest.mark.parametrize("kind", ["json", "directory"])
+@pytest.mark.parametrize("delimiter", ["'PY'", '"PY"', "\\PY", "P'Y'"])
+def test_canonical_pty_foreground_keeps_real_local_reads(
+    read_data, terminal_boundary, background_spawns, kind, delimiter,
+):
+    import tools.terminal_tool as tt
+
+    data, directory = read_data
+    _, boundary = terminal_boundary
+    expression = (
+        f"json.loads(Path({str(data)!r}).read_text())['example']"
+        if kind == "json" else f"list(Path({str(directory)!r}).iterdir())"
+    )
+    command = canonical("from pathlib import Path\nimport json\n" + f"print({expression})", delimiter)
+    boundary.expected_read = command
+    result = json.loads(tt.terminal_tool(command, force=True, pty=True))
+    assert result["exit_code"] == 0, result
+    assert ("hermes gateway restart" if kind == "json" else "entry.txt") in result["output"]
+    assert boundary.calls == [command]
+    assert boundary.prepared == [(command, (command, None))]
+    assert len(boundary.launches) == 1
+    assert boundary.launches[0][1] is None
+    for spawn in background_spawns:
+        spawn.assert_not_called()
+
+
 @pytest.mark.parametrize("backend, form", [
     ("local", "sudo-command"), ("local", "unproven-python"),
     ("local", "wrapped-python"), ("ssh", "proven-python"),

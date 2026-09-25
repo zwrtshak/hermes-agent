@@ -2792,6 +2792,7 @@ def terminal_tool(
         if os.environ.get("_HERMES_GATEWAY") == "1":
             from cron.lifecycle_guard import (
                 _MAX_REFERENCED_SCRIPT_BYTES,
+                _is_canonical_python_read,
                 contains_gateway_lifecycle_command_or_referenced_script,
                 contains_launchctl_submit_command,
             )
@@ -2892,7 +2893,8 @@ def terminal_tool(
                         if not interpreter.is_file():
                             raise OSError("canonical interpreter is not a regular file")
                         diagnostic_hint = (
-                            "For a local Python read diagnostic, use `"
+                            "For a local Python read diagnostic, use foreground "
+                            "execution (background=false) with `"
                             + shlex.quote(str(interpreter))
                             + " -I -S - <<'PY'` followed by the supported pathlib/JSON read "
                             "program and a closing `PY` line, as the entire command. "
@@ -2912,6 +2914,23 @@ def terminal_tool(
                         + diagnostic_hint
                         + "Actual gateway stop/restart remains blocked inside the gateway; "
                         "perform intended gateway control from a separate shell outside it."
+                    ),
+                    "status": "error",
+                }, ensure_ascii=False)
+
+            # The exemption preserves stdin only through foreground execution.
+            # Background dispatch uses config, so a cached local env can reach
+            # either registry route; reject before both, even with force/PTY.
+            if background and guard_is_local and _is_canonical_python_read(command) is True:
+                return json.dumps({
+                    "output": "",
+                    "exit_code": 1,
+                    "error": (
+                        "Blocked: the canonical local Python read exemption inside "
+                        "the gateway is foreground-only. Run this diagnostic with "
+                        "background=false. Background command preparation can change "
+                        "the verified Python input; force=true and pty=true do not "
+                        "enable this exemption for background execution."
                     ),
                     "status": "error",
                 }, ensure_ascii=False)
