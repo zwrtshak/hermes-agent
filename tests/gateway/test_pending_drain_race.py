@@ -31,6 +31,7 @@ from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
     MessageType,
+    SendResult,
 )
 from gateway.session import SessionSource, build_session_key
 
@@ -185,28 +186,51 @@ async def test_finally_cleanup_drains_late_arrival_pending():
 
 
 @pytest.mark.asyncio
-async def test_no_pending_cleans_up_normally():
-    """Regression guard: when no pending message exists, the finally
-    block must still delete _active_sessions as before (no leak)."""
+@pytest.mark.parametrize("hold_cleanup", [False, True])
+async def test_no_pending_cleans_up_normally(hold_cleanup):
+    """The completed owner task must release its guard, including slow cleanup."""
     adapter = _make_adapter()
     sk = _sk()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_stop = adapter.stop_typing
 
-    async def handler(event):
-        return "ok"
+    async def controlled_stop(*args, **kwargs):
+        entered.set()
+        await asyncio.wait_for(release.wait(), timeout=2.0)
+        return await original_stop(*args, **kwargs)
 
-    adapter._message_handler = handler
+    if hold_cleanup:
+        adapter.stop_typing = controlled_stop
+    adapter._message_handler = AsyncMock(return_value="ok")
+    adapter._send_with_retry.return_value = SendResult(success=True, message_id="reply")
+    event = _make_event(text="solo")
+    await adapter.handle_message(event)
+    task = adapter._session_tasks[sk]
+    guard = adapter._active_sessions[sk]
+    try:
+        if hold_cleanup:
+            await asyncio.wait_for(entered.wait(), timeout=1.0)
+            # A still-running cleanup must retain ownership, not look like a leak.
+            assert not task.done()
+            assert adapter._session_tasks[sk] is task
+            assert adapter._active_sessions[sk] is guard
+            assert sk not in adapter._pending_messages
+            release.set()
 
-    await adapter.handle_message(_make_event(text="solo"))
-
-    # Wait for background task to finish.
-    for _ in range(50):
-        if sk not in adapter._active_sessions:
-            break
-        await asyncio.sleep(0.01)
-
-    assert sk not in adapter._active_sessions, (
-        "_active_sessions was not cleaned up after a normal turn with no pending"
-    )
-    assert sk not in adapter._pending_messages
-
-    await adapter.cancel_background_tasks()
+        # Wait for the actual owner, not a nominal polling window that races
+        # with typing cleanup and asynchronous delivery-ledger persistence.
+        await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
+        assert not task.cancelled()
+        assert sk not in adapter._active_sessions, (
+            "_active_sessions was not cleaned up after a normal turn with no pending"
+        )
+        assert sk not in adapter._session_tasks
+        assert sk not in adapter._pending_messages
+        adapter._message_handler.assert_awaited_once_with(event)
+        adapter._send_with_retry.assert_awaited_once()
+        assert adapter._send_with_retry.await_args.kwargs["chat_id"] == "42"
+        assert adapter._send_with_retry.await_args.kwargs["content"] == "ok"
+    finally:
+        release.set()
+        await adapter.cancel_background_tasks()

@@ -1591,6 +1591,11 @@ DISPATCHER = '/Users/diggr/Projects/diggr_claw/ops/scripts/loop_control_dispatch
 CODEX_EXECUTABLE = '/Users/diggr/.npm-global/bin/codex'
 
 
+def logical_packet_root():
+    """Authoritative dispatcher packet root, shared with proposal prevalidation."""
+    return (Path(DISPATCHER).parents[2] / 'ops/state/loop-control/routing_packets').resolve()
+
+
 def logical_launcher_command(contract, route):
     """Only the existing dispatcher and data arguments, never arbitrary shell text."""
     import shlex
@@ -1667,7 +1672,7 @@ def validate_logical_route(task, contract, *, fresh=True):
         raise ValueError('isolated authorized worktree and external artifact roots required')
     paths = [canonical_path(task['artifact']), canonical_path(route['packet']), canonical_path(route['receipt'])]
     if (len(set(paths)) != 3 or any(not Path(path).is_relative_to(artifacts) for path in paths) or
-            not Path(route['packet']).is_relative_to(Path(DISPATCHER).parents[2] / 'ops/state/loop-control/routing_packets')):
+            not Path(route['packet']).is_relative_to(logical_packet_root())):
         raise ValueError('fresh logical packet/receipt/result paths must remain in bound roots')
     if fresh and any(Path(path).exists() or Path(path).is_symlink() for path in (task['artifact'], route['receipt'])):
         raise ValueError('logical result and receipt must be fresh')
@@ -1883,8 +1888,9 @@ def terminal_dispatch(args, invoke):
         guard = runtime_guard(identity['home'])
         if guard is None:
             raise ValueError('native candidate inactive')
-        digest = owner_policy.propose(guard, identity, args['continuation_proposal'])
-        return json.dumps(dict(proposal_sha256=digest, owner_command='/continuation show ' + digest))
+        transport = delivery.native_transport(identity)
+        digest = owner_policy.propose(guard, identity, args['continuation_proposal'], transport=transport)
+        return json.dumps(owner_policy.proposal_result(guard, identity, digest, transport))
     if args.get('continuation_control') is not None:
         if args.get('command') != 'SYSTEM168_CONTINUATION_CONTROL' or args.get('continuation') or args.get('continuation_ticket'):
             raise ValueError('structured maintenance accepts no shell command or dispatch')

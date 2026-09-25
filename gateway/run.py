@@ -14869,8 +14869,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
 
-        if not await self._diggr_accept(event):
+        from hermes_cli.diggr_delivery import NativeWake, batch_work_blocked
+        _diggr_batch = (type(getattr(event, '_diggr_wake', None)) is NativeWake
+                        and bool(event._diggr_wake.batch))
+        # Batch confirmation starts NEW work. Authenticate now, but consume it
+        # only once the ordinary new-turn gates and session-slot claim succeed.
+        if not await self._diggr_accept(event, accept_batch=not _diggr_batch):
             return None
+        if _diggr_batch and batch_work_blocked(self):
+            return None  # Durable queued authority remains for the bounded idle retry.
 
         # Global emergency stop (`hermes pause`): give new turns a brief
         # paused notice instead of starting an agent run. Internal events
@@ -16087,6 +16094,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # replays, background-process completions) bypass the gate — they are
         # not user-initiated new work and must still flow during a drain.
         # Reversible: once the marker is removed the gate opens again.
+        if _diggr_batch and batch_work_blocked(self):
+            return None
         if self._external_drain_active and not is_internal:
             logger.info(
                 "Refusing new turn for session %s — external drain active.",
@@ -16124,6 +16133,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _run_generation = self._begin_session_run_generation(_quick_key)
 
         try:
+            if _diggr_batch and not await self._diggr_accept(event):
+                return None
             try:
                 _agent_result = await self._handle_message_with_agent(
                     event, source, _quick_key, _run_generation
@@ -16170,6 +16181,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             session_entry=session_entry,
                             source=source,
                             final_response=_final_text,
+                            native_event=event if _diggr_routed else None,
                         )
             except Exception as _goal_exc:
                 logger.debug("goal continuation hook failed: %s", _goal_exc)
@@ -19446,12 +19458,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     platform=source.platform.value, chat_id=str(source.chat_id),
                     user_id=str(source.user_id or ''), thread_id=str(source.thread_id or ''))
 
-    async def _diggr_accept(self, event):
+    async def _diggr_accept(self, event, *, accept_batch=True):
         from hermes_cli.diggr_continuation import runtime_guard, token
         guard = runtime_guard(self._resolve_profile_home_for_source(event.source))
         wake = token(event.text)
+        from hermes_cli.diggr_delivery import NativeWake
+        proof = getattr(event, '_diggr_wake', None)
         if guard is None:
-            return wake is None
+            return wake is None and type(proof) is not NativeWake
+        if type(getattr(event, '_diggr_wake', None)) is NativeWake and wake is None:
+            return False
         if wake is not None:
             from hermes_cli.diggr_delivery import NativeWake, native_identity
             proof = getattr(event, '_diggr_wake', None)
@@ -19484,8 +19500,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return True
         from hermes_cli.diggr_delivery import NativeWake
         proof = getattr(event, '_diggr_wake', None)
-        if (type(proof) is not NativeWake or
-                (proof.task, proof.generation) != (wake.get('task'), wake.get('generation'))):
+        if (type(proof) is not NativeWake or not isinstance(wake, dict) or
+                (proof.generation != wake.get('generation')) or
+                (proof.batch and (proof.batch != wake.get('batch') or 'task' in wake)) or
+                (not proof.batch and proof.task != wake.get('task'))):
             return False
         from hermes_cli.diggr_delivery import native_identity, native_session_matches
         try:
@@ -19494,6 +19512,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return False
         if not await native_session_matches(self, identity, session):
             return False
+        if proof.batch:
+            from hermes_cli.diggr_delivery import accept_batch as commit_batch
+            return commit_batch(self, event, guard, identity) if accept_batch else True
         return guard.begin(identity, wake)
 
     async def _diggr_finish(self, event, response):
@@ -19501,8 +19522,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return await finish(self, event, response)
 
     async def _diggr_deliver(self, guard, identity):
-        from hermes_cli.diggr_delivery import deliver
+        from hermes_cli.diggr_delivery import deliver, deliver_previews
         await deliver(self, guard, identity)
+        await deliver_previews(self, guard, identity)
 
     async def _diggr_tick(self, source, session_id, idle=False):
         from hermes_cli.diggr_continuation import runtime_guard, prompt, token, observe_processes
@@ -19513,8 +19535,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         observe_processes(guard)
         from hermes_cli.diggr_continuation import TERMINAL
         try:
+            from hermes_cli.diggr_delivery import tick_batches
+            batch_pending = await tick_batches(self, guard, identity, idle=idle)
             if not guard.blocks(identity):
-                return False
+                return batch_pending
             from hermes_cli.diggr_delivery import route_scope
             with guard.transaction() as rows:
                 row = next((dict(r) for r in rows.values()
@@ -19571,9 +19595,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if guard is None:
                     continue
                 with guard.transaction() as tasks:
-                    identities = list({json.dumps(r['identity'], sort_keys=True): r['identity']
+                    origins = [r['identity']
                         for r in tasks.values() if r['status'] not in TERMINAL or
-                        any(d['status'] in {'pending', 'sending'} for d in r.get('deliveries', []))}.values())
+                        any(d['status'] in {'pending', 'sending'} for d in r.get('deliveries', []))]
+                    origins += [p['coordinator_identity'] for p in tasks.grants.get('proposals', {}).values()
+                                if p.get('native_transport') and p.get('preview') and
+                                (p['preview']['state'] in {'pending', 'open'} or
+                                 p['preview']['ui_applied'] != p['preview']['ui_revision'])]
+                    origins += [b['coordinator_identity'] for b in tasks.grants.get('batches', {}).values()
+                                if b.get('native_transport') and
+                                (b.get('coordinator_delivery', {}).get('status') in {'pending', 'queued', 'accepted'} or
+                                 any(d['status'] in {'pending', 'sending'} for d in b.get('deliveries', [])))]
+                    identities = list({json.dumps(i, sort_keys=True): i for i in origins}.values())
                 for identity in identities:
                     try:
                         if identity['platform'] != 'telegram':
@@ -19595,22 +19628,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_entry: Any,
         source: Any,
         final_response: str,
+        native_event: Any = None,
     ) -> None:
         """Run the goal judge after a gateway turn and, if still active,
         enqueue a continuation prompt for the same session.
 
-        Called from ``_handle_message_with_agent`` at turn boundary, AFTER
-        the response has been delivered. Safe when no goal is set.
+        Called by the outer handler after inner context cleanup and durable
+        native finish. Safe when no goal is set.
 
         We use the adapter's pending-message / FIFO machinery so any real
         user message that arrives simultaneously is handled by the same
         queue and takes priority naturally.
         """
-        from hermes_cli.diggr_continuation import EVENT_CONTEXT
         from hermes_cli.diggr_delivery import NativeWake
-        proof = (EVENT_CONTEXT.get() or {}).get('native_wake')
-        bound_session = proof.session if type(proof) is NativeWake else getattr(session_entry, 'session_id', '') or ''
-        if await self._diggr_tick(source, bound_session):
+        proof = getattr(native_event, '_diggr_wake', None)
+        if type(proof) is NativeWake:
+            # finish has verified this exact event's durable admission. The
+            # inner handler cleared EVENT_CONTEXT; the live transcript may
+            # now be a compression child while authority belongs to its parent.
+            await self._diggr_tick(native_event.source, proof.session)
+            return  # Exhausted native authority must never fall through to /goal.
+        if await self._diggr_tick(source, getattr(session_entry, 'session_id', '') or ''):
             return
 
         try:
