@@ -1,5 +1,6 @@
 """Actual Telegram command handler -> gateway -> durable grant -> Guard; no network."""
 import copy
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -97,6 +98,76 @@ async def test_real_native_confirmation_admission_and_replay(route):
     # New confirm event is not reauthorization, even with the old code.
     with pytest.raises(ValueError):
         await r.runner._diggr_accept(await r.event(command))
+
+
+@pytest.mark.asyncio
+async def test_app104_native_archive_requires_two_owner_events_and_releases_only_admission(route):
+    r = route
+    r.task.update(task='APP-104-stable-album-children', producer='cmux',
+        worker_route=dict(worktree=str(r.tmp / 'old-worktree')),
+        launcher_command='fixture-launcher')
+    bid, accepted_owner_event, _ = await confirm(r)
+    entry = await r.runner.async_session_store.get_or_create_session(accepted_owner_event.source)
+    native_identity = r.runner._diggr_identity(accepted_owner_event.source, entry.session_id)
+    issue = owner.issue_key(manifest(r.task)['todos'][0])
+    r.guard.register(dict(r.task, owner_batch=bid, owner_issue=issue))
+    # Construct the historical ledger snapshot in disposable fixture storage.
+    # Production never changes an existing origin or grant identifier.
+    snapshot = json.loads(r.guard.path.read_text())
+    row = snapshot[r.task['task']]
+    grants = snapshot['_owner_grants']
+    batch = grants['batches'].pop(bid)
+    old_bid = '13bd6f74a3e74ce084e43bbe823f59b444d4e76e89dbdffc2d31b8e75866ad62'
+    grants['batches'][old_bid] = batch
+    batch['coordinator_identity'] = native_identity
+    row['identity'] = native_identity
+    row['owner_batch'] = old_bid
+    row['policy']['batch'] = old_bid
+    row.update(generation=3, status='blocked', effect_status='unknown',
+        launcher_expected=True, action_id='fe6b4781ab5e4989a923ab65ab3aa6e3',
+        effect_id='8993957c2d584e418a42c4d5018d4bf6')
+    from hermes_cli import diggr_delivery as delivery
+    row['origin'] = delivery.origin_for(owner.State({row['task']: row}, grants), row)
+    r.guard.path.write_text(json.dumps(snapshot))
+    assert dc.ownership_pending(r.guard.get(r.task['task']))
+    with r.guard.transaction(read_only=True) as rows:
+        assert owner._app104_archive_candidate(rows, native_identity)
+    with pytest.raises(ValueError, match='preview'):
+        await r.runner._diggr_accept(await r.event('/continuation archive-confirm fake fake'))
+    shown = await r.event('/continuation archive-show')
+    assert await r.runner._diggr_accept(shown) is False
+    command = r.adapter.send.call_args.args[1].splitlines()[-1]
+    assert command.startswith('/continuation archive-confirm ')
+    before = r.guard.get(r.task['task'])
+    assert 'operator_archive' not in before
+    accepted = await r.event(command)
+    assert await r.runner._diggr_accept(accepted) is False
+    row = r.guard.get(r.task['task'])
+    assert row['status'] == 'blocked' and row['effect_status'] == 'unknown'
+    assert dc.operator_archive_matches(row)
+    assert not dc.ownership_pending(row)
+    assert dc.worktree_reserved(row, r.task['worker_route']['worktree'])
+    assert row['operator_archive']['historical_effects'] == 'unknown'
+    changed = copy.deepcopy(row)
+    changed['action'] = 'different historical attempt'
+    assert not dc.operator_archive_matches(changed)
+    assert dc.ownership_pending(changed)
+    with pytest.raises(ValueError, match='exact blocked attempt'):
+        await r.runner._diggr_accept(await r.event(command))
+
+    # The old batch remains intact; the exact same issue may receive a new
+    # independent native grant only after its historical row is archived.
+    fresh = dict(r.task, task='APP-104-second-attempt',
+        artifact=str(r.tmp / 'fresh-result'),
+        worker_route=dict(worktree=str(r.tmp / 'fresh-worktree')))
+    new_bid, _, _ = await confirm(r, manifest(fresh))
+    r.guard.register(dict(fresh, owner_batch=new_bid, owner_issue=issue))
+    assert r.guard.get(fresh['task'])['status'] == 'running'
+    assert r.guard.get(r.task['task'])['operator_archive'] == row['operator_archive']
+    with r.guard.transaction(read_only=True) as rows:
+        assert rows.grants['batches'][old_bid]['revoked'] is False
+        assert rows.grants['batches'][old_bid]['tasks'][issue] == r.task['task']
+        assert rows.grants['batches'][new_bid]['tasks'][issue] == fresh['task']
 
 
 @pytest.mark.asyncio

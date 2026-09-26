@@ -513,7 +513,7 @@ async def handle_callback(runner, proof):
 
 def confirm_batch(rows, p, digest, identity, event_id, code, now, transport=None):
     """Called under Guard's lock by either native proof; no effects outside state."""
-    from hermes_cli.diggr_continuation import object_hash, ownership_pending
+    from hermes_cli.diggr_continuation import object_hash, ownership_pending, operator_archive_matches
     owner = stable_owner(identity)
     used_events = rows.grants.setdefault('confirmation_events', {})
     event_key = object_hash(dict(owner=owner, event=event_id))
@@ -526,7 +526,9 @@ def confirm_batch(rows, p, digest, identity, event_id, code, now, transport=None
         if old['owner'] != owner:
             continue
         overlap = keys & {issue_key(t) for t in old['manifest']['todos']}
-        if overlap and bid != replaces and not old.get('replaced_by'):
+        if (overlap and bid != replaces and not old.get('replaced_by') and
+                not all(operator_archive_matches(rows.get(old.get('tasks', {}).get(issue), {}))
+                        for issue in overlap)):
             raise ValueError('same logical work requires explicit reauthorization of prior batch')
     if replaces:
         old = batches.get(replaces)
@@ -560,6 +562,8 @@ async def handle_command(runner, event, guard, identity):
     """Consumed before agent execution; separate explicit show and confirm messages."""
     event_id = verify_input(event, identity)
     words = event.text.split()
+    if len(words) >= 2 and words[1] in {'archive-show', 'archive-confirm'}:
+        return await handle_operator_archive(runner, event, guard, identity, event_id, words)
     if len(words) not in (3, 4) or words[0] != '/continuation' or words[1] not in {'show', 'confirm'}:
         raise ValueError('use /continuation show HASH or /continuation confirm HASH CODE')
     digest = words[2]
@@ -631,6 +635,79 @@ async def handle_command(runner, event, guard, identity):
             if not p.get('batch') and not p.get('revoked') and not p.get('declined') and p.get('show_reservation') == event_id:
                 p['shown'] = preview
     return False  # fully handled, never forwarded to agent/tool execution
+
+
+def _app104_archive_candidate(rows, identity):
+    """One historical identity-loss case, never a reusable task unlock."""
+    row = rows.get('APP-104-stable-album-children')
+    if (not row or row.get('task') != 'APP-104-stable-album-children' or
+            row.get('generation') != 3 or row.get('status') != 'blocked' or
+            row.get('effect_status') != 'unknown' or row.get('producer') != 'cmux' or
+            row.get('owner_batch') != '13bd6f74a3e74ce084e43bbe823f59b444d4e76e89dbdffc2d31b8e75866ad62' or
+            row.get('action_id') != 'fe6b4781ab5e4989a923ab65ab3aa6e3' or
+            row.get('effect_id') != '8993957c2d584e418a42c4d5018d4bf6' or
+            row.get('identity') != identity or not row.get('launcher_expected') or
+            any(row.get(k) for k in ('process_id', 'launcher_pid', 'launcher_identity',
+                                     'worker_pid', 'worker_identity', 'child_identity',
+                                     'visible_sent', 'reservation_retirement', 'operator_archive'))):
+        raise ValueError('APP-104 historical archive does not match the exact blocked attempt')
+    return row
+
+
+async def handle_operator_archive(runner, event, guard, identity, event_id, words):
+    """Direct native owner acceptance of one documented unknown historical attempt."""
+    from hermes_cli.diggr_continuation import object_hash, operator_archive_core
+    from hermes_cli.diggr_delivery import command_transport, same_transport
+    transport = command_transport(runner, event, identity)
+    if words[1] == 'archive-show':
+        if len(words) != 2:
+            raise ValueError('archive-show takes no task alias or payload')
+        with guard.transaction() as rows:
+            row = _app104_archive_candidate(rows, identity)
+            preview = dict(core_sha256=operator_archive_core(row), generation=row['generation'],
+                identity=identity, transport=transport, event=event_id,
+                code=secrets.token_hex(12), expires=time.time() + 300)
+            rows.grants.setdefault('operator_archive_previews', {})[row['task']] = preview
+        response = ('APP-104 old attempt, generation 3: start and effects remain UNKNOWN. '
+            'This one-time owner archive releases its Main admission and visible target; '
+            'the old worktree remains reserved. A second execution may duplicate past work. '
+            'No success, no-effect or proven nonstart is asserted. To accept this risk, '
+            'send a NEW direct unformatted message within five minutes:\n'
+            '/continuation archive-confirm ' + preview['core_sha256'] + ' ' + preview['code'])
+    else:
+        if len(words) != 4:
+            raise ValueError('archive-confirm requires the exact shown hash and one-use code')
+        with guard.transaction() as rows:
+            row = _app104_archive_candidate(rows, identity)
+            preview = rows.grants.get('operator_archive_previews', {}).get(row['task'])
+            if (not preview or time.time() >= preview['expires'] or
+                    preview['identity'] != identity or
+                    not same_transport(preview['transport'], transport) or
+                    preview['event'] == event_id or
+                    preview['core_sha256'] != words[2] or
+                    preview['code'] != words[3] or
+                    operator_archive_core(row) != preview['core_sha256']):
+                raise ValueError('APP-104 archive preview expired, changed or not owner-confirmed')
+            receipt = dict(kind='owner_accepted_historical_uncertainty',
+                task=row['task'], generation=row['generation'], identity=dict(identity),
+                action_id=row['action_id'], effect_id=row['effect_id'],
+                core_sha256=preview['core_sha256'], native_owner_event=event_id,
+                preview_event=preview['event'], accepted_at=time.time(),
+                historical_effects='unknown', duplicate_work_risk_accepted=True,
+                released=['main_session', 'visible_target'], retained=['old_worktree'])
+            row['operator_archive'] = receipt
+            rows.grants.setdefault('operator_archive_events', {})[object_hash(dict(
+                owner=stable_owner(identity), event=event_id))] = receipt
+            rows.grants['operator_archive_previews'].pop(row['task'], None)
+        response = ('APP-104 old attempt archived by direct native owner confirmation. '
+            'Historical effects remain unknown; the old worktree stays reserved. '
+            'Main may propose a fresh separately confirmed APP-104 task; no worker was started.')
+    from gateway.platforms.base import _thread_metadata_for_source
+    result = await runner._adapter_for_source(event.source).send(
+        event.source.chat_id, response, metadata=_thread_metadata_for_source(event.source, str(event.message_id)))
+    if not getattr(result, 'success', False):
+        raise ValueError('native archive display delivery failed')
+    return False
 
 
 class Policy(dict):

@@ -67,7 +67,7 @@ class Guard:
         current_clock = now is None
         now = time.time() if now is None else now
         task = copy.deepcopy(task)
-        if any(key in task for key in ('origin', 'deliveries', 'coordinator_delivery',
+        if any(key in task for key in ('origin', 'deliveries', 'coordinator_delivery', 'operator_archive',
                                         'native_transport', 'transport', 'transport_profile', 'bot_id', 'chat_type',
                                         'logical_contract', 'native_admission_sha256', '_native_admission_replayed', 'native_launch_sha256', 'send_request_sha256')):
             raise ValueError('origin and delivery fields are native-only')
@@ -991,6 +991,8 @@ def ownership_pending(row):
         return True
     if row.get('producer') != 'cmux':
         return False
+    if operator_archive_matches(row):
+        return False
     if row.get('reservation_retirement'):
         return not retirement_matches(row)
     # Cancellation/failure invalidates tickets, not live process ownership.
@@ -999,6 +1001,33 @@ def ownership_pending(row):
     except (ValueError, KeyError, OSError):
         return True
     return False
+
+
+def operator_archive_core(row):
+    """Seal the historical attempt without delivery bookkeeping or grant hydration."""
+    core = copy.deepcopy(row)
+    for field in ('operator_archive', 'deliveries', 'coordinator_turns'):
+        core.pop(field, None)
+    if isinstance(core.get('policy'), dict):
+        core['policy'].pop('revoked', None)
+    return object_hash(core)
+
+
+def operator_archive_matches(row):
+    """A one-case owner disposition releases admission, never rewrites history."""
+    receipt = row.get('operator_archive')
+    return bool(isinstance(receipt, dict) and
+        receipt.get('kind') == 'owner_accepted_historical_uncertainty' and
+        row.get('task') == 'APP-104-stable-album-children' and
+        row.get('generation') == 3 and row.get('status') == 'blocked' and
+        row.get('effect_status') == 'unknown' and
+        receipt.get('task') == row['task'] and
+        receipt.get('generation') == row['generation'] and
+        receipt.get('identity') == row['identity'] and
+        receipt.get('action_id') == row.get('action_id') and
+        receipt.get('effect_id') == row.get('effect_id') and
+        receipt.get('core_sha256') == operator_archive_core(row) and
+        receipt.get('native_owner_event'))
 
 
 def retirement_matches(row):
@@ -1068,7 +1097,7 @@ def worktree_reserved(row, worktree):
     """Derive the writer reservation from the existing candidate lifecycle."""
     owned = row.get('worker_route', {}).get('worktree')
     return bool(owned and Path(owned).resolve() == Path(worktree).resolve()
-                and ownership_pending(row))
+                and (ownership_pending(row) or operator_archive_matches(row)))
 
 
 def cmux_tree():
@@ -1770,7 +1799,7 @@ def register_native(task):
         if not batch or batch.get('coordinator_identity') != identity:
             raise ValueError('confirmed coordinator identity required; no session rerouting')
         # The caller cannot supply the persisted native fingerprint or transport.
-        if any(key in task for key in ('logical_contract', 'native_admission_sha256', '_native_admission_replayed', 'native_launch_sha256', 'send_request_sha256',
+        if any(key in task for key in ('logical_contract', 'native_admission_sha256', '_native_admission_replayed', 'native_launch_sha256', 'send_request_sha256', 'operator_archive',
                                       'origin', 'native_transport', 'deliveries', 'coordinator_delivery',
                                       'transport', 'transport_profile', 'bot_id', 'chat_type')):
             raise ValueError('native admission and origin fields are native-only')
