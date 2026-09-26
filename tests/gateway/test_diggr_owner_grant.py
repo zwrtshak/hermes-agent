@@ -148,6 +148,10 @@ async def test_app104_native_archive_requires_two_owner_events_and_releases_only
     assert not dc.ownership_pending(row)
     assert dc.worktree_reserved(row, r.task['worker_route']['worktree'])
     assert row['operator_archive']['historical_effects'] == 'unknown'
+    changed = copy.deepcopy(row)
+    changed['action'] = 'different historical attempt'
+    assert not dc.operator_archive_matches(changed)
+    assert dc.ownership_pending(changed)
     with pytest.raises(ValueError, match='exact blocked attempt'):
         await r.runner._diggr_accept(await r.event(command))
 
