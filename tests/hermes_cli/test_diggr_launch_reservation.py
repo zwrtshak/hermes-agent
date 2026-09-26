@@ -233,6 +233,10 @@ def test_exact_prelaunch_gateway_rejection_retires_without_invented_launcher(rig
     assert dc.prelaunch_rejection_case(r.row())
     assert dc.ownership_pending(r.row())
     evidence = hashed(r.tmp / 'prelaunch-rejection.json', dc.prelaunch_rejection_report(r.row()))
+    with r.guard.transaction() as rows:
+        rows[r.task['task']]['deliveries'] = [dict(status='delivered', message_id='new')]
+    assert dc.prelaunch_rejection_report(r.row()) == json.loads(
+        (r.tmp / 'prelaunch-rejection.json').read_text())
     assert retire(r, evidence)
     row = r.row()
     assert dc.prelaunch_retirement_matches(row)
@@ -241,6 +245,13 @@ def test_exact_prelaunch_gateway_rejection_retires_without_invented_launcher(rig
     assert not dc.ownership_pending(dc.Guard(r.guard.path).get(row['task']))
     with pytest.raises(ValueError, match='replay'):
         retire(r, evidence)
+    with r.guard.transaction() as rows:
+        current = rows[row['task']]
+        current['deliveries'] = [dict(status='delivered', message_id='later')]
+        current['coordinator_turns'] = {'3': dict(status='response_produced')}
+        current['policy']['revoked'] = True
+    assert dc.prelaunch_retirement_matches(r.row())
+    assert not dc.ownership_pending(r.row())
     with r.guard.transaction() as rows:
         rows[row['task']]['action'] = 'changed after retirement'
     assert dc.ownership_pending(r.row())

@@ -525,10 +525,10 @@ class Guard:
                 if any(Path(path).exists() or Path(path).is_symlink()
                        for path in (row['artifact'], route['receipt'])):
                     raise ValueError('worker artifact or route receipt exists; prelaunch retirement refused')
-                before = object_hash(row)
+                before = prelaunch_rejection_core(row)
                 row['reservation_retirement'] = dict(
                     kind='gateway_lifecycle_rejection_before_execute',
-                    row_sha256=before, evidence=dict(evidence), at=now,
+                    core_sha256=before, evidence=dict(evidence), at=now,
                     generation=row['generation'], identity=dict(row['identity']),
                     retired_by=dict(identity), action_id=row['action_id'],
                     effect_id=row['effect_id'])
@@ -1065,17 +1065,29 @@ def prelaunch_rejection_case(row):
             'response_sha256': '8bb817e125655c67191c0c38d8e5384736a71441e04367c7a811a093e18a49f9',
             'status': 'error'} and
         row.get('attempt_history') == [] and
+        not row.get('operator_archive') and
         not any(row.get(key) for key in ('process_id', 'launcher_pid', 'launcher_identity',
             'worker_pid', 'worker_identity', 'child_identity', 'visible_sent',
             'send_claim', 'worker_result'))
     )
 
 
+def prelaunch_rejection_core(row):
+    """Seal launch identity and effects, excluding only mutable delivery bookkeeping."""
+    core = copy.deepcopy(row)
+    for field in ('reservation_retirement', 'deliveries', 'coordinator_turns',
+                  'coordinator_delivery'):
+        core.pop(field, None)
+    if isinstance(core.get('policy'), dict):
+        core['policy'].pop('revoked', None)
+    return object_hash(core)
+
+
 def prelaunch_rejection_report(row):
     """Exact evidence payload for this recorded pre-execution terminal response."""
     return dict(kind='gateway_lifecycle_rejection_before_execute', task=row['task'],
         generation=row['generation'], identity=row['identity'], action_id=row['action_id'],
-        effect_id=row['effect_id'], row_sha256=object_hash(row),
+        effect_id=row['effect_id'], core_sha256=prelaunch_rejection_core(row),
         native_response_sha256=row['native_launch_diagnostic']['response_sha256'],
         outcome='no_launcher_execution')
 
@@ -1090,7 +1102,7 @@ def prelaunch_retirement_matches(row):
         return bool(prelaunch_rejection_case(current) and
             not any(Path(path).exists() or Path(path).is_symlink() for path in
                 (current['artifact'], current['worker_route']['receipt'])) and
-            receipt.get('row_sha256') == object_hash(current) and
+            receipt.get('core_sha256') == prelaunch_rejection_core(current) and
             receipt.get('identity') == row['identity'] and
             receipt.get('action_id') == row['action_id'] and
             receipt.get('effect_id') == row['effect_id'] and
