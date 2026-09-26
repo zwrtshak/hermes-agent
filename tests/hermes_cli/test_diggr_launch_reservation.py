@@ -141,6 +141,29 @@ def claim_without_spawn(r, ticket):
     return spawn
 
 
+def test_native_terminal_rejection_keeps_unknown_effect_and_bounded_diagnostic(rig):
+    r = rig
+    with r.guard.transaction() as rows:
+        row = rows[r.task['task']]
+        for key in ('launcher_expected', 'process_id', 'process_started_at',
+                    'launcher_pid', 'launcher_identity'):
+            row.pop(key, None)
+    r.monkeypatch.setattr(dc, 'register_native', lambda task: (r.guard, r.row()))
+    response = dict(error='rejected; secret should not persist', exit_code=-1, status='error')
+    args = dict(command=r.task.get('launcher_command', 'fixture-launcher'), background=True,
+                continuation=dict(r.task, launcher_command=r.task.get('launcher_command', 'fixture-launcher')))
+    with pytest.raises(ValueError, match='launch effects unknown'):
+        dc.terminal_dispatch(args, lambda launch: json.dumps(response))
+    row = r.row()
+    assert row['launcher_expected'] is True
+    assert row.get('process_id') is None
+    assert row.get('worker_pid') is None
+    assert row['native_launch_diagnostic'] == dict(
+        response_sha256=dc.object_hash(response), outcome='terminal_error',
+        status='error', exit_code=-1)
+    assert 'secret should not persist' not in json.dumps(row)
+
+
 def test_recovered_send_uses_fresh_claim_window(rig):
     r = rig
     ticket = recover(r)
