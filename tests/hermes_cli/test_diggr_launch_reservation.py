@@ -211,6 +211,51 @@ def test_retirement_releases_distinct_task_and_keeps_old_ticket_fenced(rig):
         retire(r, evidence, wake)
 
 
+def test_exact_prelaunch_gateway_rejection_retires_without_invented_launcher(rig):
+    r = rig
+    with r.guard.transaction() as rows:
+        row = rows.pop(r.task['task'])
+        row.update(task='APP-104-album-group-new-20260926', generation=3,
+            status='blocked', gate='reconcile', effect_status='unknown',
+            owner_batch='ff6f91394b8c50844db6a06735f76378e26bdccc135e484b906dd76d555e469f',
+            action_id='cac52908fccb449ebf46b44a3a079b7d',
+            effect_id='0de8fcd3771545ba9a0f68922ff2c65e',
+            native_launch_sha256='ed811def019e6f36ca33c81dd386b95e6a549815e8b4f5f6b3fe20d6b64ca68c',
+            native_launch_diagnostic=dict(exit_code=1, outcome='terminal_error',
+                response_sha256='8bb817e125655c67191c0c38d8e5384736a71441e04367c7a811a093e18a49f9',
+                status='error'), attempt_history=[], launcher_expected=True)
+        for key in ('process_id', 'process_started_at', 'launcher_pid', 'launcher_identity',
+                    'worker_pid', 'worker_identity', 'visible_sent', 'origin'):
+            row.pop(key, None)
+        row['worker_route']['receipt'] = str(r.tmp / 'never-sent.json')
+        rows[row['task']] = row
+    r.task['task'] = 'APP-104-album-group-new-20260926'
+    assert dc.prelaunch_rejection_case(r.row())
+    assert dc.ownership_pending(r.row())
+    evidence = hashed(r.tmp / 'prelaunch-rejection.json', dc.prelaunch_rejection_report(r.row()))
+    assert retire(r, evidence)
+    row = r.row()
+    assert dc.prelaunch_retirement_matches(row)
+    assert not dc.ownership_pending(row)
+    assert dc.worktree_reserved(row, row['worker_route']['worktree'])
+    assert not dc.ownership_pending(dc.Guard(r.guard.path).get(row['task']))
+    with pytest.raises(ValueError, match='replay'):
+        retire(r, evidence)
+    with r.guard.transaction() as rows:
+        rows[row['task']]['action'] = 'changed after retirement'
+    assert dc.ownership_pending(r.row())
+
+
+def test_prelaunch_retirement_refuses_changed_diagnostic_or_effect(rig):
+    r = rig
+    row = r.row()
+    assert not dc.prelaunch_rejection_case(row)
+    forged = dict(row, reservation_retirement=dict(kind='gateway_lifecycle_rejection_before_execute',
+        row_sha256=dc.object_hash(row), evidence=hashed(r.tmp / 'false-report.json',
+            dict(kind='gateway_lifecycle_rejection_before_execute'))))
+    assert not dc.prelaunch_retirement_matches(forged)
+
+
 @pytest.mark.parametrize('change', ['owner', 'generation', 'action_id', 'effect_id', 'hash', 'missing',
     'busy', 'shell-reused', 'launcher-alive', 'launcher-reused', 'launcher-missing', 'launcher-exit-missing',
     'worker', 'child', 'worker-identity', 'effect-proof', 'row-hash', 'authorization', 'no-context'])
