@@ -171,6 +171,63 @@ async def test_app104_native_archive_requires_two_owner_events_and_releases_only
 
 
 @pytest.mark.asyncio
+async def test_exact_prelaunch_retirement_allows_new_owner_batch_without_reusing_old_grant(route):
+    r = route
+    r.task.update(task='APP-104-album-group-new-20260926', producer='cmux',
+        worker_route=dict(worktree=str(r.tmp / 'old-worktree'),
+                          receipt=str(r.tmp / 'never-sent.json')),
+        launcher_command='fixture-launcher')
+    old_bid, event, _ = await confirm(r)
+    entry = await r.runner.async_session_store.get_or_create_session(event.source)
+    native_identity = r.runner._diggr_identity(event.source, entry.session_id)
+    issue = owner.issue_key(manifest(r.task)['todos'][0])
+    r.guard.register(dict(r.task, owner_batch=old_bid, owner_issue=issue))
+    snapshot = json.loads(r.guard.path.read_text())
+    row = snapshot[r.task['task']]
+    grants = snapshot['_owner_grants']
+    batch = grants['batches'].pop(old_bid)
+    historical_bid = 'ff6f91394b8c50844db6a06735f76378e26bdccc135e484b906dd76d555e469f'
+    grants['batches'][historical_bid] = batch
+    batch['coordinator_identity'] = native_identity
+    row['policy']['batch'] = historical_bid
+    row['identity'] = native_identity
+    row['owner_batch'] = historical_bid
+    row.update(generation=3, status='blocked', gate='reconcile', effect_status='unknown',
+        launcher_expected=True,
+        action_id='cac52908fccb449ebf46b44a3a079b7d',
+        effect_id='0de8fcd3771545ba9a0f68922ff2c65e',
+        native_launch_sha256='ed811def019e6f36ca33c81dd386b95e6a549815e8b4f5f6b3fe20d6b64ca68c',
+        native_launch_diagnostic=dict(exit_code=1, outcome='terminal_error',
+            response_sha256='8bb817e125655c67191c0c38d8e5384736a71441e04367c7a811a093e18a49f9',
+            status='error'), attempt_history=[])
+    for key in ('process_id', 'process_started_at', 'launcher_pid', 'launcher_identity',
+                'worker_pid', 'worker_identity', 'visible_sent', 'send_claim'):
+        row.pop(key, None)
+    from hermes_cli import diggr_delivery as delivery
+    row['origin'] = delivery.origin_for(owner.State({row['task']: row}, grants), row)
+    r.guard.path.write_text(json.dumps(snapshot))
+    row = r.guard.get(r.task['task'])
+    assert dc.ownership_pending(row)
+    from tests.hermes_cli.test_diggr_launch_reservation import hashed
+    evidence = hashed(r.tmp / 'prelaunch-rejection.json', dc.prelaunch_rejection_report(row))
+    context = dc.EVENT_CONTEXT.set(dict(identity=native_identity))
+    try:
+        assert r.guard.retire_reservation(native_identity,
+            dict(task=row['task'], generation=row['generation']), evidence)
+    finally:
+        dc.EVENT_CONTEXT.reset(context)
+    retired = r.guard.get(row['task'])
+    assert dc.prelaunch_retirement_matches(retired)
+    assert not dc.ownership_pending(retired)
+    fresh = dict(r.task, task='APP-104-after-prelaunch-rejection',
+        artifact=str(r.tmp / 'fresh-result'),
+        worker_route=dict(worktree=str(r.tmp / 'fresh-worktree')))
+    new_bid, _, _ = await confirm(r, manifest(fresh))
+    assert new_bid != historical_bid
+    assert r.guard.get(row['task'])['reservation_retirement'] == retired['reservation_retirement']
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('mutation', ['synthetic', 'forwarded', 'quoted', 'bot', 'wrong-owner', 'edited-text', 'internal'])
 async def test_native_provenance_rejections(route, mutation):
     r = route

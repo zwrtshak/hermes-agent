@@ -67,7 +67,7 @@ class Guard:
         current_clock = now is None
         now = time.time() if now is None else now
         task = copy.deepcopy(task)
-        if any(key in task for key in ('origin', 'deliveries', 'coordinator_delivery', 'operator_archive',
+        if any(key in task for key in ('origin', 'deliveries', 'coordinator_delivery', 'operator_archive', 'reservation_retirement',
                                         'native_transport', 'transport', 'transport_profile', 'bot_id', 'chat_type',
                                         'logical_contract', 'native_admission_sha256', '_native_admission_replayed', 'native_launch_sha256', 'send_request_sha256')):
             raise ValueError('origin and delivery fields are native-only')
@@ -514,6 +514,25 @@ class Guard:
                     row['status'] not in TERMINAL or row.get('producer') != 'cmux' or
                     row.get('reservation_retirement')):
                 raise ValueError('terminal current owner required; retirement replay refused')
+            if prelaunch_rejection_case(row):
+                # The persisted response digest was reconstructed from the exact
+                # terminal gateway guard return, which occurs before env.execute.
+                # This case does not invent a launcher PID or an exit receipt.
+                report = read_hashed_json(evidence['path'], evidence['sha256'])
+                if report != prelaunch_rejection_report(row):
+                    raise ValueError('exact pre-execution rejection evidence required')
+                route = row['worker_route']
+                if any(Path(path).exists() or Path(path).is_symlink()
+                       for path in (row['artifact'], route['receipt'])):
+                    raise ValueError('worker artifact or route receipt exists; prelaunch retirement refused')
+                before = prelaunch_rejection_core(row)
+                row['reservation_retirement'] = dict(
+                    kind='gateway_lifecycle_rejection_before_execute',
+                    core_sha256=before, evidence=dict(evidence), at=now,
+                    generation=row['generation'], identity=dict(row['identity']),
+                    retired_by=dict(identity), action_id=row['action_id'],
+                    effect_id=row['effect_id'])
+                return True
             report = recovery_report(row, evidence)
             before = object_hash(row)
             if (report.get('row_sha256') != before or not row.get('authorization') or
@@ -1030,7 +1049,72 @@ def operator_archive_matches(row):
         receipt.get('native_owner_event'))
 
 
+def prelaunch_rejection_case(row):
+    """The one APP-104 attempt rejected by the local gateway scan before execute."""
+    return bool(
+        row.get('task') == 'APP-104-album-group-new-20260926' and
+        row.get('generation') == 3 and row.get('status') == 'blocked' and
+        row.get('gate') == 'reconcile' and row.get('effect_status') == 'unknown' and
+        row.get('producer') == 'cmux' and row.get('launcher_expected') is True and
+        row.get('owner_batch') == 'ff6f91394b8c50844db6a06735f76378e26bdccc135e484b906dd76d555e469f' and
+        row.get('action_id') == 'cac52908fccb449ebf46b44a3a079b7d' and
+        row.get('effect_id') == '0de8fcd3771545ba9a0f68922ff2c65e' and
+        row.get('native_launch_sha256') == 'ed811def019e6f36ca33c81dd386b95e6a549815e8b4f5f6b3fe20d6b64ca68c' and
+        row.get('native_launch_diagnostic') == {
+            'exit_code': 1, 'outcome': 'terminal_error',
+            'response_sha256': '8bb817e125655c67191c0c38d8e5384736a71441e04367c7a811a093e18a49f9',
+            'status': 'error'} and
+        row.get('attempt_history') == [] and
+        not row.get('operator_archive') and
+        not any(row.get(key) for key in ('process_id', 'launcher_pid', 'launcher_identity',
+            'worker_pid', 'worker_identity', 'child_identity', 'visible_sent',
+            'send_claim', 'worker_result'))
+    )
+
+
+def prelaunch_rejection_core(row):
+    """Seal launch identity and effects, excluding only mutable delivery bookkeeping."""
+    core = copy.deepcopy(row)
+    for field in ('reservation_retirement', 'deliveries', 'coordinator_turns',
+                  'coordinator_delivery'):
+        core.pop(field, None)
+    if isinstance(core.get('policy'), dict):
+        core['policy'].pop('revoked', None)
+    return object_hash(core)
+
+
+def prelaunch_rejection_report(row):
+    """Exact evidence payload for this recorded pre-execution terminal response."""
+    return dict(kind='gateway_lifecycle_rejection_before_execute', task=row['task'],
+        generation=row['generation'], identity=row['identity'], action_id=row['action_id'],
+        effect_id=row['effect_id'], core_sha256=prelaunch_rejection_core(row),
+        native_response_sha256=row['native_launch_diagnostic']['response_sha256'],
+        outcome='no_launcher_execution')
+
+
+def prelaunch_retirement_matches(row):
+    receipt = row.get('reservation_retirement')
+    if not isinstance(receipt, dict) or receipt.get('kind') != 'gateway_lifecycle_rejection_before_execute':
+        return False
+    current = copy.deepcopy(row)
+    current.pop('reservation_retirement', None)
+    try:
+        return bool(prelaunch_rejection_case(current) and
+            not any(Path(path).exists() or Path(path).is_symlink() for path in
+                (current['artifact'], current['worker_route']['receipt'])) and
+            receipt.get('core_sha256') == prelaunch_rejection_core(current) and
+            receipt.get('identity') == row['identity'] and
+            receipt.get('action_id') == row['action_id'] and
+            receipt.get('effect_id') == row['effect_id'] and
+            read_hashed_json(receipt['evidence']['path'], receipt['evidence']['sha256']) ==
+                prelaunch_rejection_report(current))
+    except (KeyError, ValueError, OSError, TypeError):
+        return False
+
+
 def retirement_matches(row):
+    if prelaunch_retirement_matches(row):
+        return True
     receipt = row['reservation_retirement']
     current = {k: v for k, v in row.items() if k != 'reservation_retirement'}
     try:
@@ -1097,7 +1181,8 @@ def worktree_reserved(row, worktree):
     """Derive the writer reservation from the existing candidate lifecycle."""
     owned = row.get('worker_route', {}).get('worktree')
     return bool(owned and Path(owned).resolve() == Path(worktree).resolve()
-                and (ownership_pending(row) or operator_archive_matches(row)))
+                and (ownership_pending(row) or operator_archive_matches(row) or
+                     prelaunch_retirement_matches(row)))
 
 
 def cmux_tree():
@@ -1799,7 +1884,7 @@ def register_native(task):
         if not batch or batch.get('coordinator_identity') != identity:
             raise ValueError('confirmed coordinator identity required; no session rerouting')
         # The caller cannot supply the persisted native fingerprint or transport.
-        if any(key in task for key in ('logical_contract', 'native_admission_sha256', '_native_admission_replayed', 'native_launch_sha256', 'send_request_sha256', 'operator_archive',
+        if any(key in task for key in ('logical_contract', 'native_admission_sha256', '_native_admission_replayed', 'native_launch_sha256', 'send_request_sha256', 'operator_archive', 'reservation_retirement',
                                       'origin', 'native_transport', 'deliveries', 'coordinator_delivery',
                                       'transport', 'transport_profile', 'bot_id', 'chat_type')):
             raise ValueError('native admission and origin fields are native-only')

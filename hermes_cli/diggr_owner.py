@@ -513,7 +513,8 @@ async def handle_callback(runner, proof):
 
 def confirm_batch(rows, p, digest, identity, event_id, code, now, transport=None):
     """Called under Guard's lock by either native proof; no effects outside state."""
-    from hermes_cli.diggr_continuation import object_hash, ownership_pending, operator_archive_matches
+    from hermes_cli.diggr_continuation import (
+        object_hash, ownership_pending, operator_archive_matches, prelaunch_retirement_matches)
     owner = stable_owner(identity)
     used_events = rows.grants.setdefault('confirmation_events', {})
     event_key = object_hash(dict(owner=owner, event=event_id))
@@ -527,7 +528,8 @@ def confirm_batch(rows, p, digest, identity, event_id, code, now, transport=None
             continue
         overlap = keys & {issue_key(t) for t in old['manifest']['todos']}
         if (overlap and bid != replaces and not old.get('replaced_by') and
-                not all(operator_archive_matches(rows.get(old.get('tasks', {}).get(issue), {}))
+                not all(operator_archive_matches(rows.get(old.get('tasks', {}).get(issue), {})) or
+                        prelaunch_retirement_matches(rows.get(old.get('tasks', {}).get(issue), {}))
                         for issue in overlap)):
             raise ValueError('same logical work requires explicit reauthorization of prior batch')
     if replaces:
