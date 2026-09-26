@@ -1987,9 +1987,25 @@ def terminal_dispatch(args, invoke):
                 'LOOP_CONTROL_CONTINUATION_PYTHON=' + shlex.quote(sys.executable), args['command']])
         result = invoke(launch)
         data = json.loads(result) if isinstance(result, str) else result
+        if not isinstance(data, dict):
+            raise ValueError('native terminal response is not an object; launch effects unknown')
         process_id = data.get('session_id')
         if not process_id:
-            raise ValueError('terminal did not return native process identity')
+            # A terminal rejection is not evidence that no process was started.
+            # Persist only bounded metadata: raw error text can contain secrets.
+            diagnostic = dict(
+                response_sha256=object_hash(data),
+                outcome='terminal_error' if data.get('error') else 'missing_session_id',
+                status=data.get('status') if isinstance(data.get('status'), str) and
+                    data.get('status') in {'error', 'blocked'} else None,
+                exit_code=data.get('exit_code') if type(data.get('exit_code')) is int else None,
+            )
+            with guard.transaction() as tasks:
+                current = tasks[row['task']]
+                if (current['generation'] == row['generation'] and
+                        current.get('native_launch_sha256') == object_hash(args)):
+                    current['native_launch_diagnostic'] = diagnostic
+            raise ValueError('native terminal returned no process identity; launch effects unknown')
         from tools.process_registry import process_registry
         session = process_registry.get(process_id)
         if session is None or session.session_key != row['identity']['session_key']:
