@@ -1372,22 +1372,11 @@ async def test_second_renewal_exact_prompt_reaches_single_native_spawn(route, mo
     row = r.guard.get(registered['task'])
     ticket = dc.worker_ticket(row)
     monkeypatch.setattr(dc, 'verify_visible_claim', lambda row: None)  # Disposable terminal boundary.
-    monkeypatch.setattr(dc, 'process_identity', lambda pid: dict(pid=pid, start='fixture'))
-    original_popen = subprocess.Popen
-    spawned = []
-    class FinishedExecutor:
-        pid = 45678
-        returncode = 0
-        def poll(self): return 0
-    def execute(argv, *args, **kwargs):
-        if argv == row['worker_route']['argv']:
-            spawned.append(argv)
-            assert argv[-1].encode() == exact
-            Path(row['artifact']).write_text('isolated executor fixture result')
-            return FinishedExecutor()
-        return original_popen(argv, *args, **kwargs)
-    monkeypatch.setattr(subprocess, 'Popen', execute)
-    assert dc.main(['--home', r.identity['home'], 'worker', '--payload-json', json.dumps(ticket)]) == 0
+    result, spawned = _run_observed_fixture_worker(
+        r.guard, ticket, row['worker_route']['argv'], row['artifact'], monkeypatch,
+        output='isolated executor fixture result',
+        inspect_argv=lambda argv: argv[-1].encode() == exact)
+    assert result == 0
     assert len(spawned) == 1
     with pytest.raises(ValueError):
         dc.main(['--home', r.identity['home'], 'worker', '--payload-json', json.dumps(ticket)])
@@ -2581,44 +2570,37 @@ def test_plain_migration_and_correction_keep_their_deadlines():
     assert dc.coding_assignment_deadline(correction) == float('-inf')
 
 
-def test_plain_correction_requires_bound_result_and_completed_exit(monkeypatch):
-    bid = 'current-batch'
-    correction = dict(tasks={'current-issue': 'same-worker'}, item=dict(
-        phase='correction_needed', issue='current-issue', task='same-worker',
-        coding_assignment=dict(id='current', status='pending', correction_of=1),
+@pytest.mark.asyncio
+async def test_plain_correction_requires_bound_result_and_completed_exit(route, monkeypatch):
+    r = route
+    payload, home, reference, _, descriptor = await sent_second_renewal(r, monkeypatch)
+    prompt = Path(descriptor['prompt']['path']).read_text()
+    dc.accept_coding_assignment('SYSTEM171_ASSIGN ' + reference, 'second-session', home)
+    _, registered = dc.register_assigned_worker(reference, 'second-session', home, prompt)
+    monkeypatch.setattr(dc, 'cmux_send', lambda *args: None)
+    assert dc.start_assigned_worker(r.guard, registered)['sent'] is True
+    row = _complete_item_attempt_os(r.guard, registered['task'], registered['artifact'])
+    bid, issue, task = payload['batch'], payload['issue'], row['task']
+    generation = row['generation']
+    assert row['direct_worker'] is True
+    row.update(status='blocked', gate='coding_correction')
+    correction = dict(tasks={issue: task}, item=dict(
+        phase='correction_needed', issue=issue, task=task,
+        coding_assignment=dict(id='current', status='pending', correction_of=generation),
         coding_assignment_history=[
             dict(id='expired', status='blocked', reason='confirmed assignment deadline expired'),
-            dict(id='previous', status='worker_sent', task='same-worker')]))
+            dict(id=reference, status='worker_sent', task=task)]))
     active = correction['item']
     assert delivery.recovered_preparation_origin(active)
     assert dc.coding_assignment_deadline(correction) == float('-inf')
-    row = dict(task='same-worker', owner_batch=bid, owner_issue='current-issue',
-               generation=1,
-               direct_worker=True, status='blocked',
-               gate='coding_correction', artifact='/tmp/correction-result',
-               action_id='action', effect_id='effect', visible_sent=True,
-               worker_route=dict(argv=['previous prompt']),
-               native_admission_sha256=dc.object_hash(dict(
-                   assignment='previous',
-                   prompt_sha256=hashlib.sha256(b'previous prompt').hexdigest())),
-               worker_pid=123, worker_identity=dict(pid=123),
-               child_exited=True, child_identity=dict(pid=124),
-               policy=owner.Policy(batch=bid, issue='current-issue',
-                                   item_lifecycle=True, revoked=False,
-                                   work_seconds=1, work_limit=10),
-               worker_result=dict(generation=1, exit_code=0,
-                                  artifact_status='present', task='same-worker',
-                                  artifact='/tmp/correction-result',
-                                  action_id='action', effect_id='effect'))
-    rows = {'same-worker': row}
-    monkeypatch.setattr(dc, 'process_absent', lambda *a, **kw: True)
+    rows = {task: row}
     assert delivery.canonical_plain_correction(bid, correction, active, rows)
     assert not delivery.recovered_preparation_origin(
         active, rows, bid=bid, batch=correction)
     assert dc.coding_assignment_deadline(correction, rows, bid=bid) == float('inf')
     assert dc.coding_assignment_deadline(correction) == float('-inf')
     assert delivery.recovered_preparation_origin(active, rows)
-    for field, value in [('generation', 2), ('gate', 'coding'),
+    for field, value in [('generation', generation + 1), ('gate', 'coding'),
                          ('status', 'running'), ('direct_worker', False),
                          ('worker_result', None)]:
         damaged = copy.deepcopy(row)
@@ -2627,15 +2609,15 @@ def test_plain_correction_requires_bound_result_and_completed_exit(monkeypatch):
         else:
             damaged[field] = value
         assert delivery.recovered_preparation_origin(
-            active, {'same-worker': damaged}, bid=bid, batch=correction)
+            active, {task: damaged}, bid=bid, batch=correction)
         assert dc.coding_assignment_deadline(
-            correction, {'same-worker': damaged}, bid=bid) == float('-inf')
+            correction, {task: damaged}, bid=bid) == float('-inf')
     damaged = copy.deepcopy(row)
     damaged['worker_result'].pop('exit_code')
     assert delivery.recovered_preparation_origin(
-        active, {'same-worker': damaged}, bid=bid, batch=correction)
+        active, {task: damaged}, bid=bid, batch=correction)
     assert dc.coding_assignment_deadline(
-        correction, {'same-worker': damaged}, bid=bid) == float('-inf')
+        correction, {task: damaged}, bid=bid) == float('-inf')
     for change in ('revoked', 'hard_stop'):
         damaged = copy.deepcopy(row)
         if change == 'revoked':
@@ -2643,9 +2625,9 @@ def test_plain_correction_requires_bound_result_and_completed_exit(monkeypatch):
         else:
             damaged['hard_stop'] = 0
         assert delivery.recovered_preparation_origin(
-            active, {'same-worker': damaged}, bid=bid, batch=correction)
+            active, {task: damaged}, bid=bid, batch=correction)
         assert dc.coding_assignment_deadline(
-            correction, {'same-worker': damaged}, bid=bid) == float('-inf')
+            correction, {task: damaged}, bid=bid) == float('-inf')
     for change in ('owner_batch', 'owner_issue', 'policy_batch', 'policy_issue',
                    'missing_policy_batch', 'missing_policy_issue',
                    'batch_task', 'item_task', 'history_task', 'history_status',
@@ -2668,7 +2650,7 @@ def test_plain_correction_requires_bound_result_and_completed_exit(monkeypatch):
         elif change == 'missing_policy_issue':
             damaged_row['policy'].pop('issue')
         elif change == 'batch_task':
-            damaged_batch['tasks']['current-issue'] = 'foreign-worker'
+            damaged_batch['tasks'][issue] = 'foreign-worker'
         elif change == 'item_task':
             damaged_item['task'] = 'foreign-worker'
         elif change == 'history_task':
@@ -2680,16 +2662,16 @@ def test_plain_correction_requires_bound_result_and_completed_exit(monkeypatch):
         elif change == 'history_current_id':
             damaged_item['coding_assignment_history'][-1]['id'] = 'current'
         elif change == 'row_generation':
-            damaged_row['generation'] = 2
+            damaged_row['generation'] = generation + 1
         elif change == 'missing_row_generation':
             damaged_row.pop('generation')
         elif change == 'result_generation':
-            damaged_row['worker_result']['generation'] = 2
+            damaged_row['worker_result']['generation'] = generation + 1
         elif change == 'missing_result_generation':
             damaged_row['worker_result'].pop('generation')
         else:
-            damaged_item['coding_assignment']['correction_of'] = 2
-        damaged_rows = {'same-worker': damaged_row}
+            damaged_item['coding_assignment']['correction_of'] = generation + 1
+        damaged_rows = {task: damaged_row}
         assert not delivery.canonical_plain_correction(
             bid, damaged_batch, damaged_item, damaged_rows)
         assert delivery.recovered_preparation_origin(
@@ -3003,20 +2985,49 @@ def test_automatic_playback_requires_track_and_duration_evidence():
         item.validate_automatic_test(dict(checks=duplicate), two_steps, ['track_playback'])
 
 
-async def completed_candidate(r, monkeypatch, *, prepared=None):
-    contract, payload = prepared if prepared is not None else await setup(r, monkeypatch)
+async def completed_candidate(r, monkeypatch, *, prepared=None, observed_direct=False,
+                              observed_v2=False):
+    assert not (observed_direct and observed_v2)
+    contract, payload = prepared if prepared is not None else await setup(
+        r, monkeypatch, result_flow=observed_direct)
     item.control(r.guard, r.identity, payload)
-    row = register(r)
-    # Native worker completion fixture; no real model, PID or gateway is started.
-    Path(row['artifact']).write_text('implementation report')
-    native_result = dict(task=row['task'], generation=row['generation'], action=row['action'],
-                         artifact=row['artifact'], action_id=row['action_id'],
-                         effect_id=row['effect_id'], exit_code=0, artifact_status='present',
-                         evidence=dict(sha256=dc.digest(row['artifact'])))
-    with r.guard.transaction() as rows:
-        rows[row['task']].update(worker_result=native_result, status='pending', gate='main_validation')
-    monkeypatch.setattr(dc, 'verify_prior_exit', lambda row: None)
-    monkeypatch.setattr(dc, 'verify_restarted_reservation_exit', lambda row: None)
+    if observed_v2:
+        row = _complete_native_v2_item_attempt(r, monkeypatch)
+    elif observed_direct:
+        binding = dict(workspace='fixture', surface='fixture',
+                       process=dict(identity=dict(pid=os.getpid()), argv=['hermes', '--resume', 'coding']))
+        monkeypatch.setattr(dc, 'preflight_coding_coordinator', lambda: binding)
+        with r.guard.transaction() as rows:
+            batch = rows.grants['batches'][payload['batch']]
+            batch['native_transport'] = delivery.native_transport(r.identity)
+            assignment = batch['item']['coding_assignment']
+            reference = assignment['id']
+            assignment.update(status='sent', binding=binding)
+        coding_home = r.tmp / 'diggr-coding'
+        coding_home.mkdir(exist_ok=True)
+        assert dc.accept_coding_assignment('SYSTEM171_ASSIGN ' + reference,
+                                           'coding-session', coding_home)
+        _, row = dc.register_assigned_worker(reference, 'coding-session', coding_home,
+                                             'Implement and test the approved fixture item.')
+        monkeypatch.setattr(dc, 'cmux_send', lambda *args: None)
+        assert dc.start_assigned_worker(r.guard, row)['sent'] is True
+        row = _complete_item_attempt_os(r.guard, row['task'], row['artifact'],
+                                        output='implementation report')
+        native_result = row['worker_result']
+        assert r.guard.observe(row['task'], row['generation'], 'completed', native_result['evidence'])
+    else:
+        row = register(r)
+        # Legacy candidate fixtures carry an unstarted result; only the
+        # dedicated direct-worker paths above qualify operational supervision.
+        Path(row['artifact']).write_text('implementation report')
+        native_result = dict(task=row['task'], generation=row['generation'], action=row['action'],
+                             artifact=row['artifact'], action_id=row['action_id'],
+                             effect_id=row['effect_id'], exit_code=0, artifact_status='present',
+                             evidence=dict(sha256=dc.digest(row['artifact'])))
+        with r.guard.transaction() as rows:
+            rows[row['task']].update(worker_result=native_result, status='pending', gate='main_validation')
+        monkeypatch.setattr(dc, 'verify_prior_exit', lambda row: None)
+        monkeypatch.setattr(dc, 'verify_restarted_reservation_exit', lambda row: None)
     assessment = evidence(contract, 'assessment.json', dict(task=row['task'], result='passed',
         result_sha256=dc.digest(row['artifact']), checks=['scoped diff and tests']))
     command = [sys.executable, '-c', "from pathlib import Path; Path('build').mkdir(exist_ok=True); Path('build/app').write_text('candidate')"]
@@ -3528,16 +3539,12 @@ async def test_current_head_review_merge_closeout_and_lane_release(route, monkey
         monkeypatch.setattr(dc, 'cmux_send', lambda target, command: sends.append(command))
         dc.start_assigned_worker(guard, second_worker)
         assert len(sends) == 1
-        with guard.transaction() as rows:
-            rows[second_worker['task']].update(worker_pid=os.getpid(),
-                worker_identity={'pid': os.getpid(), 'start': 'fixture'}, worker_started_ns=1,
-                child_identity={'pid': 900002, 'start': 'fixture'}, claim_phase='claimed')
-        Path(second_worker['artifact']).write_text('Second item implemented and tested.\n')
-        second_worker = guard.get(second_worker['task'])
-        worker_result = guard.record_worker_result(second_worker, 0, work_seconds=1)
+        second_worker = _complete_item_attempt_os(
+            guard, second_worker['task'], second_worker['artifact'],
+            output='Second item implemented and tested.\n')
+        worker_result = second_worker['worker_result']
         assert guard.observe(second_worker['task'], second_worker['generation'],
             'completed', worker_result['evidence'])
-        monkeypatch.setattr(dc, 'process_absent', lambda identity: True)
         second_candidate = item.control(guard, r.identity, dict(next_payload,
             operation='item_candidate', checks=['second item scoped diff and tests'],
             steps=[dict(action='Open second item', expected='Approved behavior')],
@@ -3648,9 +3655,21 @@ async def test_actual_work_budget_stops_only_owned_child(route, monkeypatch):
     child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(3)'])
     unbound = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(3)'])
     try:
-        code = item.wait_worker(r.guard, row, child, time.monotonic())
-        assert code != 0 and child.poll() is not None
+        started = time.monotonic()
+        with pytest.raises(ValueError, match='^worker stopped by budget or revocation$'):
+            item.wait_worker(r.guard, row, child, started)
+        assert child.poll() is not None
         assert unbound.poll() is None
+        stopped = r.guard.get(row['task'])
+        proof = stopped['worker_supervision']
+        assert proof['state'] == 'unknown' and proof['accounted_seconds'] > 0
+        with r.guard.transaction(read_only=True) as rows:
+            spent = rows.grants['batches'][payload['batch']]['item']['work_seconds']
+        assert spent == proof['accounted_seconds']
+        with pytest.raises(ValueError, match='already recorded'):
+            item.wait_worker(r.guard, row, child, started)
+        with r.guard.transaction(read_only=True) as rows:
+            assert rows.grants['batches'][payload['batch']]['item']['work_seconds'] == spent
     finally:
         for process in (child, unbound):
             if process.poll() is None:
@@ -3659,6 +3678,1096 @@ async def test_actual_work_budget_stops_only_owned_child(route, monkeypatch):
                 except RuntimeError:
                     pass  # sandbox test guard; bounded child exits by itself
             process.wait(timeout=5)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('detached', [False, True], ids=['inherited-group', 'detached-session'])
+async def test_worker_leader_exit_before_first_scan_keeps_live_helper_reserved(route, monkeypatch, tmp_path,
+                                                                               detached):
+    r = route
+    _, payload = await setup(r, monkeypatch)
+    item.control(r.guard, r.identity, payload)
+    register(r)
+    ready = tmp_path / 'helper-ready'
+    release = tmp_path / 'helper-release'
+    done = tmp_path / 'helper-done'
+    pid_file = tmp_path / 'helper-pid'
+    helper_code = (
+        'import os,sys,time; from pathlib import Path; '
+        'ready,release,done=map(Path,sys.argv[1:]); ready.write_text(str(os.getpid())); '
+        'end=time.monotonic()+4; '
+        'exec("while not release.exists() and time.monotonic()<end: time.sleep(.02)"); '
+        'done.touch()'
+    )
+    leader_code = (
+        'import subprocess,sys,time; from pathlib import Path; '
+        'ready,release,done,pid_file=map(Path,sys.argv[1:]); '
+        f'child=subprocess.Popen([sys.executable,"-c",{helper_code!r},str(ready),str(release),str(done)], '
+        f'start_new_session={detached!r}); '
+        'pid_file.write_text(str(child.pid)); '
+        'end=time.monotonic()+2; '
+        'exec("while not ready.exists() and time.monotonic()<end: time.sleep(.02)"); '
+        'sys.exit(0 if ready.exists() else 2)'
+    )
+    work_started = time.monotonic()
+    leader = subprocess.Popen([sys.executable, '-c', leader_code,
+                               str(ready), str(release), str(done), str(pid_file)])
+    helper_pid = None
+    try:
+        assert leader.wait(timeout=3) == 0
+        helper_pid = int(pid_file.read_text())
+        assert int(ready.read_text()) == helper_pid
+        os.kill(helper_pid, 0)  # real OS process remains after proven leader exit
+        if detached:
+            assert os.getpgid(helper_pid) == helper_pid
+        attempt = r.guard.get(r.task['task'])
+        try:
+            code = item.wait_worker(r.guard, attempt, leader, work_started)
+        except ValueError as exc:  # explicit incomplete proof is a safe blocked result
+            assert any(word in str(exc).lower() for word in ('exit', 'unknown', 'incomplete', 'ownership'))
+        else:
+            assert code == 0
+            elapsed = time.monotonic() - work_started
+            native_result = r.guard.record_worker_result(attempt, code, work_seconds=elapsed)
+            r.guard.observe(attempt['task'], attempt['generation'], 'completed', native_result['evidence'])
+            current = r.guard.get(attempt['task'])
+            assert done.exists() or current['status'] != 'pending', (
+                'native Guard admitted the next step while the real helper was alive')
+            assert done.exists(), 'leader exit released the worker while its real helper was alive'
+            with r.guard.transaction(read_only=True) as rows:
+                spent = rows.grants['batches'][payload['batch']]['item']['work_seconds']
+            assert spent >= elapsed - .05, 'helper walltime was not charged to the item'
+    finally:
+        release.touch()
+        if leader.poll() is None:
+            leader.wait(timeout=3)
+        if helper_pid is not None:
+            until = time.monotonic() + 5
+            while not done.exists() and time.monotonic() < until:
+                time.sleep(.02)
+            assert done.exists(), 'test-owned helper did not complete its bounded lifetime'
+
+
+@pytest.mark.asyncio
+async def test_worker_leader_exit_after_first_scan_keeps_captured_helper_reserved(route, monkeypatch, tmp_path):
+    import threading
+
+    r = route
+    _, payload = await setup(r, monkeypatch)
+    item.control(r.guard, r.identity, payload)
+    register(r)
+    ready = tmp_path / 'captured-helper-ready'
+    leader_release = tmp_path / 'captured-leader-release'
+    helper_release = tmp_path / 'captured-helper-release'
+    helper_done = tmp_path / 'captured-helper-done'
+    pid_file = tmp_path / 'captured-helper-pid'
+    helper_code = (
+        'import os,sys,time; from pathlib import Path; '
+        'ready,release,done=map(Path,sys.argv[1:]); ready.write_text(str(os.getpid())); '
+        'end=time.monotonic()+6; '
+        'exec("while not release.exists() and time.monotonic()<end: time.sleep(.02)"); done.touch()'
+    )
+    leader_code = (
+        'import subprocess,sys,time; from pathlib import Path; '
+        'ready,leader_release,helper_release,helper_done,pid_file=map(Path,sys.argv[1:]); '
+        f'child=subprocess.Popen([sys.executable,"-c",{helper_code!r},str(ready),str(helper_release),str(helper_done)]); '
+        'pid_file.write_text(str(child.pid)); '
+        'end=time.monotonic()+4; '
+        'exec("while not ready.exists() and time.monotonic()<end: time.sleep(.02)"); '
+        'exec("while not leader_release.exists() and time.monotonic()<end: time.sleep(.02)"); '
+        'sys.exit(0 if ready.exists() else 2)'
+    )
+    work_started = time.monotonic()
+    leader = subprocess.Popen([sys.executable, '-c', leader_code, str(ready),
+                               str(leader_release), str(helper_release), str(helper_done), str(pid_file)])
+    result = {}
+    thread = None
+    try:
+        until = time.monotonic() + 2
+        while not ready.exists() and time.monotonic() < until:
+            time.sleep(.02)
+        helper_pid = int(pid_file.read_text())
+        assert int(ready.read_text()) == helper_pid
+        attempt = r.guard.get(r.task['task'])
+        def supervise():
+            try:
+                result['code'] = item.wait_worker(r.guard, attempt, leader, work_started)
+            except BaseException as exc:
+                result['error'] = exc
+
+        thread = threading.Thread(target=supervise, daemon=True)
+        thread.start()
+        until = time.monotonic() + 2
+        while time.monotonic() < until:
+            if 'error' in result:
+                raise result['error']
+            if any(entry['pid'] == helper_pid for entry in
+                   r.guard.get(r.task['task']).get('worker_descendants', [])):
+                break
+            time.sleep(.02)
+        else:
+            pytest.fail('native supervisor did not capture the real helper before leader exit')
+        leader_release.touch()
+        assert leader.wait(timeout=3) == 0
+        os.kill(helper_pid, 0)
+        thread.join(timeout=2)
+        if not thread.is_alive() and not helper_done.exists():
+            assert isinstance(result.get('error'), ValueError) and any(
+                word in str(result['error']).lower() for word in
+                ('exit', 'unknown', 'incomplete', 'ownership')), (
+                'captured helper was released when its leader exited')
+    finally:
+        leader_release.touch()
+        helper_release.touch()
+        if leader.poll() is None:
+            leader.wait(timeout=5)
+        if thread is not None:
+            thread.join(timeout=5)
+            assert not thread.is_alive(), 'supervisor did not stop after bounded helper lifetime'
+        until = time.monotonic() + 5
+        while not helper_done.exists() and time.monotonic() < until:
+            time.sleep(.02)
+        assert helper_done.exists(), 'test-owned helper did not complete its bounded lifetime'
+
+
+def _bind_started_os_worker(guard, task, leader):
+    """Use actual process identities; the normal launcher supplies these fields."""
+    wrapper = dc.process_identity(os.getpid())
+    child = dc.process_identity(leader.pid)
+    assert wrapper and child
+    with guard.transaction() as rows:
+        row = rows[task]
+        row.update(worker_pid=os.getpid(), worker_identity=wrapper,
+                   worker_started_ns=time.time_ns(), child_identity=child,
+                   claim_phase='claimed', visible_sent=True)
+    return guard.get(task)
+
+
+def _run_observed_fixture_worker(guard, ticket, argv, artifact, monkeypatch,
+                                 *, output='isolated worker result', inspect_argv=None):
+    """Run the native worker route with a real, bounded child and first-scan handshake."""
+    import threading
+
+    release = Path(artifact).with_name(Path(artifact).name + '.release')
+    release.unlink(missing_ok=True)
+    child_code = (
+        'import sys,time; from pathlib import Path; '
+        'release,artifact=map(Path,sys.argv[1:]); '
+        'end=time.monotonic()+10; '
+        'exec("while not release.exists() and time.monotonic()<end: time.sleep(.02)"); '
+        'sys.exit(2) if not release.exists() else artifact.write_text(' + repr(output) + ')'
+    )
+    original_popen = subprocess.Popen
+    spawned = []
+    child = None
+    def execute(command, *args, **kwargs):
+        nonlocal child
+        if command == argv:
+            if inspect_argv:
+                assert inspect_argv(command)
+            spawned.append(command)
+            child = original_popen([sys.executable, '-c', child_code,
+                                    str(release), str(artifact)], *args, **kwargs)
+            return child
+        return original_popen(command, *args, **kwargs)
+
+    def release_after_observation():
+        until = time.monotonic() + 5
+        while time.monotonic() < until:
+            if guard.get(ticket['task']).get('worker_supervision', {}).get('state') == 'observing':
+                release.touch()
+                return
+            time.sleep(.02)
+
+    watcher = threading.Thread(target=release_after_observation, daemon=True)
+    with monkeypatch.context() as patch:
+        patch.setattr(subprocess, 'Popen', execute)
+        watcher.start()
+        try:
+            result = dc.main(['--home', ticket['identity']['home'], 'worker', '--payload-json',
+                              json.dumps(ticket)])
+        finally:
+            watcher.join(timeout=6)
+            if child is not None and child.poll() is None:
+                child.terminate()
+                try:
+                    child.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    child.wait(timeout=3)
+    assert not watcher.is_alive()
+    return result, spawned
+
+
+def _guard_real_cmux_subprocesses(monkeypatch):
+    """Fail at the process boundary if this opt-in fixture reaches real cMux."""
+    import shlex
+
+    attempts = []
+    guarded_popen = subprocess.Popen  # Preserve the root conftest's process guard.
+
+    class NoRealCmux(guarded_popen):
+        def __init__(self, command, *args, **kwargs):
+            parts = shlex.split(command) if isinstance(command, str) else list(command)
+            executable = os.fspath(parts[0]) if parts else ''
+            if executable == dc.CMUX or Path(executable).name == 'cmux':
+                attempts.append(executable)
+                raise AssertionError('real cmux subprocess forbidden in native V2 fixture: ' + executable)
+            super().__init__(command, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, 'Popen', NoRealCmux)
+    return attempts
+
+
+def _complete_native_v2_item_attempt(r, monkeypatch):
+    """Exercise native V2 gates with owned processes and external terminal seams.
+
+    invoke, cmux_send, verify_visible_target and verify_visible_claim stop at the terminal boundary;
+    the argv adapter launches a real bounded child in place of Codex. These
+    seams do not prove shell parentage, TTY/PGID/foreground or cMux snapshots.
+    """
+    from tools.process_registry import ProcessSession, process_registry
+    import yaml
+
+    # Parent and fresh child must use the same already configured profile home.
+    home = Path(r.identity['home']).resolve()
+    assert home == r.tmp.resolve()
+    profile = r.identity['profile']
+    assert profile in delivery.PROFILES
+    runtime_path = home / 'state' / 'diggr-continuation.json'
+    assert r.guard.path == runtime_path and runtime_path.exists()
+    config_path = home / 'config.yaml'
+    assert not config_path.is_symlink()
+    config = yaml.safe_load(config_path.read_text())
+    assert config['diggr_continuation'] == dict(enabled=True, profile=profile, home=str(home))
+    assert r.guard.profile == profile
+    assert dc.runtime_guard(home).path == runtime_path
+    dispatcher = r.tmp / 'system' / 'ops' / 'scripts' / 'loop_control_dispatch_coding.sh'
+    assert dc.DISPATCHER == str(dispatcher) and dispatcher.is_file() and not dispatcher.is_symlink()
+    assert dispatcher.resolve().is_relative_to(home)
+    packet_root = dc.logical_packet_root()
+    assert packet_root == (dispatcher.parents[2] / 'ops/state/loop-control/routing_packets').resolve()
+    assert packet_root.is_relative_to(home)
+    assert dc.CODEX_EXECUTABLE == r.task['worker_route']['argv'][0]
+    onboarding, skill_dir = item.onboarding_payload()
+    assert skill_dir == str((home / 'skills' / item.ONBOARDING_SKILL).resolve())
+    assert onboarding in r.task['worker_route']['argv'][-1]
+    item.require_onboarding_context()
+
+    launcher_release = r.tmp / 'v2-launcher.release'
+    launcher_release.unlink(missing_ok=True)
+    launcher = None
+    session = None
+    def invoke(launch):
+        nonlocal launcher, session
+        # This is the external terminal seam. The native reservation, registry
+        # ownership check and launcher identity capture remain in terminal_dispatch.
+        code = ('import sys,time; from pathlib import Path; '
+                'release=Path(sys.argv[1]); end=time.monotonic()+20; '
+                'exec("while not release.exists() and time.monotonic()<end: time.sleep(.02)"); '
+                'sys.exit(0 if release.exists() else 2)')
+        launcher = subprocess.Popen([sys.executable, '-B', '-c', code, str(launcher_release)],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        session = ProcessSession(id='fixture-v2-' + str(launcher.pid), command=launch['command'],
+                                 session_key=r.identity['session_key'], started_at=time.time(),
+                                 pid=launcher.pid, process=launcher, pid_scope='host')
+        with process_registry._lock:
+            assert session.id not in process_registry._running
+            process_registry._running[session.id] = session
+        return dict(session_id=session.id)
+
+    # The worker runs in its own short-lived wrapper so the recorded worker PID
+    # really exits before Main evaluates the candidate and recovery request.
+    worker_script = '''
+import json, os, subprocess, sys, threading, time
+from pathlib import Path
+from hermes_cli import diggr_continuation as dc
+from hermes_cli import diggr_item as item
+dc.DISPATCHER = sys.argv[6]
+dc.CODEX_EXECUTABLE = sys.argv[7]
+time.time = lambda: float(sys.argv[3])  # Same disposable fixture clock as Main.
+guard = dc.Guard(Path(sys.argv[1]))
+ticket = json.loads(sys.argv[2])
+row = guard.get(ticket['task'])
+home = Path(ticket['identity']['home']).resolve()
+dispatcher = home / 'system' / 'ops' / 'scripts' / 'loop_control_dispatch_coding.sh'
+assert dc.DISPATCHER == str(dispatcher) and dispatcher.is_file() and not dispatcher.is_symlink()
+assert dispatcher.resolve().is_relative_to(home)
+route = row['worker_route']
+expected_binding = json.loads(sys.argv[8])  # Registered, sealed disposable fixture binding.
+assert row['visible_binding'] == expected_binding
+assert route['visible_target'] == expected_binding['target']
+contract = row['logical_contract']
+artifacts = Path(contract['resources']['artifacts']).resolve()
+assert artifacts.is_relative_to(home)
+assert dc.logical_packet_root() == artifacts / 'routing_packets'
+packet, receipt, result = (Path(path).resolve() for path in
+                           (route['packet'], route['receipt'], row['artifact']))
+assert len({packet, receipt, result}) == 3
+assert packet.is_relative_to(dc.logical_packet_root())
+assert receipt.is_relative_to(artifacts) and result.is_relative_to(artifacts)
+assert row['launcher_command'] == dc.logical_launcher_command(contract, route)
+content, directory = item.onboarding_payload()
+assert content == sys.argv[4]
+assert directory == sys.argv[5]
+assert content in row['worker_route']['argv'][-1]
+assert dc.runtime_guard(ticket['identity']['home']).path == guard.path
+release = Path(row['artifact'] + '.release')
+release.unlink(missing_ok=True)
+authorized = row['worker_route']['argv']
+assert authorized[0] == dc.CODEX_EXECUTABLE
+original_popen = subprocess.Popen
+child = None
+spawned = 0
+cmux_attempts = []
+class NoRealCmux(original_popen):
+    def __init__(self, command, *args, **kwargs):
+        import shlex
+        parts = shlex.split(command) if isinstance(command, str) else list(command)
+        executable = os.fspath(parts[0]) if parts else ''
+        if executable == dc.CMUX or Path(executable).name == 'cmux':
+            cmux_attempts.append(executable)
+            raise AssertionError('real cmux subprocess forbidden in fresh V2 worker: ' + executable)
+        super().__init__(command, *args, **kwargs)
+subprocess.Popen = NoRealCmux
+guarded_popen = subprocess.Popen
+target_checks = []
+def verify_fixture_target(binding, idle=False):
+    frame = sys._getframe()
+    callers = []
+    route_row = None
+    while frame is not None:
+        callers.append(frame.f_code.co_name)
+        if frame.f_code.co_name == 'route_check':
+            route_row = frame.f_locals.get('row')
+        frame = frame.f_back
+    assert 'route_check' in callers and 'preflight_non_cmm' in callers
+    assert route_row is not None and not route_row.get('worker_pid'), 'target checked after worker claim'
+    assert binding == expected_binding, 'receipt consumed a different visible binding'
+    assert binding['target'] == route['visible_target'], 'receipt consumed a different target'
+    target_checks.append(dict(binding=binding, idle=idle, before_claim=True))
+    return binding['target'], binding.get('shell')  # Simulated terminal evidence only.
+dc.verify_visible_target = verify_fixture_target
+def execute(command, *args, **kwargs):
+    global child, spawned
+    if command == authorized:
+        spawned += 1
+        child_code = ('import sys,time; from pathlib import Path; '
+                      'release,artifact=map(Path,sys.argv[1:]); '
+                      'end=time.monotonic()+10; '
+                      'exec("while not release.exists() and time.monotonic()<end: time.sleep(.02)"); '
+                      'sys.exit(2) if not release.exists() else artifact.write_text("implementation report")')
+        child = guarded_popen([sys.executable, '-B', '-c', child_code,
+                                str(release), row['artifact']], *args, **kwargs)
+        return child
+    return guarded_popen(command, *args, **kwargs)
+def release_after_first_scan():
+    end = time.monotonic() + 6
+    while time.monotonic() < end:
+        if (guard.get(ticket['task']).get('worker_supervision') or {}).get('state') == 'observing':
+            release.touch()
+            return
+        time.sleep(.02)
+watcher = threading.Thread(target=release_after_first_scan, daemon=True)
+subprocess.Popen = execute
+dc.verify_visible_claim = lambda row: None  # Disposable external terminal seam.
+watcher.start()
+try:
+    result = dc.main(['--home', ticket['identity']['home'], 'worker', '--payload-json', json.dumps(ticket)])
+    assert result == 0 and spawned == 1 and release.exists()
+    assert child is not None and child.poll() == 0
+    assert target_checks, 'fresh worker did not revalidate the sealed receipt before claim'
+    assert cmux_attempts == [], 'fresh worker attempted real cmux: ' + repr(cmux_attempts)
+    print('SYSTEM171_TEST_TERMINAL_ADAPTER ' + json.dumps(target_checks, sort_keys=True), flush=True)
+finally:
+    release.touch()
+    watcher.join(timeout=7)
+    if child is not None and child.poll() is None:
+        child.terminate()
+        try: child.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait(timeout=3)
+assert not watcher.is_alive()
+'''
+    env = dict(PATH=os.environ.get('PATH', ''), PYTHONPATH=str(Path(__file__).resolve().parents[2]),
+               PYTHONDONTWRITEBYTECODE='1', HOME=str(home), HERMES_HOME=str(home),
+               CODEX_HOME=str(home / 'codex'), HERMES_PLATFORM='telegram')
+    wrapper = None
+    sent = []
+    try:
+        request = dict(command=r.task['launcher_command'], background=True, continuation=r.task)
+        token = dc.EVENT_CONTEXT.set(dict(identity=r.identity))
+        try:
+            admitted = dc.terminal_dispatch(request, invoke)
+        finally:
+            dc.EVENT_CONTEXT.reset(token)
+        row = r.guard.get(r.task['task'])
+        assert admitted['continuation']['worker_ticket'] == dc.worker_ticket(row)
+        assert row['launcher_identity'], 'native launcher identity unavailable'
+        assert row['launcher_identity']['pid'] == launcher.pid
+        assert row['launcher_identity']['created'] > 0
+        ticket = dc.worker_ticket(row)
+        assert dc.main(['--home', r.identity['home'], 'route-preflight', '--payload-json',
+                        json.dumps(dict(ticket=ticket, route=row['worker_route']))]) == 0
+        with monkeypatch.context() as patch:
+            patch.setattr(dc, 'cmux_send', lambda *args: sent.append(args))
+            response = json.loads(dc.terminal_dispatch(
+                dict(command='SYSTEM167_REGISTERED_WORKER', continuation_ticket=ticket),
+                lambda _: pytest.fail('launcher must not start a second worker')))
+        assert response['sent'] is True
+        assert sent == [(row['visible_binding'], dc.visible_worker_command(ticket))]
+        wrapper = subprocess.Popen([sys.executable, '-B', '-c', worker_script,
+                                    str(r.guard.path), json.dumps(ticket), str(r.clock[0]),
+                                    onboarding, skill_dir, dc.DISPATCHER, dc.CODEX_EXECUTABLE,
+                                    json.dumps(row['visible_binding'], sort_keys=True)], env=env,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                   start_new_session=True)
+        stdout, stderr = wrapper.communicate(timeout=16)
+        assert wrapper.returncode == 0, (stdout, stderr)
+        markers = [line.removeprefix('SYSTEM171_TEST_TERMINAL_ADAPTER ')
+                   for line in stdout.splitlines()
+                   if line.startswith('SYSTEM171_TEST_TERMINAL_ADAPTER ')]
+        assert len(markers) == 1, (stdout, stderr)
+        checks = json.loads(markers[0])
+        assert checks and all(check == dict(binding=row['visible_binding'], idle=False,
+                                            before_claim=True) for check in checks), checks
+        assert wrapper.poll() == 0
+        row = r.guard.get(r.task['task'])
+        assert row['worker_supervision']['state'] == 'exited'
+        assert row['worker_result']['exit_code'] == 0
+        assert row['claim_phase'] == 'claimed'
+        assert row['worker_identity']['pid'] == wrapper.pid
+        assert row['child_identity']['pid'] > 0 and row['child_exited'] is True
+        assert dc.worker_operational_exit(row)
+        assert row['worker_result']['evidence']['sha256'] == dc.digest(row['artifact'])
+        return row
+    finally:
+        launcher_release.touch()
+        if wrapper is not None and wrapper.poll() is None:
+            # The wrapper and its one child own this private process group.
+            import signal
+            os.killpg(wrapper.pid, signal.SIGTERM)
+            try:
+                wrapper.communicate(timeout=3)
+            except subprocess.TimeoutExpired:
+                os.killpg(wrapper.pid, signal.SIGKILL)
+                wrapper.communicate(timeout=3)
+        if launcher is not None:
+            try:
+                assert launcher.wait(timeout=3) == 0
+            except subprocess.TimeoutExpired:
+                launcher.terminate()
+                try:
+                    launcher.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    launcher.kill()
+                    launcher.wait(timeout=3)
+        if session is not None:
+            process_registry._reconcile_local_exit(session)
+            with process_registry._lock:
+                process_registry._running.pop(session.id, None)
+
+
+def _complete_item_attempt_os(guard, task, artifact, *, output='observed item result'):
+    """Finish a disposable Item attempt from a real wrapper that subsequently exits."""
+    release = Path(artifact).with_name(Path(artifact).name + '.release')
+    release.unlink(missing_ok=True)
+    script = '''
+import os, subprocess, sys, time
+from pathlib import Path
+from hermes_cli import diggr_continuation as dc, diggr_item as item
+guard = dc.Guard(Path(sys.argv[1]))
+task, artifact, release, output = sys.argv[2:]
+child_code = ('import sys,time; from pathlib import Path; '
+              'release=Path(sys.argv[1]); artifact=Path(sys.argv[2]); '
+              'end=time.monotonic()+10; '
+              'exec("while not release.exists() and time.monotonic()<end: time.sleep(.02)"); '
+              'sys.exit(2) if not release.exists() else artifact.write_text(sys.argv[3])')
+started = time.monotonic()
+child = subprocess.Popen([sys.executable, '-c', child_code, release, artifact, output],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+with guard.transaction() as rows:
+    row = rows[task]
+    row.update(worker_pid=os.getpid(), worker_identity=dc.process_identity(os.getpid()),
+               worker_started_ns=time.time_ns(), child_identity=dc.process_identity(child.pid),
+               claim_phase='claimed', visible_sent=True)
+attempt = guard.get(task)
+code = item.wait_worker(guard, attempt, child, started)
+guard.record_worker_result(attempt, code)
+'''
+    env = dict(PATH=os.environ.get('PATH', ''), PYTHONPATH=str(Path(__file__).resolve().parents[2]),
+               PYTHONDONTWRITEBYTECODE='1', HOME=str(Path(guard.path).parent),
+               HERMES_HOME=str(Path(guard.path).parent))
+    wrapper = subprocess.Popen([sys.executable, '-B', '-c', script, str(guard.path),
+                                task, str(artifact), str(release), output],
+                               env=env, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, text=True)
+    try:
+        until = time.monotonic() + 6
+        while time.monotonic() < until:
+            proof = guard.get(task).get('worker_supervision') or {}
+            if proof.get('state') == 'observing':
+                release.touch()
+                break
+            if wrapper.poll() is not None:
+                break
+            time.sleep(.02)
+        stdout, stderr = wrapper.communicate(timeout=13)
+        assert wrapper.returncode == 0, (stdout, stderr)
+        row = guard.get(task)
+        assert row['worker_supervision']['state'] == 'exited'
+        assert row['worker_result']['exit_code'] == 0
+        return row
+    finally:
+        release.touch()
+        if wrapper.poll() is None:
+            wrapper.terminate()
+            try:
+                wrapper.communicate(timeout=3)
+            except subprocess.TimeoutExpired:
+                wrapper.kill()
+                wrapper.communicate(timeout=3)
+
+
+@pytest.mark.asyncio
+async def test_unobserved_os_exit_retains_unknown_and_books_elapsed_once(route, monkeypatch):
+    r = route
+    _, payload = await setup(r, monkeypatch)
+    item.control(r.guard, r.identity, payload)
+    register(r)
+    started = time.monotonic()
+    leader = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(.05)'])
+    assert leader.wait(timeout=2) == 0
+    attempt = r.guard.get(r.task['task'])
+    with pytest.raises(ValueError, match='before first successful scan'):
+        item.wait_worker(r.guard, attempt, leader, started)
+    row = r.guard.get(attempt['task'])
+    proof = row['worker_supervision']
+    assert proof['state'] == 'unknown' and proof['accounted_seconds'] > 0
+    assert 'before first successful scan' in proof['reason']
+    with r.guard.transaction(read_only=True) as rows:
+        spent = rows.grants['batches'][payload['batch']]['item']['work_seconds']
+    assert spent == proof['accounted_seconds']
+    with pytest.raises(ValueError, match='already recorded'):
+        item.wait_worker(r.guard, attempt, leader, started)
+    with r.guard.transaction(read_only=True) as rows:
+        assert rows.grants['batches'][payload['batch']]['item']['work_seconds'] == spent
+
+
+@pytest.mark.asyncio
+async def test_observed_normal_os_worker_reaches_native_validation(route, monkeypatch, tmp_path):
+    import threading
+
+    r = route
+    _, payload = await setup(r, monkeypatch)
+    item.control(r.guard, r.identity, payload)
+    register(r)
+    ready = tmp_path / 'normal-ready'
+    release = tmp_path / 'normal-release'
+    artifact = r.guard.get(r.task['task'])['artifact']
+    code = (
+        'import sys,time; from pathlib import Path; '
+        'ready,release,artifact=map(Path,sys.argv[1:]); ready.touch(); '
+        'end=time.monotonic()+5; '
+        'exec("while not release.exists() and time.monotonic()<end: time.sleep(.02)"); '
+        'artifact.write_text("real worker result")'
+    )
+    started = time.monotonic()
+    leader = subprocess.Popen([sys.executable, '-c', code, str(ready), str(release), artifact])
+    result = {}
+    thread = None
+    try:
+        until = time.monotonic() + 2
+        while not ready.exists() and time.monotonic() < until:
+            time.sleep(.02)
+        assert ready.exists()
+        attempt = _bind_started_os_worker(r.guard, r.task['task'], leader)
+        def supervise():
+            try:
+                result['code'] = item.wait_worker(r.guard, attempt, leader, started)
+            except BaseException as exc:
+                result['error'] = exc
+        thread = threading.Thread(target=supervise, daemon=True)
+        thread.start()
+        until = time.monotonic() + 2
+        while r.guard.get(attempt['task']).get('worker_supervision', {}).get('state') != 'observing' and time.monotonic() < until:
+            if 'error' in result:
+                raise result['error']
+            time.sleep(.02)
+        assert r.guard.get(attempt['task'])['worker_supervision']['state'] == 'observing'
+        release.touch()
+        thread.join(timeout=5)
+        assert not thread.is_alive() and result.get('code') == 0 and not result.get('error')
+        native = r.guard.record_worker_result(attempt, result['code'])
+        assert native['artifact_status'] == 'present'
+        assert r.guard.observe(attempt['task'], attempt['generation'], 'completed', native['evidence'])
+        row = r.guard.get(attempt['task'])
+        assert row['gate'] == 'main_validation' and row['status'] == 'pending'
+        assert row['worker_supervision']['state'] == 'exited'
+        assert row['worker_supervision']['accounted_seconds'] > 0
+        with r.guard.transaction(read_only=True) as rows:
+            spent = rows.grants['batches'][payload['batch']]['item']['work_seconds']
+        assert spent == row['worker_supervision']['accounted_seconds']
+        assert r.guard.record_worker_result(attempt, result['code']) == native
+        with r.guard.transaction(read_only=True) as rows:
+            assert rows.grants['batches'][payload['batch']]['item']['work_seconds'] == spent
+    finally:
+        release.touch()
+        if leader.poll() is None:
+            leader.wait(timeout=6)
+        if thread is not None:
+            thread.join(timeout=6)
+
+
+@pytest.mark.asyncio
+@pytest.mark.live_system_guard_bypass
+async def test_authority_loss_between_scan_and_exit_publication_stays_unknown(route, monkeypatch, tmp_path):
+    """The last ledger write must not publish an exit against an earlier authority read."""
+    import threading
+    from contextlib import contextmanager
+
+    r = route
+    _, payload = await setup(r, monkeypatch)
+    item.control(r.guard, r.identity, payload)
+    register(r)
+    ready = tmp_path / 'publication-ready'
+    release = tmp_path / 'publication-release'
+    code = ('import sys,time; from pathlib import Path; '
+            'ready,release=map(Path,sys.argv[1:]); ready.touch(); '
+            'end=time.monotonic()+8; '
+            'exec("while not release.exists() and time.monotonic()<end: time.sleep(.02)")')
+    started = time.monotonic()
+    leader = subprocess.Popen([sys.executable, '-c', code, str(ready), str(release)])
+    result = {}
+    thread = None
+    try:
+        until = time.monotonic() + 2
+        while not ready.exists() and time.monotonic() < until:
+            time.sleep(.02)
+        assert ready.exists()
+        attempt = _bind_started_os_worker(r.guard, r.task['task'], leader)
+        original_transaction = r.guard.transaction
+        injected = []
+
+        @contextmanager
+        def transaction(*, read_only=False):
+            with original_transaction(read_only=read_only) as rows:
+                proof = rows[attempt['task']].get('worker_supervision') or {}
+                if (not read_only and not injected and proof.get('state') == 'observing'
+                        and leader.poll() is not None):
+                    rows.grants['batches'][payload['batch']]['revoked'] = True
+                    injected.append(True)
+                yield rows
+
+        monkeypatch.setattr(r.guard, 'transaction', transaction)
+        def supervise():
+            try:
+                result['code'] = item.wait_worker(r.guard, attempt, leader, started)
+            except BaseException as exc:
+                result['error'] = exc
+        thread = threading.Thread(target=supervise, daemon=True)
+        thread.start()
+        until = time.monotonic() + 2
+        while (r.guard.get(attempt['task']).get('worker_supervision') or {}).get('state') != 'observing' and time.monotonic() < until:
+            if result.get('error'):
+                raise result['error']
+            time.sleep(.02)
+        assert r.guard.get(attempt['task'])['worker_supervision']['state'] == 'observing'
+        release.touch()
+        thread.join(timeout=5)
+        assert injected == [True]
+        assert not thread.is_alive() and isinstance(result.get('error'), ValueError)
+        assert 'authority ended before operational exit' in str(result['error'])
+        row = r.guard.get(attempt['task'])
+        assert row['worker_supervision']['state'] == 'unknown'
+        assert row['worker_supervision']['accounted_seconds'] > 0
+        assert not dc.executor_released(row)
+        with pytest.raises(ValueError, match='operational exit is unknown'):
+            r.guard.record_worker_result(attempt, 0)
+        with r.guard.transaction(read_only=True) as rows:
+            assert rows.grants['batches'][payload['batch']]['item']['work_seconds'] == row['worker_supervision']['accounted_seconds']
+    finally:
+        release.touch()
+        if leader.poll() is None:
+            leader.wait(timeout=9)
+        if thread is not None:
+            thread.join(timeout=6)
+
+
+@pytest.mark.asyncio
+async def test_supervised_result_passes_exit_consumer_after_real_wrapper_exit(route, monkeypatch, tmp_path):
+    r = route
+    _, payload = await setup(r, monkeypatch)
+    item.control(r.guard, r.identity, payload)
+    register(r)
+    ready = tmp_path / 'wrapped-leader-ready'
+    release = tmp_path / 'wrapped-leader-release'
+    with r.guard.transaction() as rows:
+        # Exercise the direct exit consumer with a real wrapper process that
+        # runs the native supervisor and then actually exits.
+        rows[r.task['task']]['direct_worker'] = True
+    wrapper_code = '''
+import os, subprocess, sys, time
+from pathlib import Path
+from hermes_cli import diggr_continuation as dc, diggr_item as item
+path, task, ready, release = sys.argv[1:]
+guard = dc.Guard(path)
+artifact = guard.get(task)['artifact']
+leader_code = (
+    'import sys,time; from pathlib import Path; '
+    'ready,release,artifact=map(Path,sys.argv[1:]); ready.touch(); '
+    'end=time.monotonic()+6; '
+    'exec("while not release.exists() and time.monotonic()<end: time.sleep(.02)"); '
+    'artifact.write_text("wrapped native result")'
+)
+started = time.monotonic()
+leader = subprocess.Popen([sys.executable, '-c', leader_code, ready, release, artifact])
+end = time.monotonic() + 2
+while not Path(ready).exists() and time.monotonic() < end:
+    time.sleep(.02)
+if not Path(ready).exists():
+    raise ValueError('real leader never became ready')
+with guard.transaction() as rows:
+    row = rows[task]
+    row.update(worker_pid=os.getpid(), worker_identity=dc.process_identity(os.getpid()),
+               child_identity=dc.process_identity(leader.pid), worker_started_ns=time.time_ns(),
+               claim_phase='claimed', visible_sent=True)
+attempt = guard.get(task)
+code = item.wait_worker(guard, attempt, leader, started)
+result = guard.record_worker_result(attempt, code)
+guard.observe(task, attempt['generation'], 'completed', result['evidence'])
+'''
+    wrapper = subprocess.Popen([sys.executable, '-c', wrapper_code, str(r.guard.path),
+                                r.task['task'], str(ready), str(release)],
+                               cwd=str(Path(__file__).resolve().parents[2]))
+    try:
+        until = time.monotonic() + 3
+        while time.monotonic() < until:
+            if wrapper.poll() is not None:
+                pytest.fail('native wrapper exited before observed leader scan')
+            row = r.guard.get(r.task['task'])
+            if row.get('worker_supervision', {}).get('state') == 'observing':
+                break
+            time.sleep(.02)
+        else:
+            pytest.fail('native wrapper never observed its real leader')
+        release.touch()
+        assert wrapper.wait(timeout=8) == 0
+        row = r.guard.get(r.task['task'])
+        assert row['gate'] == 'main_validation' and row['worker_result']['exit_code'] == 0
+        dc.verify_direct_worker_exit(row, completed=True)
+    finally:
+        release.touch()
+        wrapper.wait(timeout=8)
+
+
+@pytest.mark.asyncio
+async def test_captured_os_helper_finishes_after_leader_before_native_result(route, monkeypatch, tmp_path):
+    import threading
+
+    r = route
+    _, payload = await setup(r, monkeypatch)
+    item.control(r.guard, r.identity, payload)
+    register(r)
+    ready = tmp_path / 'helper-ready'
+    leader_release = tmp_path / 'leader-release'
+    helper_release = tmp_path / 'helper-release'
+    done = tmp_path / 'helper-done'
+    pid_file = tmp_path / 'helper-pid'
+    artifact = r.guard.get(r.task['task'])['artifact']
+    helper_code = (
+        'import os,sys,time; from pathlib import Path; '
+        'ready,release,done=map(Path,sys.argv[1:]); ready.write_text(str(os.getpid())); '
+        'end=time.monotonic()+7; '
+        'exec("while not release.exists() and time.monotonic()<end: time.sleep(.02)"); done.touch()'
+    )
+    leader_code = (
+        'import subprocess,sys,time; from pathlib import Path; '
+        'ready,leader_release,helper_release,done,pid_file,artifact=map(Path,sys.argv[1:]); '
+        f'helper=subprocess.Popen([sys.executable,"-c",{helper_code!r},str(ready),str(helper_release),str(done)]); '
+        'pid_file.write_text(str(helper.pid)); '
+        'end=time.monotonic()+5; '
+        'exec("while not ready.exists() and time.monotonic()<end: time.sleep(.02)"); '
+        'exec("while not leader_release.exists() and time.monotonic()<end: time.sleep(.02)"); '
+        'artifact.write_text("real captured helper result"); sys.exit(0)'
+    )
+    started = time.monotonic()
+    leader = subprocess.Popen([sys.executable, '-c', leader_code, str(ready),
+        str(leader_release), str(helper_release), str(done), str(pid_file), artifact])
+    result = {}
+    thread = None
+    try:
+        until = time.monotonic() + 2
+        while not ready.exists() and time.monotonic() < until:
+            time.sleep(.02)
+        helper_pid = int(pid_file.read_text())
+        assert int(ready.read_text()) == helper_pid
+        attempt = _bind_started_os_worker(r.guard, r.task['task'], leader)
+        def supervise():
+            try:
+                result['code'] = item.wait_worker(r.guard, attempt, leader, started)
+            except BaseException as exc:
+                result['error'] = exc
+        thread = threading.Thread(target=supervise, daemon=True)
+        thread.start()
+        until = time.monotonic() + 2
+        while time.monotonic() < until:
+            if 'error' in result:
+                raise result['error']
+            row = r.guard.get(attempt['task'])
+            if row.get('worker_supervision', {}).get('state') == 'observing' and any(
+                    entry['pid'] == helper_pid for entry in row.get('worker_descendants', [])):
+                break
+            time.sleep(.02)
+        else:
+            pytest.fail('real helper was not captured before leader exit')
+        leader_release.touch()
+        assert leader.wait(timeout=3) == 0
+        leader_elapsed = time.monotonic() - started
+        assert not done.exists() and thread.is_alive()
+        with pytest.raises(ValueError, match='operational exit'):
+            r.guard.record_worker_result(attempt, 0)
+        assert not dc.executor_released(r.guard.get(attempt['task']))
+        helper_release.touch()
+        thread.join(timeout=7)
+        assert not thread.is_alive() and result.get('code') == 0 and not result.get('error')
+        native = r.guard.record_worker_result(attempt, 0)
+        assert native['artifact_status'] == 'present'
+        assert r.guard.observe(attempt['task'], attempt['generation'], 'completed', native['evidence'])
+        row = r.guard.get(attempt['task'])
+        assert row['gate'] == 'main_validation' and row['worker_supervision']['state'] == 'exited'
+        assert row['worker_supervision']['accounted_seconds'] >= leader_elapsed
+    finally:
+        leader_release.touch()
+        helper_release.touch()
+        if leader.poll() is None:
+            leader.wait(timeout=6)
+        if thread is not None:
+            thread.join(timeout=8)
+
+
+@pytest.mark.asyncio
+@pytest.mark.live_system_guard_bypass
+@pytest.mark.parametrize('stop_kind', ['budget', 'revocation'])
+async def test_after_leader_exit_item_stop_accounts_once_and_spares_foreign_process(
+        route, monkeypatch, tmp_path, stop_kind):
+    import threading
+
+    r = route
+    _, payload = await setup(r, monkeypatch)
+    item.control(r.guard, r.identity, payload)
+    register(r)
+    ready = tmp_path / 'stop-helper-ready'
+    leader_release = tmp_path / 'stop-leader-release'
+    helper_release = tmp_path / 'stop-helper-release'
+    foreign_release = tmp_path / 'foreign-release'
+    pid_file = tmp_path / 'stop-helper-pid'
+    helper_code = (
+        'import os,sys,time; from pathlib import Path; '
+        'ready,release=map(Path,sys.argv[1:]); ready.write_text(str(os.getpid())); '
+        'end=time.monotonic()+30; '
+        'exec("while not release.exists() and time.monotonic()<end: time.sleep(.02)")'
+    )
+    leader_code = (
+        'import subprocess,sys,time; from pathlib import Path; '
+        'ready,leader_release,helper_release,pid_file=map(Path,sys.argv[1:]); '
+        f'helper=subprocess.Popen([sys.executable,"-c",{helper_code!r},str(ready),str(helper_release)]); '
+        'pid_file.write_text(str(helper.pid)); '
+        'end=time.monotonic()+5; '
+        'exec("while not ready.exists() and time.monotonic()<end: time.sleep(.02)"); '
+        'exec("while not leader_release.exists() and time.monotonic()<end: time.sleep(.02)")'
+    )
+    started = time.monotonic()
+    leader = subprocess.Popen([sys.executable, '-c', leader_code,
+        str(ready), str(leader_release), str(helper_release), str(pid_file)])
+    foreign = subprocess.Popen([sys.executable, '-c',
+        'import sys,time; from pathlib import Path; release=Path(sys.argv[1]); '
+        'end=time.monotonic()+15; '
+        'exec("while not release.exists() and time.monotonic()<end: time.sleep(.02)")',
+        str(foreign_release)])
+    result = {}
+    thread = None
+    helper_identity = None
+    try:
+        until = time.monotonic() + 2
+        while not ready.exists() and time.monotonic() < until:
+            time.sleep(.02)
+        helper_pid = int(pid_file.read_text())
+        attempt = _bind_started_os_worker(r.guard, r.task['task'], leader)
+        def supervise():
+            try:
+                result['code'] = item.wait_worker(r.guard, attempt, leader, started)
+            except BaseException as exc:
+                result['error'] = exc
+        thread = threading.Thread(target=supervise, daemon=True)
+        thread.start()
+        until = time.monotonic() + 2
+        while time.monotonic() < until:
+            if 'error' in result:
+                raise result['error']
+            if any(entry['pid'] == helper_pid for entry in
+                   r.guard.get(attempt['task']).get('worker_descendants', [])):
+                break
+            time.sleep(.02)
+        else:
+            pytest.fail('real helper not captured before stop')
+        leader_release.touch()
+        assert leader.wait(timeout=3) == 0
+        assert thread.is_alive()
+        import psutil
+        helper_identity = next(entry for entry in r.guard.get(attempt['task'])['worker_descendants']
+                               if entry['pid'] == helper_pid)
+        assert psutil.Process(helper_pid).create_time() == helper_identity['created']
+        assert psutil.Process(helper_pid).status() != psutil.STATUS_ZOMBIE
+        with r.guard.transaction() as rows:
+            batch = rows.grants['batches'][payload['batch']]
+            if stop_kind == 'budget':
+                batch['item']['budget']['todo_seconds'] = 0
+            else:
+                batch['revoked'] = True
+        with r.guard.transaction(read_only=True) as rows:
+            row = rows[attempt['task']]
+            assert (row['policy']['work_limit'] == 0 if stop_kind == 'budget'
+                    else row['policy']['revoked'] is True)
+        thread.join(timeout=12)
+        assert not thread.is_alive() and isinstance(result.get('error'), ValueError)
+        assert 'stopped by budget or revocation' in str(result['error'])
+        row = r.guard.get(attempt['task'])
+        proof = row['worker_supervision']
+        assert proof['state'] == 'unknown' and proof['accounted_seconds'] > 0
+        assert foreign.poll() is None
+        assert not dc.executor_released(row)
+        with r.guard.transaction(read_only=True) as rows:
+            spent = rows.grants['batches'][payload['batch']]['item']['work_seconds']
+        assert spent == proof['accounted_seconds']
+        with pytest.raises(ValueError, match='already recorded'):
+            item.wait_worker(r.guard, attempt, leader, started)
+        with r.guard.transaction(read_only=True) as rows:
+            assert rows.grants['batches'][payload['batch']]['item']['work_seconds'] == spent
+    finally:
+        leader_release.touch()
+        helper_release.touch()
+        foreign_release.touch()
+        if leader.poll() is None:
+            leader.wait(timeout=8)
+        if thread is not None:
+            thread.join(timeout=12)
+        if pid_file.exists() and helper_identity is not None:
+            import psutil
+            try:
+                owned = psutil.Process(int(pid_file.read_text()))
+                if owned.create_time() == helper_identity['created'] and owned.status() != psutil.STATUS_ZOMBIE:
+                    owned.terminate()
+                    try:
+                        owned.wait(timeout=3)
+                    except psutil.TimeoutExpired:
+                        owned.kill()
+                        owned.wait(timeout=3)
+            except psutil.NoSuchProcess:
+                pass
+        foreign.wait(timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_item_stop_authority_is_hydrated_from_persisted_grant(route, monkeypatch):
+    r = route
+    _, payload = await setup(r, monkeypatch)
+    item.control(r.guard, r.identity, payload)
+    register(r)
+    with r.guard.transaction(read_only=True) as rows:
+        original_limit = rows[r.task['task']]['policy']['work_limit']
+    with r.guard.transaction() as rows:
+        rows[r.task['task']]['policy'].update(work_limit=0, revoked=True)
+    with r.guard.transaction(read_only=True) as rows:
+        assert rows[r.task['task']]['policy']['work_limit'] == original_limit
+        assert rows[r.task['task']]['policy']['revoked'] is False
+    with r.guard.transaction() as rows:
+        batch = rows.grants['batches'][payload['batch']]
+        batch['item']['budget']['todo_seconds'] = 0
+        batch['revoked'] = True
+    with r.guard.transaction(read_only=True) as rows:
+        assert rows[r.task['task']]['policy']['work_limit'] == 0
+        assert rows[r.task['task']]['policy']['revoked'] is True
+
+
+@pytest.mark.asyncio
+async def test_started_item_unknown_cannot_use_integer_artifact_or_exit_consumers(route, monkeypatch):
+    r = route
+    _, payload = await setup(r, monkeypatch)
+    item.control(r.guard, r.identity, payload)
+    register(r)
+    with r.guard.transaction() as rows:
+        row = rows[r.task['task']]
+        row.update(worker_pid=987654321, worker_identity=dict(pid=987654321, start='old', executable='python'),
+                   worker_started_ns=1, child_identity=dict(pid=987654322, start='old', executable='python'),
+                   child_exited=True, claim_phase='claimed', visible_sent=True)
+    attempt = r.guard.get(r.task['task'])
+    Path(attempt['artifact']).write_text('present but unobserved')
+    evidence = {k: attempt[k] for k in ('task', 'generation', 'action', 'artifact')}
+    evidence.update(sha256=dc.digest(attempt['artifact']), result='ready_for_main_review', exit_code=0)
+    with pytest.raises(ValueError, match='operational exit'):
+        r.guard.record_worker_result(attempt, 0)
+    assert r.guard.observe(attempt['task'], attempt['generation'], 'unknown', evidence)
+    row = r.guard.get(attempt['task'])
+    assert row['gate'] == 'reconcile' and row['action'] != 'validate coding evidence'
+    assert not dc.executor_released(row)
+    for check in (dc.verify_prior_exit, dc.verify_restarted_reservation_exit, item.verify_completed_exit):
+        with pytest.raises(ValueError, match='operational exit'):
+            check(row)
+    with pytest.raises(ValueError, match='operational exit'):
+        dc.verify_direct_worker_exit(dict(row, direct_worker=True), completed=True)
+    from hermes_cli import diggr_successor
+    with pytest.raises(ValueError, match='operational exit'):
+        diggr_successor.verify_exit(row)
+    with pytest.raises(ValueError, match='operational exit'):
+        r.guard.record_worker_result(attempt, 0)  # replay cannot create exit evidence
+
+
+@pytest.mark.asyncio
+async def test_observer_does_not_complete_item_with_forged_result(route, monkeypatch):
+    r = route
+    _, payload = await setup(r, monkeypatch)
+    item.control(r.guard, r.identity, payload)
+    register(r)
+    with r.guard.transaction() as rows:
+        row = rows[r.task['task']]
+        row.update(worker_pid=987654321, worker_identity=dict(pid=987654321, start='old', executable='python'),
+                   worker_started_ns=1, child_identity=dict(pid=987654322, start='old', executable='python'),
+                   claim_phase='claimed', visible_sent=True, child_exited=True)
+        row['worker_result'] = dict(task=row['task'], generation=row['generation'],
+            artifact=row['artifact'], action_id=row['action_id'], effect_id=row['effect_id'],
+            exit_code=0, artifact_status='present', evidence=None)
+    dc.observe_processes(r.guard)
+    row = r.guard.get(r.task['task'])
+    assert row['gate'] == 'reconcile' and row['action'] != 'validate coding evidence'
+    assert not dc.executor_released(row)
+
+
+@pytest.mark.asyncio
+async def test_supervision_proof_stays_bound_to_one_item_attempt(route, monkeypatch):
+    r = route
+    _, payload = await setup(r, monkeypatch)
+    item.control(r.guard, r.identity, payload)
+    register(r)
+    with r.guard.transaction() as rows:
+        row = rows[r.task['task']]
+        row.update(worker_pid=987654321, worker_identity=dict(pid=987654321, start='old', executable='python'),
+                   worker_started_ns=1, child_identity=dict(pid=987654322, start='old', executable='python'),
+                   claim_phase='claimed', visible_sent=True)
+        row['worker_supervision'] = dict(
+            binding=dc.worker_supervision_binding(row), state='exited',
+            leader_exit_code=0, accounted_seconds=1)
+    attempt = r.guard.get(r.task['task'])
+    assert dc.worker_operational_exit(attempt)
+    assert not dc.worker_operational_exit(dict(attempt, child_identity=dict(pid=123, start='reused', executable='python')))
+    assert not dc.worker_operational_exit(dict(attempt, effect_id='stale'))
+    assert not dc.worker_operational_exit(dict(attempt, worker_supervision=dict(
+        attempt['worker_supervision'], state='unknown', reason='scan unavailable')))
+    with r.guard.transaction() as rows:
+        rows[attempt['task']]['effect_id'] = 'new-attempt'
+    with pytest.raises(ValueError, match='different attempt'):
+        r.guard.record_worker_result(attempt, 0)
 
 
 @pytest.mark.asyncio
@@ -4289,9 +5398,10 @@ async def test_v2_preflight_survives_time_spent_in_external_verification(route, 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("pre_candidate", [False, True])
-async def test_native_v2_review_recovery_preserves_changes_and_passes_real_route_preflight(route, monkeypatch, pre_candidate, exercise_transport=True):
+async def test_native_v2_review_recovery_preserves_changes_and_passes_real_route_preflight(route, monkeypatch, pre_candidate):
     r = route
-    contract, payload, request = await completed_candidate(r, monkeypatch)
+    cmux_attempts = _guard_real_cmux_subprocesses(monkeypatch)
+    contract, payload, request = await completed_candidate(r, monkeypatch, observed_v2=True)
     source = Path(payload['worktree']) / 'src' / 'code.txt'
     source.write_text('implementation to retain\n')
     git(payload['worktree'], 'add', 'src/code.txt')
@@ -4325,13 +5435,16 @@ async def test_native_v2_review_recovery_preserves_changes_and_passes_real_route
                  receipt=str(Path(contract['resources']['artifacts']) / 'correction-receipt.json'))
     artifact = str(Path(contract['resources']['artifacts']) / 'correction-result.txt')
     fresh['argv'][fresh['argv'].index('--output-last-message') + 1] = artifact
-    fresh['argv'][-1] = item.onboarding_payload()[0] + '\n\nCorrect only the album grouping finding; retain previous work'
+    from tests.diggr_owner_fixtures import assert_child_onboarding
+    correction_content, correction_dir = item.onboarding_payload()
+    previous_prompt = correction_content + '\n\nCorrect only the album grouping finding; retain previous work'
+    fresh['argv'][-1] = 'Executor instructions\n' + previous_prompt
+    assert fresh['argv'][-1] == 'Executor instructions\n' + previous_prompt
+    assert correction_content in fresh['argv'][-1]
+    assert not fresh['argv'][-1].startswith('-')
+    assert_child_onboarding(r.tmp, correction_content, correction_dir)
     strategy = dict(kind='review', reason='live test finding', hypothesis='preserve album grouping',
                     artifact=artifact, worker_route=fresh)
-    # Only OS/launcher history is synthetic. Git, scope, route, packet, argv,
-    # canonical launcher and preflight all run through their real functions.
-    monkeypatch.setattr(dc, 'verify_restarted_reservation_exit', lambda _: None)
-    monkeypatch.setattr(dc, 'verify_prior_exit', lambda *a, **kw: None)
     token = dc.EVENT_CONTEXT.set(dict(identity=r.identity))
     try:
         ticket = dc.maintenance_control(dict(operation='recover', wake=wake, evidence=report, strategy=strategy))
@@ -4341,43 +5454,55 @@ async def test_native_v2_review_recovery_preserves_changes_and_passes_real_route
     assert ticket == dc.worker_ticket(after)
     assert after['policy']['corrections'] == 1
     assert source.read_text() == 'implementation to retain\n'
+    assert git(payload['worktree'], 'show', ':src/code.txt') == 'implementation to retain'
+    assert dc._worktree_snapshot(payload['worktree']) == packet['retained_worktree_sha256']
     assert not after.get('worker_pid') and not after.get('visible_sent')
     assert item.status(r.guard, r.identity, payload['batch'], payload['issue'])['phase'] == 'coding'
-    if not exercise_transport:
-        return
-    # Complete the same recovered ticket through the real native seal, send
-    # reservation and claim code. Only external terminal I/O and Codex are fake.
+    # Complete the recovered ticket through native seal, send, claim and
+    # supervision. Terminal I/O, visible claim verification and Codex argv
+    # execution remain isolated external seams; no live TTY/cMux proof.
     route = after['worker_route']
+    content, directory = item.onboarding_payload()
+    assert directory == str((r.tmp / 'skills' / item.ONBOARDING_SKILL).resolve())
+    assert content in route['argv'][-1]
     assert dc.main(['--home', r.identity['home'], 'route-preflight', '--payload-json',
                     json.dumps(dict(ticket=ticket, route=route))]) == 0
     sealed = r.guard.get(after['task'])
     assert sealed['receipt_sha256'] == dc.digest(route['receipt'])
-    monkeypatch.setattr(item, 'require_onboarding_context', lambda: None)
     sent = []
-    monkeypatch.setattr(dc, 'cmux_send', lambda binding, command: sent.append(command))
+    monkeypatch.setattr(dc, 'cmux_send', lambda binding, command: sent.append((binding, command)))
     response = json.loads(dc.terminal_dispatch(
         dict(command='SYSTEM167_REGISTERED_WORKER', continuation_ticket=ticket),
         lambda _: pytest.fail('launcher must not start a second worker')))
-    assert response['sent'] is True and len(sent) == 1
+    assert response['sent'] is True
+    assert sent == [(after['visible_binding'], dc.visible_worker_command(ticket))]
     monkeypatch.setattr(dc, 'verify_visible_claim', lambda row: None)
-    monkeypatch.setattr(dc, 'process_identity', lambda pid: dict(pid=pid, start='fixture'))
-    original_popen = subprocess.Popen
-    spawned = []
-    class FinishedWorker:
-        pid = 45678
-        returncode = 0
-        def poll(self): return 0
-    def worker_popen(argv, *args, **kwargs):
-        if argv == route['argv']:
-            spawned.append(argv)
-            Path(artifact).write_text('scoped correction result')
-            return FinishedWorker()
-        return original_popen(argv, *args, **kwargs)
-    monkeypatch.setattr(subprocess, 'Popen', worker_popen)
-    assert dc.main(['--home', r.identity['home'], 'worker', '--payload-json', json.dumps(ticket)]) == 0
+    result, spawned = _run_observed_fixture_worker(
+        r.guard, ticket, route['argv'], artifact, monkeypatch,
+        output='scoped correction result')
+    assert result == 0
     claimed = r.guard.get(after['task'])
     assert claimed['claim_phase'] == 'claimed' and claimed['worker_pid']
     assert claimed['worker_result']['generation'] == ticket['generation'] and len(spawned) == 1
+    expected_generation = ticket['generation']
+    assert claimed['worker_supervision']['state'] == 'exited'
+    assert claimed['worker_supervision']['binding'] == dc.worker_supervision_binding(
+        claimed, expected_generation)
+    assert claimed['worker_result']['evidence']['generation'] == expected_generation
+    assert claimed['generation'] == expected_generation + 1
+    assert claimed['status'] == 'pending' and claimed['gate'] == 'main_validation'
+    assert claimed['worker_result']['exit_code'] == 0 and claimed['child_exited'] is True
+    assert claimed['worker_result']['evidence']['sha256'] == dc.digest(artifact)
+    assert claimed['worker_result']['action_id'] == after['action_id']
+    assert claimed['worker_result']['effect_id'] == after['effect_id']
+    assert claimed['child_identity']['pid'] > 0 and dc.worker_operational_exit(claimed)
+    assert dc.worker_operational_exit(claimed, expected_generation)
+    assert not dc.worker_operational_exit(claimed, claimed['generation'])
+    stale = copy.deepcopy(claimed)
+    stale['worker_supervision']['binding']['generation'] = expected_generation - 1
+    assert not dc.worker_operational_exit(stale, expected_generation)
+    assert Path(artifact).read_text() == 'scoped correction result'
     with pytest.raises(ValueError):
         dc.main(['--home', r.identity['home'], 'worker', '--payload-json', json.dumps(ticket)])
     assert len(spawned) == 1
+    assert cmux_attempts == [], 'parent/recovery attempted real cmux: ' + repr(cmux_attempts)

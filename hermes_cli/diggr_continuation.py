@@ -26,6 +26,44 @@ _NATIVE_PROVIDER_CORRECTION = object()
 RECEIVED_PROMPT_CLAIM_SECONDS = 660
 
 
+def worker_supervision_binding(row, generation=None):
+    """The native Item supervisor binds observations to one started attempt."""
+    return {key: row.get(key) for key in
+            ('task', 'action_id', 'effect_id', 'worker_pid', 'worker_identity', 'child_identity')} | {
+                'generation': row.get('generation') if generation is None else generation}
+
+
+def requires_worker_supervision(row):
+    # Historic non-Item workers and unsent/fenced attempts retain their own gates.
+    return bool(row.get('policy', {}).get('item_lifecycle') and
+                (row.get('claim_phase') == 'claimed' or any(row.get(key) for key in
+                    ('worker_pid', 'worker_identity', 'worker_started_ns', 'child_identity',
+                     'child_exited', 'worker_result', 'worker_supervision'))))
+
+
+def worker_operational_exit(row, generation=None):
+    if not requires_worker_supervision(row):
+        return True
+    proof = row.get('worker_supervision')
+    result = row.get('worker_result') or {}
+    if generation is None and isinstance(proof, dict):
+        generation = (proof.get('binding') or {}).get('generation')
+    return bool(isinstance(proof, dict) and proof.get('state') == 'exited' and
+                proof.get('binding') == worker_supervision_binding(row, generation) and
+                isinstance(row.get('worker_identity'), dict) and row.get('worker_pid') and
+                isinstance(row.get('child_identity'), dict) and
+                row['child_identity'].get('pid') and
+                type(proof.get('leader_exit_code')) is int and
+                type(proof.get('accounted_seconds')) in (int, float) and
+                not proof.get('reason') and
+                (not result or result.get('exit_code') == proof['leader_exit_code']))
+
+
+def require_worker_operational_exit(row, generation=None):
+    if not worker_operational_exit(row, generation):
+        raise ValueError('started Item worker operational exit is unknown')
+
+
 class Guard:
     def __init__(self, path, profile=None):
         self.profile = profile
@@ -319,6 +357,7 @@ class Guard:
             valid = (known_exit or
                      (self.evidence_matches(row, evidence) and evidence.get('result') == 'ready_for_main_review'
                       and evidence.get('exit_code', 0) == 0))
+            valid = valid and worker_operational_exit(row, generation)
             if not valid:
                 row['evidence'] = evidence
                 self.schedule_recovery(row, now, 'unknown or invalid worker outcome')
@@ -360,15 +399,18 @@ class Guard:
             if any(row.get(k) != attempt.get(k) for k in
                    ('worker_pid', 'worker_identity', 'action_id', 'effect_id', 'artifact')):
                 raise ValueError('worker result belongs to a different attempt')
+            if requires_worker_supervision(row):
+                require_worker_operational_exit(row, attempt['generation'])
+                if exit_code != row['worker_supervision']['leader_exit_code']:
+                    raise ValueError('worker result differs from supervised leader exit')
             previous = row.get('worker_result')
             if previous:
                 if any(previous.get(k) != result.get(k) for k in result if k != 'observed_at'):
                     raise ValueError('conflicting worker result')
                 return previous
             row.update(child_exited=True, worker_result=result)
-            if row.get('policy', {}).get('item_lifecycle'):
-                item = rows.grants['batches'][row['policy']['batch']]['item']
-                item['work_seconds'] += work_seconds
+            # Item time is charged by the supervisor, including its Unknown path.
+            # Non-Item workers have no cumulative Item allowance.
         return result
 
     def tick(self, identity, busy=False, now=None):
@@ -1026,7 +1068,7 @@ class Guard:
                 reconciliation_sha256=evidence['sha256'], effect_status=report['outcome']))
             for key in ('worker_pid', 'worker_identity', 'worker_started_ns', 'child_identity', 'child_exited',
                         'visible_sent', 'visible_sent_at', 'send_request_sha256', 'receipt_sha256', 'non_cmm_receipt_sha256', 'maintenance',
-                        'worker_result', 'worker_descendants'):
+                        'worker_result', 'worker_descendants', 'worker_supervision'):
                 row.pop(key, None)
             if row.get('logical_contract'):
                 row['launcher_command'] = logical_launcher_command(row['logical_contract'], route)
@@ -1494,6 +1536,7 @@ def verify_direct_worker_exit(row, *, completed=False):
     """A flow-v3 worker has a native visible claim and wait, no launcher handle."""
     if row.get('direct_worker') is not True:
         raise ValueError('direct worker proof requires an assigned route')
+    require_worker_operational_exit(row)
     result = row.get('worker_result') or {}
     completed_proof = (completed and row.get('visible_sent') is True and
         row.get('worker_pid') and row.get('child_exited') is True and
@@ -1526,6 +1569,7 @@ def verify_direct_worker_exit(row, *, completed=False):
 def verify_prior_exit(row, *, allow_idle_unclaimed=False):
     if row.get('direct_worker') is True:
         return verify_direct_worker_exit(row)
+    require_worker_operational_exit(row)
     for descendant in row.get('worker_descendants', []):
         if not identity_exited(descendant):
             raise ValueError('recorded Coding descendant still alive or identity unavailable')
@@ -1592,6 +1636,7 @@ def verify_restarted_reservation_exit(row):
 
     attempts = [row] + row.get('history', [])
     for attempt in attempts:
+        require_worker_operational_exit(attempt)
         for descendant in attempt.get('worker_descendants', []):
             if not identity_exited(descendant):
                 raise ValueError('recorded Coding descendant still alive or identity unavailable')
@@ -1856,6 +1901,7 @@ def process_observation_key(row):
     # A copied observer must not invalidate a newer send/claim in the same generation.
     return object_hash({k: row.get(k) for k in (
         'worker_pid', 'worker_identity', 'worker_started_ns', 'child_identity', 'child_exited',
+        'worker_supervision', 'worker_descendants', 'worker_result',
         'visible_sent', 'visible_sent_at', 'claim_phase', 'claim_deadline',
         'process_id', 'process_started_at', 'receipt_sha256', 'non_cmm_receipt_sha256',
         'handoff_generation', 'handoff_deadline')})
@@ -1870,6 +1916,8 @@ def target_reserved(row, target):
 def executor_released(row):
     """Release only the physical slot, never the candidate or logical Todo."""
     result = row.get('worker_result')
+    if not worker_operational_exit(row):
+        return False
     if (row.get('producer') != 'cmux' or not isinstance(result, dict) or
             type(result.get('exit_code')) is not int or not row.get('worker_pid') or
             not row.get('child_exited') or not row.get('child_identity') or
@@ -2980,7 +3028,7 @@ def register_assigned_worker(reference, session_id, coding_home, prompt):
                 worker_result=copy.deepcopy(current['worker_result']),
                 logical_contract=copy.deepcopy(current['logical_contract'])))
             for key in ('worker_pid', 'worker_identity', 'worker_started_ns', 'child_identity',
-                        'child_exited', 'worker_result', 'worker_descendants', 'visible_sent',
+                        'child_exited', 'worker_result', 'worker_descendants', 'worker_supervision', 'visible_sent',
                         'visible_sent_at', 'send_request_sha256', 'receipt_sha256',
                         'non_cmm_receipt_sha256', 'coordinator_delivery', 'evidence',
                         'late_evidence', 'recovery_kind', 'reason'):
@@ -3702,7 +3750,8 @@ def observe_processes(guard):
     for row in rows:
         snapshot = process_observation_key(row)
         if row.get('worker_result'):
-            guard.observe(row['task'], row['worker_result']['generation'], 'completed',
+            guard.observe(row['task'], row['worker_result']['generation'],
+                          'completed' if worker_operational_exit(row) else 'unknown',
                           process_snapshot=snapshot)
             continue
         if row.get('worker_pid'):

@@ -31,6 +31,46 @@ def test_completed_cmux_lane_releases_after_gateway_restart_only_with_exit_proof
 from tests.gateway.test_telegram_reply_quote import _make_adapter, _make_message
 
 
+def test_full_onboarding_fixture_does_not_read_host_source(tmp_path, monkeypatch):
+    import builtins
+    import io
+    import shutil
+    import yaml
+    from pathlib import Path
+    from tests.diggr_owner_fixtures import bind_full_onboarding_fixture
+
+    host_source = Path('/Users/diggr/Projects/diggr_claw/docs/skills/diggr-coding-loop-onboarding/SKILL.md').resolve()
+    fixture_source = Path(__file__).resolve().parents[1] / 'fixtures' / 'diggr-coding-loop-onboarding' / 'SKILL.md'
+    home = tmp_path / 'diggr-main'
+    home.mkdir()
+    (home / 'codex').mkdir()
+    (home / 'config.yaml').write_text(yaml.safe_dump(dict(diggr_continuation=dict(
+        enabled=True, profile='diggr-main', home=str(home.resolve())))))
+    for key, value in (('HOME', str(home)), ('HERMES_HOME', str(home)),
+                       ('CODEX_HOME', str(home / 'codex')), ('HERMES_PLATFORM', 'telegram')):
+        monkeypatch.setenv(key, value)
+
+    original_builtin_open = builtins.open
+    original_io_open = io.open
+
+    def deny_host_source(opener):
+        def guarded(path, *args, **kwargs):
+            if isinstance(path, (str, bytes, Path)) and Path(path).resolve() == host_source:
+                raise PermissionError('host onboarding source denied in test process')
+            return opener(path, *args, **kwargs)
+        return guarded
+
+    monkeypatch.setattr(builtins, 'open', deny_host_source(original_builtin_open))
+    monkeypatch.setattr(io, 'open', deny_host_source(original_io_open))
+    with pytest.raises(PermissionError, match='host onboarding source denied'):
+        host_source.read_text(encoding='utf-8')
+    with pytest.raises(PermissionError, match='host onboarding source denied'):
+        shutil.copyfile(host_source, home / 'denied-copy')
+
+    bind_full_onboarding_fixture(monkeypatch, home)
+    assert (home / 'skills' / 'diggr-coding-loop-onboarding' / 'SKILL.md').read_bytes() == fixture_source.read_bytes()
+
+
 def manifest(task, number=1, replaces=None):
     return dict(budgets=dict(owner.BUDGETS), replaces=replaces, todos=[dict(
         workspace_id='11111111-1111-4111-8111-111111111111',
@@ -40,15 +80,38 @@ def manifest(task, number=1, replaces=None):
 
 
 @pytest.fixture
-def route(tmp_path, monkeypatch):
+def route(tmp_path, monkeypatch, request):
+    full_onboarding = request.node.name in {
+        'test_native_v2_review_recovery_preserves_changes_and_passes_real_route_preflight[False]',
+        'test_native_v2_review_recovery_preserves_changes_and_passes_real_route_preflight[True]',
+    }
+    if full_onboarding:
+        import yaml
+        home = tmp_path / 'diggr-main'
+        home.mkdir()
+        for key, value in (('HOME', str(home)), ('HERMES_HOME', str(home)),
+                           ('CODEX_HOME', str(home / 'codex')),
+                           ('HERMES_PLATFORM', 'telegram')):
+            monkeypatch.setenv(key, value)
+        (home / 'codex').mkdir()
+        (home / 'config.yaml').write_text(yaml.safe_dump(dict(diggr_continuation=dict(
+            enabled=True, profile='diggr-main', home=str(home.resolve())))))
+        import gateway.run as gateway_run
+        monkeypatch.setattr(gateway_run, '_hermes_home', home)
+    else:
+        home = tmp_path
     clock = [1000.0]
     monkeypatch.setattr(dc.time, 'time', lambda: clock[0])
-    guard = dc.Guard(tmp_path / 'state.json')
-    monkeypatch.setattr(dc, 'runtime_guard', lambda home=None: guard)
+    guard = dc.Guard(home / 'state' / 'diggr-continuation.json', profile='diggr-main') if full_onboarding else dc.Guard(tmp_path / 'state.json')
+    if full_onboarding:
+        assert dc.runtime_guard(home).path == guard.path
+        assert dc.runtime_guard(home).profile == guard.profile
+    else:
+        monkeypatch.setattr(dc, 'runtime_guard', lambda home=None: guard)
     runner = object.__new__(GatewayRunner)
     runner.config = GatewayConfig()
-    runner._resolve_profile_home_for_source = lambda source: tmp_path
-    runner.session_store = SessionStore(tmp_path / 'sessions', runner.config)
+    runner._resolve_profile_home_for_source = lambda source: home
+    runner.session_store = SessionStore(home / 'sessions', runner.config)
     adapter = _make_adapter()
     adapter.gateway_runner = SimpleNamespace(_profile_name_for_source=lambda s: 'diggr-main')
     adapter._should_process_message = lambda *a, **kw: True
@@ -72,15 +135,18 @@ def route(tmp_path, monkeypatch):
         await adapter._handle_command(SimpleNamespace(effective_message=msg, update_id=seq[0]), None)
         return events[-1]
 
-    identity = dict(home=str(tmp_path), profile='diggr-main', platform='telegram',
+    identity = dict(home=str(home), profile='diggr-main', platform='telegram',
         chat_id=owner.OWNER, user_id=owner.OWNER, thread_id='', session='fixture', session_key='fixture')
     task = dict(task='display-name', scope='inspect disposable fixture', action='inspect',
-        owner='coding', gate='coding', artifact=str(tmp_path / 'out'), deadline=1100, wake_budget=10,
+        owner='coding', gate='coding', artifact=str(home / 'out'), deadline=1100, wake_budget=10,
         identity=identity, authorization='reference only')
-    from tests.diggr_owner_fixtures import bind_onboarded_agent_fixture
-    bind_onboarded_agent_fixture(monkeypatch)
+    from tests.diggr_owner_fixtures import bind_onboarded_agent_fixture, bind_full_onboarding_fixture
+    if full_onboarding:
+        bind_full_onboarding_fixture(monkeypatch, home)
+    else:
+        bind_onboarded_agent_fixture(monkeypatch)
     return SimpleNamespace(guard=guard, runner=runner, adapter=adapter, event=event,
-        identity=identity, task=task, clock=clock, tmp=tmp_path)
+        identity=identity, task=task, clock=clock, tmp=home)
 
 
 async def confirm(r, proposal=None):

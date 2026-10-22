@@ -146,48 +146,198 @@ def wait_worker(guard, attempt, child, started):
     allowance; stop/revocation terminates only captured child identities.
     """
     import psutil
+    from hermes_cli import diggr_continuation as dc
+
+    def same_attempt(row):
+        return (row.get('task') == attempt.get('task') and
+                all(row.get(k) == attempt.get(k) for k in
+                    ('action_id', 'effect_id', 'worker_pid', 'worker_identity')) and
+                (row.get('generation') == attempt.get('generation') or
+                 row.get('limit_generation') == attempt.get('generation')))
+
+    def authority_remaining(rows, row):
+        policy = row['policy']
+        batch = rows.grants['batches'][policy['batch']]
+        item = batch['item']
+        remaining = min(policy['work_limit'] - policy.get('work_seconds', 0),
+                        item['budget']['todo_seconds'] - item['work_seconds'])
+        permitted = (not policy['revoked'] and not batch['revoked'] and
+                     time.monotonic() - started < remaining and
+                     row.get('status') not in {'paused', 'cancelled', 'superseded', 'blocked'})
+        return permitted, remaining
+
     observed = {}
-    while child.poll() is None:
-        try:
-            children = psutil.Process(child.pid).children(recursive=True)
-            additions = {p.pid: p.create_time() for p in children}
-        except psutil.NoSuchProcess:
-            additions = {}
-        if any(observed.get(pid) != created for pid, created in additions.items()):
-            observed.update(additions)
-            with guard.transaction() as rows:
-                row = rows[attempt['task']]
-                row['worker_descendants'] = [dict(pid=pid, created=created) for pid, created in observed.items()]
-        with guard.transaction(read_only=True) as rows:
+    leader_code = None
+    reason = None
+    binding = None
+    try:
+        start_error = None
+        with guard.transaction() as rows:
             row = rows[attempt['task']]
-            policy = row['policy']
-            same = all(row.get(k) == attempt.get(k) for k in ('action_id', 'effect_id', 'worker_identity'))
-            remaining = policy['work_limit'] - policy.get('work_seconds', 0)
-            permitted = same and not policy['revoked'] and time.monotonic() - started < remaining
-        if not permitted:
-            owned = []
-            for pid, created in observed.items():
+            if not same_attempt(row):
+                raise ValueError('worker attempt changed before supervision')
+            if child.poll() is None and not row.get('child_identity'):
                 try:
-                    process = psutil.Process(pid)
-                    if process.create_time() == created:
-                        owned.append(process)
-                        process.terminate()
-                except psutil.NoSuchProcess:
-                    pass
-            child.terminate()
-            _, alive = psutil.wait_procs(owned, timeout=5)
-            for process in alive:
-                process.kill()  # psutil verifies PID reuse against its cached identity
+                    row['child_identity'] = dc.process_identity(child.pid)
+                except (OSError, ValueError, subprocess.SubprocessError):
+                    row['child_identity'] = None
+            binding = dc.worker_supervision_binding(row, attempt['generation'])
+            if row.get('worker_supervision'):
+                raise ValueError('worker supervision already recorded')
+            row['worker_supervision'] = dict(binding=binding, state='unobserved')
+            observed = {entry['pid']: entry['created'] for entry in row.get('worker_descendants', [])}
+            if child.poll() is not None:
+                start_error = 'worker leader exited before first successful scan; exit unknown'
+            elif not row.get('child_identity') or row['child_identity'].get('pid') != child.pid:
+                start_error = 'worker exit unknown: child identity unavailable'
+        if start_error:
+            raise ValueError(start_error)
+
+        while True:
+            with guard.transaction(read_only=True) as rows:
+                row = rows[attempt['task']]
+                if not same_attempt(row) or dc.worker_supervision_binding(row, attempt['generation']) != binding:
+                    raise ValueError('worker attempt changed during supervision')
+                permitted, remaining = authority_remaining(rows, row)
+                state = row['worker_supervision']['state']
+
+            leader_alive = child.poll() is None
+            if not leader_alive and leader_code is None:
+                leader_code = child.returncode
+            additions = {}
             try:
-                return child.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                child.kill()
-                return child.wait(timeout=5)
-        try:
-            return child.wait(timeout=min(1, max(.01, remaining - (time.monotonic() - started))))
-        except subprocess.TimeoutExpired:
-            continue
-    return child.returncode
+                if leader_alive:
+                    try:
+                        leader = psutil.Process(child.pid)
+                        actual = dc.process_identity(child.pid)
+                        if actual != binding['child_identity']:
+                            if child.poll() is None:
+                                raise ValueError('worker leader identity changed')
+                            leader_alive = False
+                        else:
+                            additions.update({p.pid: p.create_time() for p in leader.children(recursive=True)})
+                            if state == 'unobserved':
+                                with guard.transaction() as rows:
+                                    row = rows[attempt['task']]
+                                    if not same_attempt(row) or dc.worker_supervision_binding(row, attempt['generation']) != binding:
+                                        raise ValueError('worker attempt changed during first scan')
+                                    row['worker_supervision']['state'] = 'observing'
+                                state = 'observing'
+                    except (psutil.NoSuchProcess, subprocess.CalledProcessError):
+                        if child.poll() is None:
+                            raise ValueError('worker leader identity unavailable while running') from None
+                        leader_alive = False
+                    if not leader_alive:
+                        leader_code = child.returncode
+                if not leader_alive and state == 'unobserved':
+                    raise ValueError('worker leader exited before first successful scan')
+                live = {}
+                for pid, created in observed.items():
+                    try:
+                        process = psutil.Process(pid)
+                        if process.create_time() != created:
+                            raise ValueError('captured worker PID reused')
+                        if process.status() == psutil.STATUS_ZOMBIE:
+                            continue
+                        live[pid] = created
+                        additions.update({p.pid: p.create_time() for p in process.children(recursive=True)})
+                    except psutil.NoSuchProcess:
+                        continue
+                if additions:
+                    for pid, created in additions.items():
+                        if pid in observed and observed[pid] != created:
+                            raise ValueError('captured worker PID reused')
+                    new = {pid: created for pid, created in additions.items() if pid not in observed}
+                    if new:
+                        observed.update(new)
+                        with guard.transaction() as rows:
+                            row = rows[attempt['task']]
+                            if not same_attempt(row) or dc.worker_supervision_binding(row, attempt['generation']) != binding:
+                                raise ValueError('worker attempt changed during descendant capture')
+                            row['worker_descendants'] = [dict(pid=pid, created=created)
+                                                         for pid, created in observed.items()]
+                if not leader_alive and not live and not additions:
+                    if not permitted:
+                        raise ValueError('worker authority ended before operational exit')
+                    if not row.get('worker_identity') or not row.get('worker_pid'):
+                        raise ValueError('worker exit unknown: wrapper identity unavailable')
+                    with guard.transaction() as rows:
+                        row = rows[attempt['task']]
+                        if not same_attempt(row) or dc.worker_supervision_binding(row, attempt['generation']) != binding:
+                            raise ValueError('worker attempt changed before operational exit')
+                        if not authority_remaining(rows, row)[0]:
+                            raise ValueError('worker authority ended before operational exit')
+                        row['worker_supervision'].update(state='exited', leader_exit_code=leader_code)
+                    return leader_code
+                if not permitted:
+                    # Only identities captured and checked in this attempt may be signalled.
+                    for pid, created in observed.items():
+                        try:
+                            process = psutil.Process(pid)
+                            if process.create_time() != created:
+                                raise ValueError('captured worker PID reused during stop')
+                            if process.status() != psutil.STATUS_ZOMBIE:
+                                process.terminate()
+                        except psutil.NoSuchProcess:
+                            pass
+                    if leader_alive:
+                        child.terminate()
+                    deadline = time.monotonic() + 5
+                    while time.monotonic() < deadline:
+                        if child.poll() is None:
+                            try:
+                                child.wait(timeout=.1)
+                            except subprocess.TimeoutExpired:
+                                pass
+                        alive = []
+                        for pid, created in observed.items():
+                            try:
+                                process = psutil.Process(pid)
+                                if process.create_time() != created:
+                                    raise ValueError('captured worker PID reused during stop')
+                                if process.status() != psutil.STATUS_ZOMBIE:
+                                    alive.append(process)
+                            except psutil.NoSuchProcess:
+                                pass
+                        if child.poll() is not None and not alive:
+                            raise ValueError('worker stopped by budget or revocation')
+                        time.sleep(.05)
+                    for process in alive:
+                        process.kill()
+                    if child.poll() is None:
+                        child.kill()
+                    try:
+                        child.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        raise ValueError('worker leader remained alive after bounded stop') from None
+                    _, remaining_alive = psutil.wait_procs(alive, timeout=5)
+                    if remaining_alive:
+                        raise ValueError('captured worker remained alive after bounded stop')
+                    raise ValueError('worker stopped by budget or revocation')
+            except (psutil.Error, OSError) as exc:
+                raise ValueError('worker process inspection unavailable') from exc
+            if leader_alive:
+                try:
+                    child.wait(timeout=min(.25, max(.01, remaining - (time.monotonic() - started))))
+                except subprocess.TimeoutExpired:
+                    pass
+            else:
+                time.sleep(.1)
+    except BaseException as exc:
+        reason = str(exc) or type(exc).__name__
+        raise
+    finally:
+        elapsed = max(0, time.monotonic() - started)
+        with guard.transaction() as rows:
+            row = rows[attempt['task']]
+            if same_attempt(row) and binding and dc.worker_supervision_binding(row, attempt['generation']) == binding:
+                supervision = row.get('worker_supervision')
+                if supervision and supervision.get('binding') == binding:
+                    if reason and supervision['state'] not in {'exited', 'unknown'}:
+                        supervision.update(state='unknown', reason=reason[:300])
+                    if 'accounted_seconds' not in supervision:
+                        rows.grants['batches'][row['policy']['batch']]['item']['work_seconds'] += elapsed
+                        supervision['accounted_seconds'] = elapsed
 
 
 def git(repo, *args):
@@ -267,7 +417,8 @@ def status(guard, identity, batch_id, issue, *, include_worker_route=False, incl
         execution = dict(claimed=claimed, row_sha256=dc.object_hash(row) if task_id else None,
             **{k: row.get(k) for k in (
             'generation', 'status', 'gate', 'action', 'identity', 'reason', 'failure_evidence',
-            'claim_phase', 'worker_pid', 'worker_identity', 'action_id', 'effect_id', 'worker_result')})
+            'claim_phase', 'worker_pid', 'worker_identity', 'action_id', 'effect_id',
+            'worker_result', 'worker_supervision')})
         policy = row.get('policy') or {}
         limit_generation = row.get('limit_generation')
         turn = (row.get('coordinator_turns') or {}).get(str(limit_generation), {})

@@ -96,3 +96,68 @@ def bind_onboarded_agent_fixture(monkeypatch):
     monkeypatch.setattr(subagent_lifecycle, 'get_active_subagent_parent', lambda: actor)
     item.observe_onboarding_request(actor, {'messages': [{'role': 'system', 'content': text}]})
     return actor
+
+
+def bind_full_onboarding_fixture(monkeypatch, home):
+    """Opt-in full skill and synthetic host context for the V2 recovery fixture.
+
+    The file is loaded by the ordinary profile-scoped loader. Only the host
+    agent context is synthetic; native onboarding observation and gate remain.
+    This does not prove operational skill loading or a live terminal binding.
+    """
+    import hashlib
+    import shutil
+    from agent import subagent_lifecycle
+    from agent.skill_utils import _raw_config_cache_clear
+    from hermes_cli import diggr_item as item
+
+    # Source: diggr_claw/docs/skills/diggr-coding-loop-onboarding/SKILL.md,
+    # untracked (no source revision); Andi authorized inclusion under target MIT.
+    # Original byte SHA-256: bafca3efaacb50c78258ff1315e97eed79777a96fa39e03ee67f04cbbcfbac6b.
+    source = Path(__file__).resolve().parent / 'fixtures' / 'diggr-coding-loop-onboarding' / 'SKILL.md'
+    assert source.is_file() and source.read_text(encoding='utf-8').startswith(
+        '---\nname: diggr-coding-loop-onboarding\n')
+    skill = home / 'skills' / item.ONBOARDING_SKILL / 'SKILL.md'
+    skill.parent.mkdir(parents=True)
+    shutil.copyfile(source, skill)
+    _raw_config_cache_clear()
+    content, directory = item.onboarding_payload()
+    assert directory == str(skill.parent.resolve())
+    assert content == source.read_text(encoding='utf-8').strip()
+    assert item.required_profile_skills()[0] == item.ONBOARDING_SKILL
+    actor = SimpleNamespace(session_id='onboarded-v2-fixture')
+    monkeypatch.setattr(subagent_lifecycle, 'get_active_subagent_parent', lambda: actor)
+    item.observe_onboarding_request(actor, {'messages': [{'role': 'system', 'content': content}]})
+    assert actor._diggr_onboarding_request == (
+        str(home.resolve()), actor.session_id, directory,
+        hashlib.sha256(content.encode()).hexdigest())
+    item.require_onboarding_context()
+    assert_child_onboarding(home, content, directory)
+    return actor
+
+
+def assert_child_onboarding(home, content, directory):
+    """Check the normal loader in a fresh process before a native V2 transition."""
+    import hashlib
+    import os
+    import subprocess
+    import sys
+
+    script = '''
+import hashlib, sys
+from pathlib import Path
+from hermes_constants import get_hermes_home
+from hermes_cli import diggr_item as item
+content, directory = item.onboarding_payload()
+assert get_hermes_home().resolve() == Path(sys.argv[1]).resolve()
+assert directory == sys.argv[2]
+assert hashlib.sha256(content.encode()).hexdigest() == sys.argv[3]
+assert item.required_profile_skills()[0] == item.ONBOARDING_SKILL
+'''
+    env = dict(PATH=os.environ.get('PATH', ''),
+               PYTHONPATH=str(Path(__file__).resolve().parents[1]),
+               HOME=str(home), HERMES_HOME=str(home), CODEX_HOME=str(home / 'codex'),
+               HERMES_PLATFORM='telegram', PYTHONDONTWRITEBYTECODE='1')
+    subprocess.run([sys.executable, '-B', '-c', script, str(home), directory,
+                    hashlib.sha256(content.encode()).hexdigest()],
+                   env=env, check=True, timeout=10)
