@@ -77,3 +77,22 @@ def authorize(guard, task):
     # asyncio.run has its own Context; bind explicitly in the synchronous caller.
     bind_native_transport_fixture(task['identity'])
     return result
+
+
+def bind_onboarded_agent_fixture(monkeypatch):
+    """Synthetic host/model context for tests of other native lifecycle gates.
+
+    Only discovery and the host agent are fixtures. The real provider-context
+    observer and actual onboarding gate remain enabled. Loader/turn integration
+    is exercised separately by test_diggr_onboarding.
+    """
+    from types import SimpleNamespace
+    from agent import subagent_lifecycle
+    from hermes_cli import diggr_item as item
+    actor = SimpleNamespace(session_id='onboarded-lifecycle-fixture')
+    text = 'Complete synthetic onboarding for native lifecycle fixtures.'
+    monkeypatch.setattr(item, 'required_profile_skills', lambda: (item.ONBOARDING_SKILL,))
+    monkeypatch.setattr(item, 'onboarding_payload', lambda: (text, '/synthetic/onboarding'))
+    monkeypatch.setattr(subagent_lifecycle, 'get_active_subagent_parent', lambda: actor)
+    item.observe_onboarding_request(actor, {'messages': [{'role': 'system', 'content': text}]})
+    return actor

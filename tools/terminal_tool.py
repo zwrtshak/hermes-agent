@@ -2792,6 +2792,7 @@ def terminal_tool(
         if os.environ.get("_HERMES_GATEWAY") == "1":
             from cron.lifecycle_guard import (
                 _MAX_REFERENCED_SCRIPT_BYTES,
+                _is_canonical_python_read,
                 contains_gateway_lifecycle_command_or_referenced_script,
                 contains_launchctl_submit_command,
             )
@@ -2807,6 +2808,10 @@ def terminal_tool(
                     ),
                     "status": "error",
                 }, ensure_ascii=False)
+            # Config may have changed since this cached environment was
+            # created. Only the concrete local implementation proves locality;
+            # names, callbacks and backend-supplied attributes do not.
+            guard_is_local = type(env) is _LocalEnvironment
             guard_cwd_base = get_session_cwd(session_key)
             if guard_cwd_base is None:
                 guard_cwd_base = getattr(env, "cwd", None) or cwd
@@ -2818,11 +2823,11 @@ def terminal_tool(
             )
 
             def _read_script_in_env(script_path: str) -> Optional[str]:
-                """Best-effort script read; uses env.execute only when local read fails.
+                """Bounded script read in the explicitly selected backend.
 
                 For local backends the script path is on the host filesystem. For
-                SSH/Modal/Daytona the same path is remote; the local read misses, so we
-                fall back to a bounded ``env.execute('head -c ... < path')`` read.
+                SSH/Modal/Daytona must read remotely even if a same-named local
+                file exists; that host file cannot establish remote safety.
                 """
                 if env is None:
                     return None
@@ -2830,7 +2835,7 @@ def terminal_tool(
                     local_path = Path(script_path).expanduser()
                     if not local_path.is_absolute():
                         local_path = Path(guard_cwd) / local_path
-                    if local_path.is_file():
+                    if guard_is_local and local_path.is_file():
                         metadata = local_path.stat()
                         if stat.S_ISREG(metadata.st_mode) and metadata.st_size <= _MAX_REFERENCED_SCRIPT_BYTES:
                             data = local_path.read_bytes()
@@ -2876,16 +2881,57 @@ def terminal_tool(
                 command,
                 cwd=guard_cwd,
                 read_remote_script=_read_script_in_env,
+                is_local=guard_is_local,
             ):
+                diagnostic_hint = (
+                    "This backend has no canonical Python read exemption; "
+                    "do not substitute a local interpreter path for a remote diagnostic. "
+                )
+                if guard_is_local:
+                    try:
+                        interpreter = Path(sys.executable).resolve(strict=True)
+                        if not interpreter.is_file():
+                            raise OSError("canonical interpreter is not a regular file")
+                        diagnostic_hint = (
+                            "For a local Python read diagnostic, use foreground "
+                            "execution (background=false) with `"
+                            + shlex.quote(str(interpreter))
+                            + " -I -S - <<'PY'` followed by a supported straight-line pathlib/JSON read "
+                            "program (SHA-256: import hashlib; hashlib.sha256(path.read_bytes()).hexdigest()) "
+                            "and a closing `PY` line, as the entire command. "
+                            "Loops, wrappers, pipes and redirects are not eligible. "
+                        )
+                    except (OSError, RuntimeError, ValueError):
+                        diagnostic_hint = (
+                            "The canonical local Python interpreter could not be resolved; "
+                            "no diagnostic invocation can be recommended. "
+                        )
                 return json.dumps({
                     "output": "",
                     "exit_code": 1,
                     "error": (
-                        "Blocked: command or referenced script cannot restart or stop "
-                        "the gateway from inside the gateway process. The gateway would "
-                        "kill this command before it could complete (SIGTERM propagates "
-                        "to child processes). Run `hermes gateway restart` from a "
-                        "separate shell outside the running gateway."
+                        "Blocked: command or referenced script contains gateway control "
+                        "or could not be established as safe by the conservative lifecycle scan. "
+                        + diagnostic_hint
+                        + "Actual gateway stop/restart remains blocked inside the gateway; "
+                        "perform intended gateway control from a separate shell outside it."
+                    ),
+                    "status": "error",
+                }, ensure_ascii=False)
+
+            # The exemption preserves stdin only through foreground execution.
+            # Background dispatch uses config, so a cached local env can reach
+            # either registry route; reject before both, even with force/PTY.
+            if background and guard_is_local and _is_canonical_python_read(command) is True:
+                return json.dumps({
+                    "output": "",
+                    "exit_code": 1,
+                    "error": (
+                        "Blocked: the canonical local Python read exemption inside "
+                        "the gateway is foreground-only. Run this diagnostic with "
+                        "background=false. Background command preparation can change "
+                        "the verified Python input; force=true and pty=true do not "
+                        "enable this exemption for background execution."
                     ),
                     "status": "error",
                 }, ensure_ascii=False)
@@ -3832,7 +3878,16 @@ TERMINAL_SCHEMA['parameters']['properties']['continuation_proposal'] = {
                 'gates': {'type': 'array', 'items': {'type': 'string'},
                           'description': 'Exactly owner_confirmed, native_checks, prior_done in that order.'}
             }, 'required': ['workspace_id', 'project_id', 'issue_id', 'contract', 'depends_on', 'gates'], 'additionalProperties': False}},
-        'replaces': {'type': ['string', 'null']}
+        'replaces': {'oneOf': [
+            {'type': ['string', 'null']},
+            {'type': 'object', 'properties': {
+                'batch': {'type': 'string', 'pattern': '^[0-9a-f]{64}$'},
+                'task': {'type': 'string', 'minLength': 1, 'maxLength': 160},
+                'generation': {'type': 'integer', 'minimum': 1},
+                'core_sha256': {'type': 'string', 'pattern': '^[0-9a-f]{64}$'},
+                'accept_unknown': {'const': True}},
+             'required': ['batch', 'task', 'generation', 'core_sha256', 'accept_unknown'],
+             'additionalProperties': False}]}
     }, 'required': ['budgets', 'todos', 'replaces'], 'additionalProperties': False
 }
 
@@ -3842,7 +3897,7 @@ TERMINAL_SCHEMA['parameters']['properties']['continuation_ticket'] = {
 }
 # Additive grant form. The existing exact route contract remains a separate branch.
 _logical_properties = {
-    'version': {'type': 'string', 'enum': ['logical-v1']},
+    'version': {'type': 'string', 'enum': ['logical-v1', 'logical-v2']},
     'scope': {'type': 'string'}, 'action': {'type': 'string'},
     'owner': {'type': 'string', 'enum': ['coding']},
     'gate': {'type': 'string', 'enum': ['coding']},
@@ -3867,7 +3922,7 @@ _logical_properties = {
     }, 'required': ['owner', 'criteria', 'main_live_required'], 'additionalProperties': False},
     'model': {'type': 'object', 'properties': {
         'executor': {'type': 'string', 'enum': ['codex']},
-        'required_model': {'type': 'string', 'enum': ['gpt-6-astra']},
+        'required_model': {'type': 'string', 'pattern': '^[a-z][a-z0-9]*(?:[.-][a-z0-9]+)*(?![\\s\\S])'},
         'provider': {'type': 'string', 'pattern': '^[a-zA-Z0-9_-]+$'},
         'fallback_models_allowed': {'type': 'array', 'maxItems': 0},
         'reasoning_effort': {'type': 'string', 'enum': ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']},
@@ -3880,13 +3935,13 @@ _todo_properties = TERMINAL_SCHEMA['parameters']['properties']['continuation_pro
 _todo_properties['contract'] = {'anyOf': [_todo_properties['contract'], {
     'type': 'object', 'properties': _logical_properties,
     'required': list(_logical_properties), 'additionalProperties': False,
-}], 'description': 'Existing unversioned exact grants stay exact. New logical-v1 grants bind repo/resource roots, literal relative path scope/no-touch, role actions, acceptance and Astra/provider. Prompt and attempt paths are concretized later within this authenticated envelope; no new personal hash confirmation for technical binding.'}
+}], 'description': 'Existing unversioned exact grants stay exact. New logical-v1/logical-v2 grants bind repo/resource roots, literal relative path scope/no-touch, role actions, acceptance and an explicit Codex model/provider. Prompt and attempt paths are concretized later within this authenticated envelope; no new personal hash confirmation for technical binding.'}
 
 TERMINAL_SCHEMA['parameters']['properties']['continuation_control'] = {
     'type': 'object',
-    'description': 'Bound native Main maintenance; command must be SYSTEM168_CONTINUATION_CONTROL. No shell execution. authorize/revoke/failure/recover/retire require the originating native Main event; recover may use its exact unexpired one-use maintenance grant. Retirement only discharges proven terminal ownership, never success or dispatch.',
+    'description': 'Bound native Main maintenance; command must be SYSTEM168_CONTINUATION_CONTROL. No shell execution. authorize/revoke/failure/reconcile_failed/recover/retire require the originating native Main event; recover may use its exact unexpired one-use maintenance grant. failure may truthfully bind a missing result or an unchanged present result of an item review correction. reconcile_failed binds a fresh hashed diagnosis with row_sha256, true worker_result and observations to that same failed attempt, verifies actual exit and queues only reconciliation within existing budgets. recover requires a hashed packet route and an effect outcome of no_effect or reconciled; reconciled needs separate effect_proof. Retirement only discharges proven terminal ownership, never success or dispatch.',
     'properties': {
-        'operation': {'type': 'string', 'enum': ['authorize', 'revoke', 'failure', 'recover', 'retire']},
+        'operation': {'type': 'string', 'enum': ['authorize', 'revoke', 'failure', 'reconcile_failed', 'recover', 'retire']},
         'wake': {'type': 'object', 'properties': {
             'task': {'type': 'string'}, 'generation': {'type': 'integer', 'minimum': 1}
         }, 'required': ['task', 'generation']},
@@ -3903,6 +3958,101 @@ TERMINAL_SCHEMA['parameters']['properties']['continuation_control'] = {
         'identity': {'type': 'object'}
     },
     'required': ['operation', 'wake']
+}
+# Item operations share the existing authenticated native bridge, not a new tool.
+_legacy_control = TERMINAL_SCHEMA['parameters']['properties']['continuation_control']
+_item_control = {
+    'type': 'object',
+    'properties': {
+        'operation': {'type': 'string', 'enum': [
+            'item_status', 'item_prepare', 'item_prepare_readback', 'item_prepare_resume', 'item_preparation_blocked', 'item_preparation_resolve', 'item_preparation_assignment_recover', 'item_migration_preview', 'item_migration_rollback_preview', 'item_assignment_renew_preview', 'item_candidate', 'item_build_readback',
+            'item_test_result', 'item_publish_check', 'item_pr', 'item_review',
+            'item_merge_check', 'item_closeout', 'item_return', 'item_followup_prepare',
+            'item_scope_amend', 'item_assignment_rebind']},
+        'batch': {'type': 'string'}, 'issue': {'type': 'string'},
+        'include_worker_route': {'type': 'boolean', 'description':
+            'item_status only: return the exact registered worker_route, including every argv byte, '
+            'for bound native recovery. Default false; do not reconstruct argv from preparation files.'},
+        'include_runtime': {'type': 'boolean', 'description':
+            'item_status only: attest this Gateway turn\'s loaded terminal schema and onboarding hash. '
+            'Compare against the staged install bundle; default false.'},
+        'added_path': {'type': 'string', 'description':
+            'item_scope_amend only: the one exact Owner-approved APP-105 adjacent test file.'},
+        'owner_message_id': {'type': 'integer', 'minimum': 1, 'description':
+            'item_scope_amend only: persisted original Telegram Owner approval message row.'},
+        'row_sha256': {'type': 'string', 'description':
+            'item_scope_amend/item_assignment_rebind: current item_status execution row hash.'},
+        'assignment': {'type': 'string', 'description':
+            'item_assignment_rebind only: same accepted, unstarted APP-105 correction assignment ID.'},
+        'worktree': {'type': 'string'}, 'branch': {'type': 'string'}, 'base': {'type': 'string'},
+        'target': {'type': 'object', 'properties': {
+            'workspace': {'type': 'string'}, 'surface': {'type': 'string'}},
+            'required': ['workspace', 'surface'], 'additionalProperties': False},
+        'steps': {'type': 'array', 'minItems': 1, 'items': {'type': 'object',
+            'properties': {'action': {'type': 'string'}, 'expected': {'type': 'string'},
+                           'kind': {'type': 'string', 'enum': ['ui', 'track_playback']}},
+            'required': ['action', 'expected'], 'additionalProperties': False}},
+        'build_argv': {'type': 'array', 'minItems': 1, 'items': {'type': 'string'}},
+        'build_path': {'type': 'string'}, 'candidate_id': {'type': 'string'},
+        'result': {'type': 'string', 'enum': ['passed', 'failed']},
+        'checks': {'type': 'array', 'minItems': 1, 'items': {'type': 'string'}},
+        'findings': {'type': 'array', 'minItems': 1, 'items': {'type': 'string'}},
+        'pr_number': {'type': 'integer', 'minimum': 1},
+        'main_worktree': {'type': 'string'}, 'nextcloud_path': {'type': 'string'},
+        **{name: _legacy_control['properties']['evidence']
+           for name in ('assessment', 'evidence', 'review_run', 'smoke', 'archive')},
+    },
+    'required': ['operation', 'batch', 'issue'], 'additionalProperties': False,
+}
+_coding_control = {
+    'type': 'object',
+    'description': 'Coding only: continue one previously accepted native assignment. The runtime builds the route and sends the visible worker once.',
+    'properties': {
+        'operation': {'type': 'string', 'enum': ['item_continue']},
+        'assignment': {'type': 'string'},
+        'prompt': {'type': 'string'},
+    },
+    'required': ['operation', 'assignment', 'prompt'],
+    'additionalProperties': False,
+}
+TERMINAL_SCHEMA['parameters']['properties']['continuation_control'] = {
+    'description': ('SYSTEM168_CONTINUATION_CONTROL in authenticated Main. Legacy maintenance remains unchanged. '
+        'New logical-v2: item_prepare reserves before creating the worktree; registration consumes it. '
+        'item_candidate validates native result plus hashed Main assessment and builds a source-bound test card. '
+        'Only a direct authenticated owner /continuation accept CANDIDATE grants PR publication. '
+        'Use item_publish_check before signed commit/push/PR, item_pr for fresh readback, item_review for '
+        'independent exact-head evidence, item_merge_check before merge, item_closeout after actual merge, '
+        'current-main smoke and Accepted/Nextcloud readback. Missing or failed facts retain the lane. '
+        'item_status reads one item without expiry; include_worker_route=true explicitly returns '
+        'its exact registered argv for recovery. include_runtime=true returns the responding Gateway '
+        'schema and onboarding hashes. item_prepare_readback never re-sends work. '
+        'item_preparation_blocked takes batch, issue, evidence={path,sha256}; JSON evidence binds '
+        'batch, issue, reason and observations. Holds automatic preparation follow-up, never releases the lane. '
+        'item_preparation_resolve takes the same evidence reference in a direct original Owner/Main turn; '
+        'JSON binds batch, issue, decision=replace_missing_documentation_with_repo_evidence, '
+        'blocker_evidence, owner_message_id, observations, and three worktree sources with roles '
+        'architecture/producer/consumer and relative paths. Native verification computes the contract, '
+        'Owner message and source hashes; supplied hashes are checked if present. No new batch or wake. '
+        'item_preparation_assignment_recover is a separate direct Owner/Main path for one expired Flow-v3 '
+        'preparation delivery with no response, artifacts, task or worker. It requires the current hashed '
+        'blocker, zero work, the unchanged clean registered worktree and proven old Coordinator exit; it '
+        'archives the blocked unoffered assignment and creates exactly one pending assignment for the same '
+        'reservation with a bounded technical window. It never creates a batch/worktree or resets budgets. '
+        'item_scope_amend reads one persisted, context-bound Owner approval from the original Telegram '
+        'session in a fresh direct Owner/Main turn; it adds only the approved APP-105 neighboring test '
+        'after proven Worker exit. It keeps the original contract and result unchanged, spends no budget '
+        'and starts no worker. Supply added_path, owner_message_id and current row_sha256. '
+        'item_assignment_rebind requires a direct Owner/Main turn, the same accepted unstarted APP-105 '
+        'correction assignment, proven old Coding process exit and one new canonical Coding process. '
+        'It retains the assignment ID and budgets and leaves delivery to the existing one-send gateway tick. '
+        'Supply assignment and fresh row_sha256. If the original executor workspace vanished, target may '
+        'bind only the same surface in a new workspace with an idle shell after proven old shell exit; '
+        'the completed Worker route remains unchanged. '
+        'item_assignment_renew_preview is read-only and requires an expired accepted migration or '
+        'preparation-recovered assignment, proven prior Coding process exit, unchanged bound worktree '
+        'and no registered worker; its exact '
+        '/continuation assignment-renew BATCH HASH command needs a new direct native Owner message.'),
+    'anyOf': [_legacy_control, _item_control, _coding_control],
 }
 TERMINAL_SCHEMA['parameters']['properties']['continuation'] = {
     'type': 'object',
@@ -3929,7 +4079,7 @@ TERMINAL_SCHEMA['parameters']['properties']['continuation'] = {
     'required': ['owner_batch', 'owner_issue', 'launcher_command', 'producer', 'task',
                  'scope', 'owner', 'gate', 'action', 'artifact', 'deadline',
                  'wake_budget', 'authorization', 'worker_route'],
-    'description': 'Persisted native owner grant required: owner_batch and owner_issue (workspace/project/issue UUID path). No executor authorization text can mint authority. Explicit authorized Main task: task, scope, owner, gate, action, artifact (new absolute output), deadline, wake_budget, authorization, producer=cmux. Native event binds identity; background=true required. cmux requires worker_route with absolute packet, receipt, worktree, branch, plane_id, visible_target (exact workspace and surface UUIDs) and authorized argv (codex exec --model matching packet). For a confirmed logical-v1 grant the packet must repeat logical_resources, acceptance and role_actions exactly and coding_route must match the approved model contract. Use hermes_cli.diggr_continuation.logical_launcher_command(contract, route) for the sole canonical dispatcher command; arbitrary shell text is rejected. Explicit -c model_provider, model_reasoning_effort and approval_policy must match the logical grant. No task field can mint logical rights. cmux send exit is never worker completion.'
+    'description': 'Persisted native owner grant required: owner_batch and owner_issue (workspace/project/issue UUID path). No executor authorization text can mint authority. Explicit authorized Main task: task, scope, owner, gate, action, artifact (new absolute output), deadline, wake_budget, authorization, producer=cmux. Native event binds identity; background=true required. cmux requires worker_route with absolute packet, receipt, worktree, branch, plane_id, visible_target (exact workspace and surface UUIDs) and authorized argv (codex exec --model matching packet). For a confirmed logical-v1/logical-v2 grant the packet must repeat logical_resources, acceptance and role_actions exactly and coding_route must match the approved model contract. Use hermes_cli.diggr_continuation.logical_launcher_command(contract, route) for the sole canonical dispatcher command; arbitrary shell text is rejected. Explicit -c model_provider, model_reasoning_effort and approval_policy must match the logical grant. logical-v2 additionally requires packet coding_lane and consumes the pre-worktree item reservation. No task field can mint logical rights. cmux send exit is never worker completion.'
 }
 
 
