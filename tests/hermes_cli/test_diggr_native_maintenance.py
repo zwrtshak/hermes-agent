@@ -180,10 +180,10 @@ def test_real_terminal_schema_to_retirement_handler(rig):
     schema = registry.get_schema('terminal')['parameters']
     assert set(payload) <= set(schema['properties'])
     control = schema['properties']['continuation_control']
-    assert control['type'] == 'object'
-    assert 'retire' in control['properties']['operation']['enum']
-    assert set(control['required']) <= set(payload['continuation_control'])
-    assert set(control['properties']['wake']['required']) <= set(wake)
+    import jsonschema
+    jsonschema.validate(payload['continuation_control'], control)
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate({'operation': 'retire'}, control)
     native = Mock(side_effect=AssertionError('no shell execution'))
     r.monkeypatch.setattr(terminal, '_diggr_terminal_native', native)
     assert json.loads(registry.get_entry('terminal').handler(payload)) is True

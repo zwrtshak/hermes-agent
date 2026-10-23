@@ -15,6 +15,43 @@ from tests.gateway.test_telegram_reply_quote import _make_adapter, _make_message
 
 
 EVENT_IDS = itertools.count(1)
+TEST_REQUIRED_SKILLS_MANIFEST = (
+    Path(__file__).resolve().parent / 'fixtures' / 'diggr-required-skills' / 'required_skills.py').resolve()
+TEST_REQUIRED_SKILLS = ('diggr-coding-loop-onboarding',)
+
+
+def deny_external_onboarding_sources(monkeypatch=None):
+    """Process-local read guard for the two former absolute test dependencies."""
+    import builtins
+    import importlib.machinery
+    import io
+    forbidden = {
+        Path('/Users/diggr/Projects/diggr_claw/ops/scripts/required_skills.py').resolve(),
+        Path('/Users/diggr/Projects/diggr_claw/docs/skills/diggr-coding-loop-onboarding/SKILL.md').resolve(),
+    }
+
+    def wrap(opener):
+        def guarded(path, *args, **kwargs):
+            if isinstance(path, (str, bytes, Path)) and Path(path).resolve() in forbidden:
+                raise PermissionError('external onboarding source denied in test process')
+            return opener(path, *args, **kwargs)
+        return guarded
+
+    def bind(obj, name, value):
+        if monkeypatch is None:
+            setattr(obj, name, value)
+        else:
+            monkeypatch.setattr(obj, name, value)
+
+    bind(builtins, 'open', wrap(builtins.open))
+    bind(io, 'open', wrap(io.open))
+    original_get_data = importlib.machinery.SourceFileLoader.get_data
+    def guarded_get_data(loader, path):
+        if Path(path).resolve() in forbidden:
+            raise PermissionError('external onboarding source denied in test process')
+        return original_get_data(loader, path)
+    bind(importlib.machinery.SourceFileLoader, 'get_data', guarded_get_data)
+    return forbidden
 
 async def authorize_async(guard, task):
     # Reused row fixtures describe new explicit requests, not native routing state.
@@ -77,3 +114,112 @@ def authorize(guard, task):
     # asyncio.run has its own Context; bind explicitly in the synchronous caller.
     bind_native_transport_fixture(task['identity'])
     return result
+
+
+def bind_onboarded_agent_fixture(monkeypatch):
+    """Synthetic host/model context for tests of other native lifecycle gates.
+
+    Only discovery and the host agent are fixtures. The real provider-context
+    observer and actual onboarding gate remain enabled. Loader/turn integration
+    is exercised separately by test_diggr_onboarding.
+    """
+    from types import SimpleNamespace
+    from agent import subagent_lifecycle
+    from hermes_cli import diggr_item as item
+    actor = SimpleNamespace(session_id='onboarded-lifecycle-fixture')
+    text = 'Complete synthetic onboarding for native lifecycle fixtures.'
+    monkeypatch.setattr(item, 'required_profile_skills', lambda: (item.ONBOARDING_SKILL,))
+    monkeypatch.setattr(item, 'onboarding_payload', lambda: (text, '/synthetic/onboarding'))
+    monkeypatch.setattr(subagent_lifecycle, 'get_active_subagent_parent', lambda: actor)
+    item.observe_onboarding_request(actor, {'messages': [{'role': 'system', 'content': text}]})
+    return actor
+
+
+def bind_full_onboarding_fixture(monkeypatch, home):
+    """Opt-in full skill and synthetic host context for the V2 recovery fixture.
+
+    The file is loaded by the ordinary profile-scoped loader. Only the host
+    agent context is synthetic; native onboarding observation and gate remain.
+    This does not prove operational skill loading or a live terminal binding.
+    """
+    import hashlib
+    import shutil
+    from agent import subagent_lifecycle
+    from agent.skill_utils import _raw_config_cache_clear
+    from hermes_cli import diggr_item as item
+
+    deny_external_onboarding_sources(monkeypatch)
+    assert TEST_REQUIRED_SKILLS_MANIFEST.is_file()
+    monkeypatch.setattr(item, 'REQUIRED_SKILLS_MANIFEST', TEST_REQUIRED_SKILLS_MANIFEST)
+    assert item.REQUIRED_SKILLS_MANIFEST == TEST_REQUIRED_SKILLS_MANIFEST
+
+    # Source: diggr_claw/docs/skills/diggr-coding-loop-onboarding/SKILL.md,
+    # untracked (no source revision); Andi authorized inclusion under target MIT.
+    # Original byte SHA-256: bafca3efaacb50c78258ff1315e97eed79777a96fa39e03ee67f04cbbcfbac6b.
+    source = Path(__file__).resolve().parent / 'fixtures' / 'diggr-coding-loop-onboarding' / 'SKILL.md'
+    assert source.is_file() and source.read_text(encoding='utf-8').startswith(
+        '---\nname: diggr-coding-loop-onboarding\n')
+    skill = home / 'skills' / item.ONBOARDING_SKILL / 'SKILL.md'
+    skill.parent.mkdir(parents=True)
+    shutil.copyfile(source, skill)
+    _raw_config_cache_clear()
+    content, directory = item.onboarding_payload()
+    assert directory == str(skill.parent.resolve())
+    assert content == source.read_text(encoding='utf-8').strip()
+    assert item.required_profile_skills() == TEST_REQUIRED_SKILLS
+    actor = SimpleNamespace(session_id='onboarded-v2-fixture')
+    monkeypatch.setattr(subagent_lifecycle, 'get_active_subagent_parent', lambda: actor)
+    item.observe_onboarding_request(actor, {'messages': [{'role': 'system', 'content': content}]})
+    assert actor._diggr_onboarding_request == (
+        str(home.resolve()), actor.session_id, directory,
+        hashlib.sha256(content.encode()).hexdigest())
+    item.require_onboarding_context()
+    assert_child_onboarding(home, content, directory, TEST_REQUIRED_SKILLS_MANIFEST)
+    return actor
+
+
+def assert_child_onboarding(home, content, directory, manifest_path=TEST_REQUIRED_SKILLS_MANIFEST):
+    """Check the normal loader in a fresh process before a native V2 transition."""
+    import hashlib
+    import os
+    import subprocess
+    import sys
+
+    script = '''
+import hashlib, importlib.machinery, shutil, sys
+from pathlib import Path
+from hermes_constants import get_hermes_home
+from hermes_cli import diggr_item as item
+from tests.diggr_owner_fixtures import (deny_external_onboarding_sources,
+                                        TEST_REQUIRED_SKILLS, TEST_REQUIRED_SKILLS_MANIFEST)
+forbidden = deny_external_onboarding_sources()
+for path in forbidden:
+    for probe in (lambda: path.read_bytes(),
+                  lambda: importlib.machinery.SourceFileLoader('denied', str(path)).get_data(str(path)),
+                  lambda: shutil.copyfile(path, Path(sys.argv[1]) / 'denied-copy')):
+        try:
+            probe()
+        except PermissionError:
+            pass
+        else:
+            raise AssertionError('external source read unexpectedly permitted: ' + str(path))
+item.REQUIRED_SKILLS_MANIFEST = Path(sys.argv[4]).resolve()
+assert item.REQUIRED_SKILLS_MANIFEST == TEST_REQUIRED_SKILLS_MANIFEST
+assert Path(item.__file__).resolve().is_relative_to(Path(sys.argv[5]).resolve())
+assert item.REQUIRED_SKILLS_MANIFEST.is_relative_to(Path(sys.argv[5]).resolve())
+content, directory = item.onboarding_payload()
+assert get_hermes_home().resolve() == Path(sys.argv[1]).resolve()
+assert directory == sys.argv[2]
+assert hashlib.sha256(content.encode()).hexdigest() == sys.argv[3]
+assert item.required_profile_skills() == TEST_REQUIRED_SKILLS
+print('CHILD_ONBOARDING_PATHS ' + str(Path(item.__file__).resolve()) + ' ' +
+      str(item.REQUIRED_SKILLS_MANIFEST) + ' ' + directory, flush=True)
+'''
+    env = dict(PATH=os.environ.get('PATH', ''),
+               PYTHONPATH=str(Path(__file__).resolve().parents[1]),
+               HOME=str(home), HERMES_HOME=str(home), CODEX_HOME=str(home / 'codex'),
+               HERMES_PLATFORM='telegram', PYTHONDONTWRITEBYTECODE='1')
+    subprocess.run([sys.executable, '-B', '-c', script, str(home), directory,
+                    hashlib.sha256(content.encode()).hexdigest(), str(manifest_path),
+                    str(Path(__file__).resolve().parents[1])],
+                   env=env, check=True, timeout=10)

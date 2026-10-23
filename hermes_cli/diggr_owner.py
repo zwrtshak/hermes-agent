@@ -9,6 +9,7 @@ import hashlib
 import secrets
 import time
 import uuid
+import copy
 from dataclasses import dataclass
 
 BUDGETS = dict(todo_seconds=3600, batch_seconds=7200, wakes=10, recoveries=2, corrections=2)
@@ -34,6 +35,41 @@ def contract(task):
 CODING_ACTIONS = {'inspect', 'edit', 'test', 'review', 'document_work_item', 'commit', 'push', 'pr_update'}
 MAIN_ACTIONS = CODING_ACTIONS | {'merge', 'smoke', 'plane_update', 'nextcloud_update'}
 LOGICAL_VERSION = 'logical-v1'
+ITEM_VERSION = 'logical-v2'
+LOGICAL_VERSIONS = {LOGICAL_VERSION, ITEM_VERSION}
+
+
+def codex_cli_provider(logical_provider):
+    """Resolve a confirmed Hermes provider to its Codex CLI config name."""
+    providers = {'openai': 'openai', 'openai-codex': 'openai'}
+    try:
+        return providers[logical_provider]
+    except (KeyError, TypeError):
+        raise ValueError('unsupported Codex CLI provider') from None
+
+
+def supported_codex_model(value):
+    """Model identifiers are data; the confirmed contract pins the exact choice."""
+    import re
+    return isinstance(value, str) and bool(re.fullmatch(r'[a-z][a-z0-9]*(?:[.-][a-z0-9]+)*', value))
+
+
+def configured_coding_model(identity):
+    """Read the Coding profile only while forming a new Owner preview."""
+    from pathlib import Path
+    import yaml
+    home = Path(identity['home'])
+    path = home.parent / 'diggr-coding' / 'config.yaml'
+    if not path.is_file():
+        if home.parent.name == 'profiles':
+            raise ValueError('Coding profile model configuration unavailable')
+        return None  # Disposable non-profile test homes have no sibling Coding profile.
+    config = yaml.safe_load(path.read_text(encoding='utf-8')) or {}
+    model = (config.get('model') or {}).get('default')
+    effort = (config.get('agent') or {}).get('reasoning_effort')
+    if not supported_codex_model(model) or effort not in {'low', 'medium', 'high', 'xhigh', 'max', 'ultra'}:
+        raise ValueError('Coding profile requires a supported model and reasoning effort')
+    return model, effort
 
 
 def _strict_object(value, keys):
@@ -46,7 +82,7 @@ def validate_logical_contract(value):
     import re
     if (not _strict_object(value, ('version', 'scope', 'action', 'owner', 'gate', 'producer',
                                   'plane_id', 'resources', 'actions', 'acceptance', 'model')) or
-            value['version'] != LOGICAL_VERSION or value['producer'] != 'cmux' or
+            value['version'] not in LOGICAL_VERSIONS or value['producer'] != 'cmux' or
             value['owner'] != 'coding' or value['gate'] != 'coding' or
             any(not isinstance(value[k], str) or not value[k].strip() for k in ('scope', 'action')) or
             not isinstance(value['plane_id'], str) or
@@ -78,20 +114,69 @@ def validate_logical_contract(value):
                 any(not isinstance(a, str) or a not in allowed for a in rights) or len(set(rights)) != len(rights)):
             raise ValueError('explicit supported role actions required')
     acceptance = value['acceptance']
-    if (not _strict_object(acceptance, ('owner', 'criteria', 'main_live_required')) or
+    if (not isinstance(acceptance, dict) or
+            not {'owner', 'criteria', 'main_live_required'} <= set(acceptance) or
+            set(acceptance) - {'owner', 'criteria', 'main_live_required', 'publication', 'mode',
+                               'required_test_kinds'} or
+            acceptance.get('publication', 'allowed') not in {'allowed', 'test_only'} or
+            acceptance.get('mode', 'manual') not in {'manual', 'automatic'} or
             acceptance['owner'] not in {'main', 'user'} or type(acceptance['main_live_required']) is not bool or
             not isinstance(acceptance['criteria'], list) or not acceptance['criteria'] or
             any(not isinstance(c, str) or not c.strip() for c in acceptance['criteria'])):
         raise ValueError('explicit acceptance ownership and criteria required')
+    if value['version'] != ITEM_VERSION and ({'mode', 'required_test_kinds'} & set(acceptance)):
+        raise ValueError('automatic acceptance is only supported for logical-v2 items')
+    if value['version'] == ITEM_VERSION:
+        if (set(actions['coding']) & {'commit', 'push', 'pr_update'} or
+                acceptance['owner'] != 'user' or not acceptance['main_live_required']):
+            raise ValueError('logical-v2 requires Main publishing and owner acceptance before PR')
+        if acceptance.get('mode') == 'automatic' and acceptance.get('publication') == 'test_only':
+            raise ValueError('automatic mode cannot override a test-only publication hold')
+        kinds = acceptance.get('required_test_kinds')
+        if acceptance.get('mode') == 'automatic':
+            if (not isinstance(kinds, list) or not kinds or
+                    any(not isinstance(kind, str) or kind not in {'ui', 'track_playback'}
+                        for kind in kinds) or
+                    len(kinds) != len(set(kinds))):
+                raise ValueError('automatic mode requires owner-approved test kinds')
+        elif 'required_test_kinds' in acceptance:
+            raise ValueError('test kinds require automatic mode')
+        if not {'test', 'review', 'commit', 'push', 'pr_update', 'merge', 'smoke',
+                'plane_update', 'nextcloud_update'} <= set(actions['main']):
+            raise ValueError('logical-v2 requires the complete Main lifecycle rights before owner confirmation')
     model = value['model']
     if (not _strict_object(model, ('executor', 'required_model', 'provider', 'fallback_models_allowed',
                                   'reasoning_effort', 'sandbox', 'approval_policy')) or
-            model['executor'] != 'codex' or model['required_model'] != 'gpt-6-astra' or
+            model['executor'] != 'codex' or not supported_codex_model(model['required_model']) or
             model['fallback_models_allowed'] != [] or model['sandbox'] != 'workspace-write' or
             model['approval_policy'] != 'never' or
-            not isinstance(model['provider'], str) or not re.fullmatch(r'[a-zA-Z0-9_-]+', model['provider']) or
             model['reasoning_effort'] not in {'low', 'medium', 'high', 'xhigh', 'max', 'ultra'}):
-        raise ValueError('explicit supported Astra/provider contract required')
+        raise ValueError('explicit supported Codex model/provider contract required')
+    codex_cli_provider(model['provider'])
+
+
+def prevalidate_resources(manifest):
+    """New proposals only. Never tighten a confirmed grant during admission."""
+    from pathlib import Path, PurePosixPath
+    from hermes_cli.diggr_continuation import logical_packet_root
+    for todo in manifest['todos']:
+        scope = todo['contract']
+        if scope.get('version') not in LOGICAL_VERSIONS:
+            continue
+        resources = scope['resources']
+        roots = {k: Path(resources[k]).resolve() for k in ('repo', 'worktrees', 'artifacts')}
+        packet = logical_packet_root()
+        artifacts = roots['artifacts']
+        if not (artifacts.is_relative_to(packet) or packet.is_relative_to(artifacts)):
+            raise ValueError('artifacts and canonical routing packet root need a common possible subtree')
+        if any(path == Path(path.anchor) or path == Path.home().resolve() for path in roots.values()):
+            raise ValueError('bounded task resource root required')
+        if any(path.exists() and not path.is_dir() for path in (*roots.values(), packet)):
+            raise ValueError('logical resource roots must permit directories')
+        # Every permitted change below a forbidden ancestor is impossible.
+        if all(any(PurePosixPath(path).is_relative_to(PurePosixPath(no)) for no in resources['no_touch'])
+               for path in resources['allowed_paths']):
+            raise ValueError('all allowed paths are excluded by No-Touch')
 
 
 @dataclass(frozen=True)
@@ -118,13 +203,21 @@ class NativeInput:
 def stamp_telegram(event, message, update):
     """Called only after Telegram adapter allowlist checks, before dispatch."""
     user = getattr(message, 'from_user', None)
-    if (not user or getattr(user, 'is_bot', True) or message.chat.type != 'private' or
-            any(getattr(message, k, None) for k in ('forward_origin', 'forward_from', 'forward_from_chat',
-                'quote', 'reply_to_message', 'external_reply', 'via_bot', 'sender_chat', 'edit_date')) or
-            any(getattr(e, 'type', '') in {'blockquote', 'expandable_blockquote', 'code', 'pre'}
-                for e in (getattr(message, 'entities', None) or [])) or
-            type(update) is not int or update < 0 or not message.text or
-            message.text != event.text):
+    reason = None
+    if not user or getattr(user, 'is_bot', True) or message.chat.type != 'private':
+        reason = 'sender or private chat is not eligible'
+    elif any(getattr(message, k, None) for k in ('forward_origin', 'forward_from', 'forward_from_chat',
+            'quote', 'reply_to_message', 'external_reply', 'via_bot', 'sender_chat', 'edit_date')):
+        reason = 'forward, reply, quote or edited message is not direct owner input'
+    elif any(getattr(e, 'type', '') in {'blockquote', 'expandable_blockquote', 'code', 'pre'}
+             for e in (getattr(message, 'entities', None) or [])):
+        reason = 'code or quote formatting is not direct owner input'
+    elif type(update) is not int or update < 0:
+        reason = 'Telegram update identity is unavailable'
+    elif not message.text or message.text != event.text:
+        reason = 'Telegram text changed before admission'
+    if reason:
+        event._diggr_native_input_rejection = reason
         return
     event._diggr_native_input = NativeInput(message.text, str(message.chat.id), str(user.id),
                                            str(message.message_id), update,
@@ -139,8 +232,34 @@ def verify_input(event, identity):
             proof.text != event.text or proof.chat != identity['chat_id'] or
             proof.user != identity['user_id'] or proof.message != str(event.message_id) or
             proof.update != event.platform_update_id):
-        raise ValueError('direct authenticated native owner message required')
+        raise ValueError('direct authenticated native owner message required: '
+                         + input_failure_reason(event, identity))
     return str(proof.update) + ':' + proof.message
+
+
+def input_failure_reason(event, identity):
+    """Describe a failed direct-input proof without exposing identity values."""
+    rejected = getattr(event, '_diggr_native_input_rejection', None)
+    if rejected:
+        return rejected
+    proof = getattr(event, '_diggr_native_input', None)
+    if type(proof) is not NativeInput:
+        return 'native Telegram input proof is absent'
+    if getattr(event, 'internal', False):
+        return 'internal event cannot supply direct owner authority'
+    if identity.get('profile') not in {'diggr-main', 'mira'} or identity.get('platform') != 'telegram':
+        return 'tool session is not a Telegram Main owner session'
+    if identity.get('chat_id') != OWNER or identity.get('user_id') != OWNER:
+        return 'tool session does not match the configured owner'
+    if proof.thread != identity.get('thread_id'):
+        return 'Telegram topic differs from the tool session'
+    if proof.text != event.text:
+        return 'Telegram text changed before the tool call'
+    if proof.chat != identity.get('chat_id') or proof.user != identity.get('user_id'):
+        return 'Telegram sender differs from the tool session'
+    if proof.message != str(event.message_id) or proof.update != event.platform_update_id:
+        return 'Telegram message identity changed before the tool call'
+    return 'direct owner input proof is unavailable in this tool context'
 
 
 def validate_manifest(manifest):
@@ -161,45 +280,530 @@ def validate_manifest(manifest):
         if todo['gates'] != ['owner_confirmed', 'native_checks', 'prior_done']:
             raise ValueError('owner, native and prior completion gates required')
         scope = todo['contract']
-        if isinstance(scope, dict) and scope.get('version') == LOGICAL_VERSION:
+        if isinstance(scope, dict) and scope.get('version') in LOGICAL_VERSIONS:
             validate_logical_contract(scope)
+            if scope['version'] == ITEM_VERSION and len(manifest['todos']) != 1:
+                raise ValueError('logical-v2 authorizes exactly one serial item')
         elif (not isinstance(scope, dict) or
                 set(scope) != {'scope', 'action', 'owner', 'gate', 'producer', 'worker_route', 'launcher_command'} or
                 not scope['scope'] or not scope['action']):
             raise ValueError('exact execution scope/action/route required')
         seen.add(key)
-    if manifest['replaces'] is not None and not isinstance(manifest['replaces'], str):
+    from hermes_cli.diggr_successor import validate
+    validate(manifest)
+    if manifest['replaces'] is not None and not isinstance(manifest['replaces'], (str, dict)):
         raise ValueError('explicit prior batch reference required for reauthorization')
 
 
-def propose(guard, identity, manifest):
+def propose(guard, identity, manifest, *, transport=None):
+    if transport is not None:
+        from hermes_cli import diggr_delivery as delivery
+        if transport != delivery.native_transport(identity):
+            raise ValueError('native preview transport required')
+    with guard.transaction() as rows:
+        return _store_proposal(rows, identity, manifest, transport=transport)
+
+
+def _store_proposal(rows, identity, manifest, *, transport=None):
+    """Trusted gateway storage primitive; callers establish native origin first.
+
+    Normal model calls use propose's native context guard. The scoped technical
+    endpoint resolves its configured server-owned origin without impersonating
+    a Telegram input. Neither path creates a grant.
+    """
+    manifest = copy.deepcopy(manifest)
+    logical = (isinstance(manifest, dict) and isinstance(manifest.get('todos'), list) and
+               any(isinstance(todo, dict) and isinstance(todo.get('contract'), dict) and
+                   todo['contract'].get('version') in LOGICAL_VERSIONS for todo in manifest['todos']))
+    selected = configured_coding_model(identity) if logical else None
+    if selected is not None:
+        for todo in manifest['todos']:
+            contract = todo.get('contract') if isinstance(todo, dict) else None
+            if (isinstance(contract, dict) and contract.get('version') in LOGICAL_VERSIONS and
+                    isinstance(contract.get('model'), dict)):
+                contract['model']['required_model'], contract['model']['reasoning_effort'] = selected
     validate_manifest(manifest)
-    # Roundtrip detaches executor-owned mutable dictionaries.
     manifest = json.loads(canonical(manifest))
     digest = hashlib.sha256(canonical(manifest).encode()).hexdigest()
-    with guard.transaction() as rows:
-        proposals = rows.grants.setdefault('proposals', {})
-        proposal = dict(owner=stable_owner(identity), manifest=manifest)
-        if digest in proposals and any(proposals[digest][k] != v for k, v in proposal.items()):
-            raise ValueError('proposal owner conflict')
-        proposals.setdefault(digest, proposal)
+    proposals = rows.grants.setdefault('proposals', {})
+    proposal = dict(owner=stable_owner(identity), manifest=manifest)
+    if digest in proposals and any(proposals[digest][k] != v for k, v in proposal.items()):
+        raise ValueError('proposal owner conflict')
+    if digest in proposals and transport is not None:
+        check_proposal_origin(rows, proposals[digest], identity, transport)
+    if digest not in proposals:
+        from hermes_cli.diggr_successor import check
+        check(rows, manifest, identity)
+        from hermes_cli.diggr_item import prepared_replacement
+        preparation = prepared_replacement(rows, manifest, identity)
+        if not (preparation and preparation['scope_amendment']):
+            check_issue_overlap(rows, manifest, stable_owner(identity))
+        proposal['prepared_replacement'] = binding_hash(preparation) if preparation else None
+        proposal['scope_amendment'] = bool(preparation and preparation['scope_amendment'])
+        # New Coding Loop grants keep Git publishing with Main. Leave
+        # already-confirmed grants and their exact rights untouched.
+        for todo in manifest['todos']:
+            contract = todo['contract']
+            if (contract.get('version') in LOGICAL_VERSIONS and
+                    set(contract['actions']['coding']) & {'commit', 'push', 'pr_update'}):
+                raise ValueError('new logical Coding grant cannot publish Git changes')
+        prevalidate_resources(manifest)
+        if transport is not None:
+            from hermes_cli import diggr_delivery as delivery
+            if (identity['platform'] != 'telegram' or identity['profile'] not in delivery.PROFILES or
+                    identity['chat_id'] != OWNER or identity['user_id'] != OWNER or transport['chat_type'] != 'dm'):
+                raise ValueError('private native owner preview required')
+            proposal.update(coordinator_identity=json.loads(canonical(identity)),
+                            native_transport=json.loads(canonical(transport)), requested_at=time.time(),
+                            preview=new_preview(digest, manifest, proposal['scope_amendment']))
+    # Repeating a model call never adopts legacy rows, resets expiry or renews grants.
+    proposals.setdefault(digest, proposal)
     return digest
+
+
+def check_issue_overlap(rows, manifest, owner):
+    """Reject a card that could not pass the same batch confirmation check."""
+    from hermes_cli.diggr_continuation import operator_archive_matches, prelaunch_retirement_matches
+    replacement = manifest['replaces']
+    replaces = replacement['batch'] if isinstance(replacement, dict) else replacement
+    keys = {issue_key(todo) for todo in manifest['todos']}
+    for bid, old in rows.grants.get('batches', {}).items():
+        if old['owner'] != owner:
+            continue
+        overlap = keys & {issue_key(todo) for todo in old['manifest']['todos']}
+        if (overlap and bid != replaces and not old.get('replaced_by') and
+                not all(operator_archive_matches(rows.get(old.get('tasks', {}).get(issue), {})) or
+                        prelaunch_retirement_matches(rows.get(old.get('tasks', {}).get(issue), {}))
+                        for issue in overlap)):
+            raise ValueError('same logical work requires explicit reauthorization of prior batch')
+
+
+def check_proposal_origin(rows, proposal, identity, transport):
+    """A stable owner is not permission to inspect another native session."""
+    from hermes_cli.diggr_delivery import same_transport
+    if proposal['owner'] != stable_owner(identity):
+        raise ValueError('proposal owner conflict')
+    batch = rows.grants.get('batches', {}).get(proposal.get('batch'), {})
+    shown = proposal.get('shown', {})
+    for bound_identity, bound_transport in (
+        (proposal.get('coordinator_identity'), proposal.get('native_transport')),
+        (batch.get('coordinator_identity'), batch.get('native_transport')),
+        (shown.get('identity'), shown.get('transport')),
+    ):
+        if ((bound_identity and bound_identity != identity) or
+                (bound_transport and not same_transport(bound_transport, transport))):
+            raise ValueError('proposal belongs to a different native session or transport')
+
+
+def proposal_result(guard, identity, digest, transport):
+    """Read-only snapshot; reporting never renews, adopts, sends or admits work."""
+    from hermes_cli import diggr_delivery as delivery
+    with guard.transaction(read_only=True) as rows:
+        p = rows.grants['proposals'][digest]
+        check_proposal_origin(rows, p, identity, transport)
+        now = time.time()
+        pv = p.get('preview', {})
+        batch = rows.grants.get('batches', {}).get(p.get('batch'))
+        state = current_preview_state(rows, p, now)
+        send = pv.get('send', 'unbound')
+        # Match delivery's deadlines even before its next tick, without changing
+        # the durable reservation or risking another original send.
+        if send == 'sending' and now >= pv['send_due']:
+            send = 'uncertain'
+        elif send == 'pending' and now >= p['requested_at'] + delivery.DELIVERY_SECONDS:
+            send = 'failed'
+        ui = 'pending' if pv else 'unbound'
+        if pv and pv['state'] == state:
+            if pv['ui_applied'] == pv['ui_revision']:
+                ui = 'applied'
+            elif pv['ui_attempts'] >= delivery.MAX_ATTEMPTS:
+                ui = 'failed'
+        result = dict(proposal_sha256=digest, proposal_state=state, preview_send=send, preview_ui=ui)
+        fallback = ('Owner kann im selben nativen Chat ausdrücklich /continuation show ' + digest +
+                    ' senden und danach die angezeigte Textbestätigung verwenden.')
+        if batch:
+            turn = batch.get('coordinator_delivery', {})
+            result.update(batch_id=p['batch'], admitted_tasks=len(batch['tasks']),
+                          coordinator_status=turn.get('status', 'unbound'), batch_deadline=batch['deadline'],
+                          batch_expired=batch['deadline'] is not None and now >= batch['deadline'])
+        if state == 'revoked':
+            status, message, step = state, 'Vorschlag oder Batch widerrufen.', (
+                'Keine weitere Ausführung. Bestehende Arbeit abgleichen; neue Autorisierung nur ausdrücklich.')
+        elif state == 'confirmed':
+            status, message, step = state, 'Bestätigt. Freigabe allein belegt weder Workerstart noch Zustellung.', (
+                'Vorhandenen Batch und Taskstatus prüfen; nur innerhalb der bestehenden nativen Gates fortsetzen. '
+                'Keine zweite Freigabe und keinen zusätzlichen Start aus dieser Wiederholung ableiten.')
+            if (result['batch_expired'] or result['coordinator_status'] in {'uncertain', 'suppressed', 'exhausted', 'unbound'} or
+                    (turn.get('status') in {'pending', 'queued', 'accepted'} and now >= turn['deadline'])):
+                step = ('Bestehenden Batch und Tasks ausdrücklich abgleichen; keine automatische Wiederholung '
+                        'oder Budgetverlängerung. Diese Antwort erteilt keine neue Ausführungsberechtigung.')
+        elif state == 'declined':
+            status, message, step = state, 'Abgelehnt. Keine Freigabe erteilt.', (
+                'Entscheidung beibehalten; erneute Autorisierung nur nach ausdrücklicher Owner-Anweisung.')
+        elif state == 'expired':
+            status, message, step = state, 'Vorschau abgelaufen. Keine Freigabe erteilt.', (
+                'Owner muss die bestehende Vorschau ausdrücklich erneuern und danach erneut freigeben.')
+            if ui == 'failed':
+                step = fallback
+        elif not pv:
+            status, message, step = 'legacy_unbound', 'Altvorschlag ohne automatische Button-Vorschau.', fallback
+        elif send in {'uncertain', 'failed'}:
+            status = 'native_preview_' + send
+            message = ('Vorschauversand unklar; kein automatischer Neuversand.' if send == 'uncertain' else
+                       'Vorschau konnte innerhalb der Versandfrist nicht zugestellt werden.')
+            step = fallback
+        elif state == 'open':
+            status, message, step = state, 'Vorschau vorhanden; Freigabe offen.', (
+                'Owner kann die vorhandene Vorschau mit Freigeben/Ablehnen entscheiden; keine neue Vorschau anfordern.')
+            if ui == 'failed':
+                message, step = 'Vorschau gebunden, Button-Aktualisierung fehlgeschlagen.', fallback
+        else:
+            status, message, step = 'native_preview_pending', 'Nativer Vorschauversand ausstehend; keine Freigabe erteilt.', (
+                'Die native Vorschau abwarten. Bei Versandfehler oder unklarem Ausgang den expliziten Textpfad nutzen; '
+                'keinen Originalsend wiederholen.')
+        return dict(result, status=status, message=message, next_step=step)
+
+
+PREVIEW_SECONDS = 300
+MAX_CALLBACKS = 32
+_CALLBACK_SEAL = object()
+
+
+def preview_text(manifest, scope_amendment=False):
+    """Plain text, with every authority field visible; no executor Markdown."""
+    lines = ['Begrenzter Coding-Auftrag', 'Unveränderlicher Freigabevertrag; aktueller Status separat.']
+    for todo in manifest['todos']:
+        scope = todo['contract']
+        lines.append('Todo: ' + issue_key(todo))
+        if scope.get('version') in LOGICAL_VERSIONS:
+            lines += [f"Aufgabe: {scope['action']}", f"Scope: {scope['scope']} ({scope['plane_id']})",
+                      f"Rolle/Gate: {scope['owner']}/{scope['gate']}; Executor: {scope['producer']}"]
+            for key, label in (('repo', 'Repo'), ('worktrees', 'Worktrees'), ('artifacts', 'Artefakte'),
+                               ('allowed_paths', 'Erlaubte Pfade'), ('no_touch', 'No-Touch')):
+                lines.append(label + ': ' + canonical(scope['resources'][key]))
+            lines += ['Coding-Rechte: ' + ', '.join(scope['actions']['coding']),
+                      'Main-Rechte: ' + ', '.join(scope['actions']['main']),
+                      'Merge: ' + ('JA (nur Main)' if 'merge' in scope['actions']['main'] else 'NEIN'),
+                      'Modell / kein Fallback: ' + canonical(scope['model']),
+                      'Abnahme: ' + canonical(scope['acceptance'])]
+            if scope['version'] == ITEM_VERSION:
+                lines += ['Item bleibt bis Abschluss/Widerruf belegt; kein Ablauf durch bloße Wartezeit.',
+                          'todo_seconds begrenzt kumulative Worker-Laufzeit; kurze Starttickets bleiben bestehen.',
+                          ('Automatik nur für dieses Item: Computer-Use-Test und gebundener PASS vor Commit/PR; '
+                           'danach bedingter Merge nach unabhängiger Review und allen Gates.'
+                           if scope['acceptance'].get('mode') == 'automatic' else
+                           'Live-Test und Owner-Abnahme dieses Kandidaten vor Commit/PR. Grüner unabhängiger Review erlaubt Merge.')]
+        else:
+            lines += ['Exakter Vertrag: ' + canonical(scope),
+                      'Merge: NEIN (keine zusätzliche Mergefreigabe)']
+        lines += ['Abhängigkeiten: ' + canonical(todo['depends_on']), 'Gates: ' + canonical(todo['gates'])]
+    if isinstance(manifest['replaces'], dict):
+        previous = manifest['replaces']
+        lines += [f"Mit dieser Bestätigung: Altversuch {previous['task']}, Generation {previous['generation']} archivieren und Nachfolger reservieren.",
+                  'Historische Wirkung bleibt UNKNOWN; erneute Arbeit kann frühere Arbeit doppeln.',
+                  'Kein Erfolg/Nichtstart behauptet. Alter Worktree und Belege bleiben reserviert.']
+    elif scope_amendment:
+        lines += ['Scope-Korrektur im selben vorbereiteten Batch; keine neue Reservierung, kein Workerstart, kein neues Budget.',
+                  'Nur die hier angezeigten Pfade werden nach direkter Owner-Bestaetigung erlaubt.']
+    lines += ['Budgets: ' + canonical(manifest['budgets']), 'Ersetzt Batch: ' + canonical(manifest['replaces'])]
+    return '\n'.join(lines)
+
+
+def new_preview(digest, manifest, scope_amendment=False):
+    text = preview_text(manifest, scope_amendment)
+    if len(text.encode('utf-16-le')) // 2 > 3800:
+        raise ValueError('native owner preview exceeds one readable Telegram message')
+    return dict(ref=secrets.token_urlsafe(12), version=1, digest=digest, text=text,
+                state='pending', send='pending', ui_revision=0, ui_applied=-1, ui_attempts=0, ui_due=0)
+
+
+def preview_state(preview, state):
+    if preview['state'] != state:
+        preview.update(state=state, ui_revision=preview['ui_revision'] + 1, ui_attempts=0, ui_due=0)
+
+
+def current_preview_state(rows, p, now):
+    preview = p.get('preview', {})
+    batch = rows.grants.get('batches', {}).get(p.get('batch'))
+    if p.get('revoked') or (batch and batch['revoked']):
+        return 'revoked'
+    if batch:
+        return 'confirmed'
+    if p.get('declined'):
+        return 'declined'
+    if preview.get('state') == 'open' and now >= preview['expires']:
+        return 'expired'
+    return preview.get('state', 'unconfirmed')
+
+
+def refresh_preview_state(rows, p, now):
+    if p.get('preview'):
+        preview_state(p['preview'], current_preview_state(rows, p, now))
+
+
+@dataclass(frozen=True)
+class NativeCallback:
+    """Adapter-only proof. Never serialized, exposed to tools or made from text."""
+    source: object
+    adapter: object
+    query_id: str
+    selector: str
+    message: str
+    bot: str
+    seal: object
+
+
+def telegram_callback(adapter, update):
+    """Only the CallbackQueryHandler may cross this boundary, using real PTB objects."""
+    from telegram import Update, CallbackQuery, Message
+    if type(update) is not Update or type(update.callback_query) is not CallbackQuery:
+        return None
+    query = update.callback_query
+    message, user = query.message, query.from_user
+    if (type(message) is not Message or not message.date or message.date.timestamp() <= 0 or
+            message.chat.type != 'private' or not user or user.is_bot or
+            str(user.id) != OWNER or str(message.chat.id) != OWNER or
+            not message.from_user or not message.from_user.is_bot or not query.id or
+            not isinstance(query.data, str) or not 1 <= len(query.data.encode('utf-8')) <= 64):
+        return None
+    try:
+        if query.get_bot() is not adapter._bot or str(message.from_user.id) != str(adapter._bot.id):
+            return None
+    except (AttributeError, RuntimeError):
+        return None
+    source = adapter.build_source(chat_id=str(message.chat.id), chat_type='dm', user_id=str(user.id),
+        user_name=user.username, thread_id=str(message.message_thread_id or '') or None)
+    runner = getattr(adapter, 'gateway_runner', None)
+    if not runner or runner._registered_transport_adapter(source) is not adapter:
+        return None
+    transport_profile = runner._adapter_profile_for_source(source)
+    # CallbackQuery bypasses the text-message wrapper that normally stamps the
+    # receiving profile. Derive its default from the live registered adapter.
+    source.profile = source.profile or transport_profile
+    from contextlib import nullcontext
+    from copy import copy
+    from gateway.run import _profile_runtime_scope
+    transport_source = copy(source)
+    transport_source.profile = transport_profile
+    scope = (_profile_runtime_scope(runner._resolve_profile_home_for_source(transport_source))
+             if getattr(runner.config, 'multiplex_profiles', False) else nullcontext())
+    with scope:
+        if not runner._is_user_authorized(source):
+            return None
+    return NativeCallback(source, adapter, query.id, query.data, str(message.message_id),
+                          str(adapter._bot.id), _CALLBACK_SEAL)
+
+
+def display_recipient(identity, transport):
+    return dict(stable_owner(identity), bot_id=transport['bot_id'],
+                transport_profile=transport['transport_profile'], home_namespace=transport['home_namespace'])
+
+
+async def handle_callback(runner, proof):
+    """Selector -> persisted preview -> one Guard decision. Never dispatch a worker."""
+    import re
+    from hermes_cli import diggr_delivery as delivery
+    from hermes_cli.diggr_continuation import runtime_guard
+    if type(proof) is not NativeCallback or proof.seal is not _CALLBACK_SEAL:
+        raise ValueError('real adapter callback required')
+    match = re.fullmatch(r'og:([1-9][0-9]?):([adr]):([A-Za-z0-9_-]{16})', proof.selector)
+    if not match:
+        raise ValueError('unknown owner button')
+    version, action, ref = int(match[1]), match[2], match[3]
+    guard = runtime_guard(runner._resolve_profile_home_for_source(proof.source))
+    if guard is None:
+        raise ValueError('native owner grant unavailable')
+    with guard.transaction(read_only=True) as rows:
+        found = [(digest, p) for digest, p in rows.grants.get('proposals', {}).items()
+                 if p.get('preview', {}).get('ref') == ref or
+                 any(c['ref'] == ref for c in p.get('callbacks', {}).values())]
+    if len(found) != 1:
+        raise ValueError('unknown or replaced owner button')
+    digest, snapshot = found[0]
+    identity, transport = snapshot.get('coordinator_identity'), snapshot.get('native_transport')
+    if not identity or not transport:
+        raise ValueError('native preview binding missing')
+    source = await delivery.origin_scope(runner, identity, transport, snapshot['requested_at'])
+    if not source:
+        raise ValueError('preview session closed or unavailable')
+    current = runner._diggr_identity(proof.source, identity['session'])
+    if (current != identity or proof.bot != transport['bot_id'] or
+            (proof.source.profile or '') != transport['profile'] or
+            (runner._adapter_profile_for_source(proof.source) or '') != transport['transport_profile'] or
+            runner._completion_receipt_adapter(proof.source, transport) is not proof.adapter):
+        raise ValueError('callback does not match native preview origin')
+    callback_id = binding_hash(dict(namespace=display_recipient(identity, transport), query=proof.query_id))
+    with guard.transaction() as rows:
+        now = time.time()
+        p = rows.grants['proposals'].get(digest)
+        preview = p.get('preview') if p else None
+        if (not preview or binding_hash(p['manifest']) != digest or preview['digest'] != digest or
+                preview['text'] != preview_text(p['manifest'], p.get('scope_amendment', False)) or p['owner'] != stable_owner(current) or
+                p.get('coordinator_identity') != identity or p.get('native_transport') != transport or
+                preview.get('recipient') != display_recipient(current, transport) or
+                preview.get('message_id') != proof.message or preview['send'] != 'bound'):
+            raise ValueError('callback differs from durable displayed proposal')
+        refresh_preview_state(rows, p, now)
+        # Stop always wins over replayed UI success. No changed grant or renewed budget.
+        if preview['state'] == 'revoked':
+            return 'revoked', identity
+        for other_digest, other in rows.grants.get('proposals', {}).items():
+            prior = other.get('callbacks', {}).get(callback_id)
+            if prior:
+                if (other_digest != digest or prior['ref'] != ref or prior['version'] != version or
+                        prior['action'] != action):
+                    raise ValueError('callback already consumed for another decision')
+                return prior['outcome'], identity
+        if preview['ref'] != ref or preview['version'] != version:
+            raise ValueError('owner button replaced; use the current preview')
+        callbacks = p.setdefault('callbacks', {})
+        if len(callbacks) >= MAX_CALLBACKS:
+            raise ValueError('owner preview callback limit reached')
+        outcome = preview['state']
+        if outcome == 'open' and action in {'a', 'd'}:
+            if action == 'a':
+                confirm_batch(rows, p, digest, identity, 'callback:' + callback_id, None, now, transport)
+                outcome = 'confirmed'
+            else:
+                p['declined'] = True
+                preview_state(preview, 'declined')
+                outcome = 'declined'
+        elif outcome == 'expired' and action == 'r':
+            # A renewed display is still unconfirmed; the new ref needs its own click.
+            preview.update(ref=secrets.token_urlsafe(12), version=version + 1, expires=now + PREVIEW_SECONDS)
+            preview_state(preview, 'open')
+            outcome = 'renewed'
+        callbacks[callback_id] = dict(ref=ref, version=version, action=action, outcome=outcome)
+    runner._diggr_homes = getattr(runner, '_diggr_homes', set()) | {identity['home']}
+    return outcome, identity
+
+
+def confirm_batch(rows, p, digest, identity, event_id, code, now, transport=None):
+    """Called under Guard's lock by either native proof; no effects outside state."""
+    from hermes_cli.diggr_continuation import object_hash, ownership_pending
+    owner = stable_owner(identity)
+    used_events = rows.grants.setdefault('confirmation_events', {})
+    event_key = object_hash(dict(owner=owner, event=event_id))
+    if event_key in used_events:
+        raise ValueError('native confirmation event already consumed')
+    batches = rows.grants.setdefault('batches', {})
+    from hermes_cli import diggr_successor as successor
+    predecessor = successor.check(rows, p['manifest'], identity)
+    from hermes_cli.diggr_item import prepared_replacement
+    preparation = prepared_replacement(rows, p['manifest'], identity)
+    if p.get('prepared_replacement') != (binding_hash(preparation) if preparation else None):
+        raise ValueError('prepared reservation changed since owner proposal')
+    if p.get('scope_amendment') != bool(preparation and preparation['scope_amendment']):
+        raise ValueError('prepared scope correction changed since owner proposal')
+    replacement = p['manifest']['replaces']
+    replaces = replacement['batch'] if isinstance(replacement, dict) else replacement
+    from hermes_cli.diggr_delivery import same_transport
+    if preparation is not None and not same_transport(batches[replaces].get('native_transport'), transport):
+        raise ValueError('prepared replacement must retain its native owner transport')
+    if preparation is not None and preparation['scope_amendment']:
+        # This is a direct native owner decision on the displayed exact scope.
+        # Preserve the item reservation and all work counters in the same batch.
+        old = batches[replaces]
+        previous_proposal = old['proposal']
+        old['manifest'] = p['manifest']
+        old['proposal'] = digest
+        old.setdefault('scope_amendments', []).append(dict(
+            proposal=digest, native_owner_event=event_id, confirmed_at=now,
+            previous_proposal=previous_proposal,
+            allowed_paths=list(p['manifest']['todos'][0]['contract']['resources']['allowed_paths']),
+            no_touch=list(p['manifest']['todos'][0]['contract']['resources']['no_touch'])))
+        blocker = old['item'].pop('preparation_blocker', None)
+        if blocker is not None:
+            old.setdefault('resolved_preparation_blockers', []).append(blocker)
+        used_events[event_key] = replaces
+        p['batch'] = replaces
+        if p.get('preview'):
+            preview_state(p['preview'], 'confirmed')
+        return replaces
+    check_issue_overlap(rows, p['manifest'], owner)
+    if replaces:
+        old = batches.get(replaces)
+        if not old or old['owner'] != owner or old.get('replaced_by'):
+            raise ValueError('invalid reauthorization target')
+        if any(r.get('policy', {}).get('batch') == replaces and r is not predecessor and ownership_pending(r) for r in rows.values()):
+            raise ValueError('prior batch still owns unreconciled work')
+    batch_id = object_hash(dict(owner=owner, proposal=digest, event=event_id))
+    batch = dict(owner=owner, manifest=p['manifest'], proposal=digest,
+        confirmation_event=event_id, confirmation_code=code, confirmed_at=now,
+        coordinator_identity=json.loads(canonical(identity)),
+        started_at=None, deadline=None, tasks={}, revoked=False, replaces=replaces)
+    if len(p['manifest']['todos']) == 1:
+        contract = p['manifest']['todos'][0]['contract']
+        if contract.get('version') == ITEM_VERSION:
+            batch['merge_approval_required'] = contract['acceptance'].get('mode', 'manual') != 'automatic'
+    # Existing batches keep their original execution contract. A fresh v2 item
+    # uses the result-driven path; replacing an old batch still needs a separate
+    # explicit migration decision and never inherits new start authority here.
+    if not replaces and all(todo['contract'].get('version') == ITEM_VERSION
+                            for todo in p['manifest']['todos']):
+        batch['flow_version'] = 3
+    if transport:
+        batch.update(native_transport=json.loads(canonical(transport)),
+                     coordinator_delivery=dict(status='pending', generation=1, due=0,
+                                               deadline=now + BUDGETS['batch_seconds']))
+    batches[batch_id] = batch
+    if predecessor is not None:
+        successor.apply(rows, predecessor, p['manifest'], identity, event_id, digest, batch_id, batch, now)
+    if preparation is not None:
+        # Same reservation, no Git operation or renewed work budget. Keep the
+        # predecessor snapshot and native confirmation provenance for readback.
+        batch['item'] = preparation['item']
+        batch['preparation_transfer'] = dict(from_batch=replaces, to_batch=batch_id,
+            item_sha256=binding_hash(preparation['item']), preparation_sha256=binding_hash(preparation),
+            native_owner_event=event_id, transferred_at=now)
+        batches[replaces]['item'].update(phase='archived', transferred_to=batch_id)
+        batches[replaces]['preparation_transfer'] = json.loads(canonical(batch['preparation_transfer']))
+    if replaces:
+        batches[replaces].update(revoked=True, replaced_by=batch_id)
+        pending = batches[replaces].get('coordinator_delivery')
+        if pending:
+            pending['status'] = 'suppressed'
+    used_events[event_key] = batch_id
+    p['batch'] = batch_id
+    if p.get('preview'):
+        preview_state(p['preview'], 'confirmed')
+    return batch_id
 
 
 async def handle_command(runner, event, guard, identity):
     """Consumed before agent execution; separate explicit show and confirm messages."""
-    from hermes_cli.diggr_continuation import object_hash, ownership_pending
     event_id = verify_input(event, identity)
     words = event.text.split()
+    if len(words) >= 2 and words[1] in {'archive-show', 'archive-confirm'}:
+        return await handle_operator_archive(runner, event, guard, identity, event_id, words)
+    if len(words) >= 2 and words[1] in {'migrate-show', 'migrate-confirm',
+                                         'migrate-rollback-show', 'migrate-rollback-confirm'}:
+        from hermes_cli.diggr_item import owner_migration_command
+        return await owner_migration_command(runner, event, guard, identity, event_id, words)
+    if len(words) >= 2 and words[1] == 'assignment-renew':
+        from hermes_cli.diggr_item import owner_assignment_renew
+        return await owner_assignment_renew(runner, event, guard, identity, event_id, words)
+    if len(words) >= 2 and words[1] in {'accept', 'accept-test-only', 'delegate-test', 'extend', 'review-policy', 'merge-approve'}:
+        from hermes_cli.diggr_item import owner_decision
+        return await owner_decision(runner, event, guard, identity, event_id, words)
     if len(words) not in (3, 4) or words[0] != '/continuation' or words[1] not in {'show', 'confirm'}:
         raise ValueError('use /continuation show HASH or /continuation confirm HASH CODE')
     digest = words[2]
     owner = stable_owner(identity)
-    now = time.time()
+    # Only an explicit, authenticated text request may bind a legacy display.
+    # No transport is guessed for old fixtures/rows lacking a live native adapter.
+    from hermes_cli.diggr_delivery import command_transport, same_transport
+    transport = command_transport(runner, event, identity)
     with guard.transaction() as rows:
+        now = time.time()
         p = rows.grants.get('proposals', {}).get(digest)
         if not p or p['owner'] != owner or hashlib.sha256(canonical(p['manifest']).encode()).hexdigest() != digest:
             raise ValueError('unknown, altered or foreign owner proposal')
+        if p.get('revoked') or p.get('declined'):
+            raise ValueError('proposal revoked or declined; a new scoped proposal is required')
+        if p.get('native_transport') and (not same_transport(p['native_transport'], transport) or
+                                          p['coordinator_identity'] != identity):
+            raise ValueError('proposal belongs to a different native session or transport')
         if words[1] == 'show':
             if len(words) != 3:
                 raise ValueError('show takes exactly the immutable proposal hash')
@@ -207,52 +811,39 @@ async def handle_command(runner, event, guard, identity):
                 response = 'Already confirmed batch ' + p['batch']
                 preview = None
             else:
-                preview = dict(code=secrets.token_hex(12), event=event_id, expires=now + 300)
+                preview = dict(code=secrets.token_hex(12), event=event_id, expires=now + 300,
+                               identity=identity, transport=transport)
+                p['show_reservation'] = event_id
                 response = ('Owner proposal (no execution yet):\n```json\n' + canonical(p['manifest']) + '\n```' +
-                            '\nSHA256 ' + digest + '\nConfirm within 300 seconds with a NEW direct message:\n' +
+                            '\nSHA256 ' + digest + '\nConfirm within 300 seconds with a NEW unformatted direct text message '
+                            '(no code block, quote, reply or forward):\n' +
                             '/continuation confirm ' + digest + ' ' + preview['code'])
         else:
             if len(words) != 4:
                 raise ValueError('confirmation requires exact hash and one-use code')
             if p.get('batch'):
                 batch = rows.grants['batches'][p['batch']]
+                if batch.get('revoked'):
+                    raise ValueError('confirmed proposal revoked; no renewed authority')
                 if batch['confirmation_event'] != event_id or batch['confirmation_code'] != words[3]:
-                    raise ValueError('already confirmed; explicit new reauthorization proposal required')
+                    raise ValueError('confirmation already consumed; batch remains confirmed')
                 response = 'Already confirmed batch ' + p['batch']
             else:
                 preview = p.get('shown')
-                if (not preview or preview['code'] != words[3] or now >= preview['expires'] or
-                        event_id == preview['event']):
-                    raise ValueError('unshown, stale or replayed confirmation')
-                used_events = rows.grants.setdefault('confirmation_events', {})
-                event_key = object_hash(dict(owner=owner, event=event_id))
-                if event_key in used_events:
-                    raise ValueError('native confirmation event already consumed')
-                batches = rows.grants.setdefault('batches', {})
-                replaces = p['manifest']['replaces']
-                keys = {issue_key(t) for t in p['manifest']['todos']}
-                for bid, old in batches.items():
-                    if old['owner'] != owner:
-                        continue
-                    overlap = keys & {issue_key(t) for t in old['manifest']['todos']}
-                    if overlap and bid != replaces and not old.get('replaced_by'):
-                        raise ValueError('same logical work requires explicit reauthorization of prior batch')
-                if replaces:
-                    old = batches.get(replaces)
-                    if not old or old['owner'] != owner or old.get('replaced_by'):
-                        raise ValueError('invalid reauthorization target')
-                    if any(r.get('policy', {}).get('batch') == replaces and ownership_pending(r) for r in rows.values()):
-                        raise ValueError('prior batch still owns unreconciled work')
-                batch_id = object_hash(dict(owner=owner, proposal=digest, event=event_id))
-                batches[batch_id] = dict(owner=owner, manifest=p['manifest'], proposal=digest,
-                    confirmation_event=event_id, confirmation_code=words[3], confirmed_at=now,
-                    coordinator_identity=json.loads(canonical(identity)),
-                    started_at=None, deadline=None, tasks={}, revoked=False, replaces=replaces)
-                if replaces:
-                    batches[replaces].update(revoked=True, replaced_by=batch_id)
-                used_events[event_key] = batch_id
-                p['batch'] = batch_id
-                response = 'Confirmed batch ' + batch_id + '. No work dispatched.'
+                if not preview:
+                    raise ValueError('preview missing; request /continuation show with the proposal hash first')
+                if now >= preview['expires']:
+                    raise ValueError('preview expired; request /continuation show again, then send a new unformatted confirmation')
+                if preview['code'] != words[3]:
+                    raise ValueError('wrong or replaced confirmation code; use the latest preview')
+                if event_id == preview['event']:
+                    raise ValueError('confirmation needs a new unformatted direct text message')
+                bound = preview.get('transport')
+                if bound and (not same_transport(bound, transport) or preview.get('identity') != identity):
+                    raise ValueError('text preview native session or transport changed')
+                batch_id = confirm_batch(rows, p, digest, identity, event_id, words[3], now, bound)
+                response = 'Confirmed batch ' + batch_id + ('. Main continuation queued; admission checks still apply.'
+                    if bound else '. No native delivery binding; no work dispatched.')
             preview = None
     # No guard lock held across native delivery. An unsuccessful preview cannot authorize.
     from gateway.platforms.base import _thread_metadata_for_source
@@ -263,9 +854,97 @@ async def handle_command(runner, event, guard, identity):
     if words[1] == 'show' and preview:
         with guard.transaction() as rows:
             p = rows.grants['proposals'][digest]
-            if not p.get('batch'):
+            if not p.get('batch') and not p.get('revoked') and not p.get('declined') and p.get('show_reservation') == event_id:
                 p['shown'] = preview
     return False  # fully handled, never forwarded to agent/tool execution
+
+
+def _app104_archive_candidate(rows, identity):
+    """One historical identity-loss case, never a reusable task unlock."""
+    from pathlib import Path
+    from hermes_cli.diggr_continuation import (app104_next_archive_case,
+        verify_restarted_reservation_exit)
+    next_row = rows.get('APP-104-album-group-retired-next-20260926')
+    if next_row and app104_next_archive_case(next_row) and not next_row.get('operator_archive'):
+        artifact = Path(next_row['artifact'])
+        bound_identity = next_row.get('identity', {})
+        if (stable_owner(bound_identity) != stable_owner(identity) or
+                bound_identity.get('session_key') != identity.get('session_key') or
+                artifact.exists() or artifact.is_symlink()):
+            raise ValueError('APP-104 handoff archive identity or artifact changed')
+        verify_restarted_reservation_exit(next_row)
+        return next_row
+    row = rows.get('APP-104-stable-album-children')
+    if (not row or row.get('task') != 'APP-104-stable-album-children' or
+            row.get('generation') != 3 or row.get('status') != 'blocked' or
+            row.get('effect_status') != 'unknown' or row.get('producer') != 'cmux' or
+            row.get('owner_batch') != '13bd6f74a3e74ce084e43bbe823f59b444d4e76e89dbdffc2d31b8e75866ad62' or
+            row.get('action_id') != 'fe6b4781ab5e4989a923ab65ab3aa6e3' or
+            row.get('effect_id') != '8993957c2d584e418a42c4d5018d4bf6' or
+            row.get('identity') != identity or not row.get('launcher_expected') or
+            any(row.get(k) for k in ('process_id', 'launcher_pid', 'launcher_identity',
+                                     'worker_pid', 'worker_identity', 'child_identity',
+                                     'visible_sent', 'reservation_retirement', 'operator_archive'))):
+        raise ValueError('APP-104 historical archive does not match the exact blocked attempt')
+    return row
+
+
+async def handle_operator_archive(runner, event, guard, identity, event_id, words):
+    """Direct native owner acceptance of one documented unknown historical attempt."""
+    from hermes_cli.diggr_continuation import object_hash, operator_archive_core
+    from hermes_cli.diggr_delivery import command_transport, same_transport
+    transport = command_transport(runner, event, identity)
+    if words[1] == 'archive-show':
+        if len(words) != 2:
+            raise ValueError('archive-show takes no task alias or payload')
+        with guard.transaction() as rows:
+            row = _app104_archive_candidate(rows, identity)
+            preview = dict(core_sha256=operator_archive_core(row), generation=row['generation'],
+                identity=identity, transport=transport, event=event_id,
+                code=secrets.token_hex(12), expires=time.time() + 300)
+            rows.grants.setdefault('operator_archive_previews', {})[row['task']] = preview
+        response = (row['task'] + ', generation 3: start and effects remain UNKNOWN. '
+            'This one-time owner archive releases its Main admission and visible target; '
+            'the old worktree remains reserved. A second execution may duplicate past work. '
+            'A currently idle lane and stale worker ticket do not prove historical no-effect. '
+            'No success, no-effect or proven nonstart is asserted. To accept this risk, '
+            'send a NEW direct unformatted message within five minutes:\n'
+            '/continuation archive-confirm ' + preview['core_sha256'] + ' ' + preview['code'])
+    else:
+        if len(words) != 4:
+            raise ValueError('archive-confirm requires the exact shown hash and one-use code')
+        with guard.transaction() as rows:
+            row = _app104_archive_candidate(rows, identity)
+            preview = rows.grants.get('operator_archive_previews', {}).get(row['task'])
+            if (not preview or time.time() >= preview['expires'] or
+                    preview['identity'] != identity or
+                    not same_transport(preview['transport'], transport) or
+                    preview['event'] == event_id or
+                    preview['core_sha256'] != words[2] or
+                    preview['code'] != words[3] or
+                    operator_archive_core(row) != preview['core_sha256']):
+                raise ValueError('APP-104 archive preview expired, changed or not owner-confirmed')
+            receipt = dict(kind='owner_accepted_historical_uncertainty',
+                task=row['task'], generation=row['generation'], identity=dict(row['identity']),
+                confirming_identity=dict(identity),
+                action_id=row['action_id'], effect_id=row['effect_id'],
+                core_sha256=preview['core_sha256'], native_owner_event=event_id,
+                preview_event=preview['event'], accepted_at=time.time(),
+                historical_effects='unknown', duplicate_work_risk_accepted=True,
+                released=['main_session', 'visible_target'], retained=['old_worktree'])
+            row['operator_archive'] = receipt
+            rows.grants.setdefault('operator_archive_events', {})[object_hash(dict(
+                owner=stable_owner(identity), event=event_id))] = receipt
+            rows.grants['operator_archive_previews'].pop(row['task'], None)
+        response = ('APP-104 old attempt archived by direct native owner confirmation. '
+            'Historical effects remain unknown; the old worktree stays reserved. '
+            'Main may propose a fresh separately confirmed APP-104 task; no worker was started.')
+    from gateway.platforms.base import _thread_metadata_for_source
+    result = await runner._adapter_for_source(event.source).send(
+        event.source.chat_id, response, metadata=_thread_metadata_for_source(event.source, str(event.message_id)))
+    if not getattr(result, 'success', False):
+        raise ValueError('native archive display delivery failed')
+    return False
 
 
 class Policy(dict):
@@ -287,12 +966,26 @@ def hydrate(rows):
         if (batch and batch['owner'] == stable_owner(row['identity']) and
                 batch['tasks'].get(raw.get('issue')) == name and batch['started_at'] is not None and
                 raw.get('batch_deadline') == batch['deadline']):
+            item = batch.get('item', {})
+            v2 = (item.get('task') == name and any(
+                issue_key(t) == raw.get('issue') and t['contract'].get('version') == ITEM_VERSION
+                for t in batch['manifest']['todos']))
             row['policy'] = Policy(raw, revoked=batch['revoked'])
+            if v2:
+                row['policy']['item_lifecycle'] = True
+                row['policy']['work_seconds'] = item.get('work_seconds', 0)
+                row['policy']['work_limit'] = item['budget']['todo_seconds']
+                row['policy']['limits'] = dict(item['budget'])
+            else:
+                row['policy'].pop('item_lifecycle', None)
         else:
             row['policy'] = dict(raw)  # legacy or forged binding fails closed
 
 
 def bind(rows, task, now, *, logical_binding=None):
+    if any(bid != task.get('owner_batch') and b.get('item', {}).get('phase') not in {None, 'closed', 'archived'}
+           for bid, b in rows.grants.get('batches', {}).items()):
+        raise ValueError('Coding lane remains reserved through accepted item closeout')
     batch = rows.grants.get('batches', {}).get(task.get('owner_batch'))
     key = task.get('owner_issue')
     if not batch or batch['owner'] != stable_owner(task['identity']) or batch['revoked']:
@@ -301,12 +994,12 @@ def bind(rows, task, now, *, logical_binding=None):
     actual = contract(task)
     # Native registration adds this seal; it is not an executor-selected route field.
     # Preserve exact comparison when an older confirmed proposal already pinned it.
-    if (todo and todo['contract'].get('version') != LOGICAL_VERSION and actual['producer'] == 'cmux' and
+    if (todo and todo['contract'].get('version') not in LOGICAL_VERSIONS and actual['producer'] == 'cmux' and
             isinstance(todo['contract']['worker_route'], dict) and
             isinstance(actual['worker_route'], dict) and
             'packet_sha256' not in todo['contract']['worker_route']):
         actual['worker_route'] = {k: v for k, v in actual['worker_route'].items() if k != 'packet_sha256'}
-    if todo and todo['contract'].get('version') == LOGICAL_VERSION:
+    if todo and todo['contract'].get('version') in LOGICAL_VERSIONS:
         if (type(logical_binding) is not LogicalBinding or
                 logical_binding.contract_sha256 != binding_hash(todo['contract']) or
                 logical_binding.task_sha256 != binding_hash(task)):
@@ -330,6 +1023,19 @@ def bind(rows, task, now, *, logical_binding=None):
         prior = rows.get(batch['tasks'].get(dep))
         if not prior or prior['status'] != 'done':
             raise ValueError('prior authorized Todo has not passed completion gates')
+    if todo['contract'].get('version') == ITEM_VERSION:
+        from hermes_cli.diggr_item import bind_task
+        bind_task(batch, task)
+        batch.update(started_at=now, deadline=None)
+        batch['tasks'][key] = task['task']
+        migration = batch['item'].get('migration') or {}
+        return Policy(batch=task['owner_batch'], issue=key, first_started_at=now,
+                      deadline=now + BUDGETS['todo_seconds'], batch_deadline=None,
+                      wakes=migration.get('wakes', batch['item'].get('preparation_wakes', 0)),
+                      recoveries=migration.get('recoveries', 0), corrections=migration.get('corrections', 0),
+                      revoked=False, item_lifecycle=True,
+                      work_seconds=batch['item'].get('work_seconds', 0),
+                      work_limit=batch['item']['budget']['todo_seconds'])
     if batch['started_at'] is None:
         batch.update(started_at=now, deadline=now + BUDGETS['batch_seconds'])
     if now >= batch['deadline']:
@@ -345,15 +1051,26 @@ def bind(rows, task, now, *, logical_binding=None):
 
 def allowed(row, now):
     p = row.get('policy')
+    if type(p) is Policy and p.get('item_lifecycle'):
+        return not p['revoked'] and p.get('work_seconds', 0) < p['work_limit']
     return (type(p) is Policy and not p['revoked'] and now < p['deadline'] and
             now < p['batch_deadline'])
 
 
 def stop(rows, identity):
     owner = stable_owner(identity)
+    for p in rows.grants.get('proposals', {}).values():
+        if p['owner'] == owner:
+            p['revoked'] = True
+            if p.get('preview'):
+                preview_state(p['preview'], 'revoked')
     for batch in rows.grants.get('batches', {}).values():
         if batch['owner'] == owner:
             batch['revoked'] = True
+            if batch.get('coordinator_delivery'):
+                batch['coordinator_delivery']['status'] = 'suppressed'
+            if batch.get('preparation_delivery'):
+                batch['preparation_delivery']['status'] = 'suppressed'
     for row in rows.values():
         if row.get('policy') and stable_owner(row['identity']) == owner:
             row['policy']['revoked'] = True

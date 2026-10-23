@@ -3,6 +3,7 @@ from tests.diggr_owner_fixtures import authorize
 
 import copy
 import json
+import sqlite3
 import sys
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -50,6 +51,10 @@ def rig(tmp_path, monkeypatch):
     monkeypatch.setattr(dc, 'runtime_guard', lambda home=None: guard)
     # Route validation is orthogonal; native ticket/claim/retire and TTY checks remain real.
     monkeypatch.setattr(dc, 'route_check', lambda *a, **kw: None)
+    # These tests exercise the registered ticket/transport lifecycle after
+    # onboarding. The onboarding guard has its own focused tests.
+    from hermes_cli import diggr_item
+    monkeypatch.setattr(diggr_item, 'require_onboarding_context', lambda: None)
     monkeypatch.setattr(dc, 'cmux_send', Mock())
     monkeypatch.setattr(dc, 'visible_worker_command', lambda ticket: 'fixture-wrapper')
     with guard.transaction() as rows:
@@ -66,6 +71,67 @@ def rig(tmp_path, monkeypatch):
 def hashed(path, data):
     path.write_text(json.dumps(data))
     return dict(path=str(path), sha256=dc.digest(path))
+
+
+def test_cmux_snapshot_uses_global_process_attribution(monkeypatch):
+    import subprocess
+    command = []
+
+    def snapshot(argv, **kwargs):
+        command.extend(argv)
+        return '{}'
+
+    monkeypatch.setattr(subprocess, 'check_output', snapshot)
+    assert dc.cmux_snapshot(dict(workspace='11111111-1111-4111-8111-111111111111')) == {}
+    assert command == [dc.CMUX, '--json', '--id-format', 'both', 'top', '--all', '--processes']
+
+
+def test_visible_surface_rejects_shared_tty_across_surfaces(monkeypatch):
+    target = dict(workspace='11111111-1111-4111-8111-111111111111',
+                  surface='22222222-2222-4222-8222-222222222222')
+    selected = dict(kind='surface', id=target['surface'], type='terminal', tty='ttys001')
+    other = dict(kind='surface', id='33333333-3333-4333-8333-333333333333',
+                 type='terminal', tty='ttys001')
+    monkeypatch.setattr(dc, 'cmux_snapshot', lambda _: dict(kind='workspace', id=target['workspace'],
+                                                            children=[selected, other]))
+    with pytest.raises(ValueError, match='ambiguous cmux target TTY'):
+        dc.visible_surface(target)
+
+
+def test_login_root_binds_its_unique_idle_foreground_shell(rig):
+    r = rig
+    r.processes[100] = dict(pid=100, ppid=1, pgid=100, tpgid=101, tty='ttys001',
+                            start='login-start', executable='/usr/bin/login')
+    r.processes[101]['ppid'] = 100
+    r.surface.update(top_level_pids=[100], root_pids=[100, 101], tty_process_pids=[100, 101])
+
+    binding = dc.bind_visible_target(r.binding['target'])
+    assert binding['shell']['pid'] == 101 and binding['shell']['ppid'] == 100
+    dc.verify_visible_target(binding, idle=True)
+
+    r.surface['tty_process_pids'].append(202)
+    with pytest.raises(ValueError, match='occupied terminal'):
+        dc.verify_visible_target(binding, idle=True)
+    r.surface['tty_process_pids'].remove(202)
+    r.processes[101]['start'] = 'replacement-shell'
+    with pytest.raises(ValueError, match='stale cmux shell binding'):
+        dc.verify_visible_target(binding, idle=True)
+
+
+def test_login_root_rejects_ambiguous_or_unrelated_shell(rig):
+    r = rig
+    r.processes[100] = dict(pid=100, ppid=1, pgid=100, tpgid=101, tty='ttys001',
+                            start='login-start', executable='/usr/bin/login')
+    r.processes[101]['ppid'] = 100
+    r.surface.update(top_level_pids=[100], root_pids=[100, 101], tty_process_pids=[100, 101])
+    r.processes[102] = dict(r.processes[101], pid=102, pgid=102, start='other-shell')
+    r.surface['root_pids'].append(102)
+    with pytest.raises(ValueError, match='login/shell OS/TTY identity mismatch'):
+        dc.bind_visible_target(r.binding['target'])
+    r.surface['root_pids'].remove(102)
+    r.processes[101]['ppid'] = 1
+    with pytest.raises(ValueError, match='login/shell OS/TTY identity mismatch'):
+        dc.bind_visible_target(r.binding['target'])
 
 
 def report(r, **overrides):
@@ -112,13 +178,39 @@ def recover(r):
         rows[r.task['task']]['worker_route'].update(packet=old_packet['path'], packet_sha256=old_packet['sha256'])
     route = dict(r.row()['worker_route'], packet=new_packet['path'], packet_sha256=new_packet['sha256'],
                  receipt=str(r.tmp / 'new-receipt.json'), visible_target=r.binding['target'])
-    r.monkeypatch.setattr(dc, 'validate_recovery_route', lambda *a: None)
+    r.monkeypatch.setattr(dc, 'validate_recovery_route', lambda *a, **kw: None)
     r.monkeypatch.setattr(dc, 'verify_recovery_worktree', lambda *a: None)
     ticket = r.guard.recover(r.identity, wake, report(r), dict(worker_route=route,
         kind='technical', artifact=str(r.tmp / 'new-result.md'), reason='claim timeout', hypothesis='new bounded preflight'))
     with r.guard.transaction() as rows:
         rows[r.task['task']]['receipt_sha256'] = 'fixture-new-seal'
     return ticket
+
+
+def coding_prompt_fixture(r, ticket=None, received_at=None):
+    session = 'coding-' + r.tmp.name
+    coordinator = dict(workspace=r.binding['target']['workspace'],
+                       surface=r.binding['target']['surface'],
+                       process=dict(identity=dict(r.processes[101]), argv=['hermes', '--resume', session]))
+    r.monkeypatch.setattr(dc, 'preflight_coding_coordinator', lambda: coordinator)
+    with r.guard.transaction() as rows:
+        rows[r.task['task']]['coding_prompt_binding'] = dc.bound_coding_prompt(coordinator)
+    if ticket is None:
+        return session
+    db = r.tmp.parent / 'diggr-coding' / 'state.db'
+    db.parent.mkdir(exist_ok=True)
+    with sqlite3.connect(db) as connection:
+        connection.execute('CREATE TABLE IF NOT EXISTS sessions '
+                           '(id TEXT PRIMARY KEY, source TEXT, profile_name TEXT, ended_at REAL)')
+        connection.execute('CREATE TABLE IF NOT EXISTS messages '
+                           '(id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, timestamp REAL, content TEXT)')
+        connection.execute('INSERT OR IGNORE INTO sessions VALUES (?, ?, ?, ?)',
+                           (session, 'cli', 'diggr-coding', None))
+        content = ('Hermes Coding task: Loop Control visible Coding dispatch for APP-105. | '
+                   'SYSTEM167_WORKER_TICKET ' + json.dumps(ticket, sort_keys=True, separators=(',', ':')))
+        connection.execute('INSERT INTO messages (session_id, role, timestamp, content) VALUES (?, ?, ?, ?)',
+                           (session, 'user', received_at, content))
+    return session
 
 
 def claim_without_spawn(r, ticket):
@@ -141,6 +233,29 @@ def claim_without_spawn(r, ticket):
     return spawn
 
 
+def test_native_terminal_rejection_keeps_unknown_effect_and_bounded_diagnostic(rig):
+    r = rig
+    with r.guard.transaction() as rows:
+        row = rows[r.task['task']]
+        for key in ('launcher_expected', 'process_id', 'process_started_at',
+                    'launcher_pid', 'launcher_identity'):
+            row.pop(key, None)
+    r.monkeypatch.setattr(dc, 'register_native', lambda task: (r.guard, r.row()))
+    response = dict(error='rejected; secret should not persist', exit_code=-1, status='error')
+    args = dict(command=r.task.get('launcher_command', 'fixture-launcher'), background=True,
+                continuation=dict(r.task, launcher_command=r.task.get('launcher_command', 'fixture-launcher')))
+    with pytest.raises(ValueError, match='launch effects unknown'):
+        dc.terminal_dispatch(args, lambda launch: json.dumps(response))
+    row = r.row()
+    assert row['launcher_expected'] is True
+    assert row.get('process_id') is None
+    assert row.get('worker_pid') is None
+    assert row['native_launch_diagnostic'] == dict(
+        response_sha256=dc.object_hash(response), outcome='terminal_error',
+        status='error', exit_code=-1)
+    assert 'secret should not persist' not in json.dumps(row)
+
+
 def test_recovered_send_uses_fresh_claim_window(rig):
     r = rig
     ticket = recover(r)
@@ -154,6 +269,74 @@ def test_recovered_send_uses_fresh_claim_window(rig):
     with pytest.raises(ValueError, match='UNREGISTERED'):
         dc.main(['--home', str(r.tmp), 'worker', '--payload-json', json.dumps(ticket)])
     assert spawn.call_count == 1
+
+
+def test_successful_launcher_has_separate_bounded_preclaim_handoff(rig):
+    r = rig
+    ticket = r.ticket()
+    r.session.exited = False
+    r.session.process.poll = lambda: None
+    r.clock[0] += 100
+    dc.observe_processes(r.guard)
+    assert r.row()['status'] == 'running' and not r.row().get('handoff_deadline')
+    r.session.exited = True
+    r.session.process.poll = lambda: 0
+    dc.observe_processes(r.guard)
+    row = r.row()
+    assert row['status'] == 'running' and row['generation'] == ticket['generation']
+    assert row['handoff_generation'] == ticket['generation']
+    assert row['handoff_deadline'] == r.clock[0] + 120
+    assert not row.get('visible_sent')
+    r.clock[0] += 110
+    dc.observe_processes(r.guard)
+    assert r.row()['status'] == 'running'
+    send(r)
+    assert r.row()['claim_phase'] == 'sent'
+    assert r.row()['generation'] == ticket['generation']
+
+
+def test_handoff_expiry_reconciles_once_without_resend(rig):
+    r = rig
+    ticket = r.ticket()
+    r.clock[0] += 31
+    dc.observe_processes(r.guard)
+    r.clock[0] += 120
+    dc.observe_processes(r.guard)
+    row = r.row()
+    assert row['gate'] == 'reconcile' and row['effect_status'] == 'unknown'
+    assert row['generation'] == ticket['generation'] + 1
+    assert not row.get('visible_sent')
+    dc.observe_processes(r.guard)
+    assert r.row()['generation'] == row['generation']
+    with pytest.raises(ValueError, match='UNREGISTERED'):
+        dc.validate_ticket({row['task']: row}, ticket)
+    dc.cmux_send.assert_not_called()
+
+
+def test_handoff_cannot_outlive_original_registration_cap(rig):
+    r = rig
+    r.clock[0] += 299
+    dc.observe_processes(r.guard)
+    assert r.row()['handoff_deadline'] == 1300
+    r.clock[0] += 1
+    dc.observe_processes(r.guard)
+    assert r.row()['gate'] == 'reconcile'
+
+
+def test_handoff_respects_owner_expiry_and_stop(rig):
+    r = rig
+    with r.guard.transaction() as rows:
+        rows[r.task['task']]['authorization_expires_at'] = r.clock[0] + 40
+    ticket = r.ticket()
+    r.clock[0] += 31
+    dc.observe_processes(r.guard)
+    assert r.row()['handoff_deadline'] == 1040
+    r.guard.control(r.identity, 'cancelled')
+    with pytest.raises(ValueError, match='UNREGISTERED'):
+        dc.validate_ticket({r.task['task']: r.row()}, ticket)
+    dc.observe_processes(r.guard)
+    assert r.row()['status'] == 'cancelled'
+    dc.cmux_send.assert_not_called()
 
 
 def test_observer_snapshot_cannot_fence_new_claim(rig):
@@ -186,6 +369,62 @@ def test_retirement_releases_distinct_task_and_keeps_old_ticket_fenced(rig):
         dc.validate_ticket({row['task']: row}, old)
     with pytest.raises(ValueError):
         retire(r, evidence, wake)
+
+
+def test_exact_prelaunch_gateway_rejection_retires_without_invented_launcher(rig):
+    r = rig
+    with r.guard.transaction() as rows:
+        row = rows.pop(r.task['task'])
+        row.update(task='APP-104-album-group-new-20260926', generation=3,
+            status='blocked', gate='reconcile', effect_status='unknown',
+            owner_batch='ff6f91394b8c50844db6a06735f76378e26bdccc135e484b906dd76d555e469f',
+            action_id='cac52908fccb449ebf46b44a3a079b7d',
+            effect_id='0de8fcd3771545ba9a0f68922ff2c65e',
+            native_launch_sha256='ed811def019e6f36ca33c81dd386b95e6a549815e8b4f5f6b3fe20d6b64ca68c',
+            native_launch_diagnostic=dict(exit_code=1, outcome='terminal_error',
+                response_sha256='8bb817e125655c67191c0c38d8e5384736a71441e04367c7a811a093e18a49f9',
+                status='error'), attempt_history=[], launcher_expected=True)
+        for key in ('process_id', 'process_started_at', 'launcher_pid', 'launcher_identity',
+                    'worker_pid', 'worker_identity', 'visible_sent', 'origin'):
+            row.pop(key, None)
+        row['worker_route']['receipt'] = str(r.tmp / 'never-sent.json')
+        rows[row['task']] = row
+    r.task['task'] = 'APP-104-album-group-new-20260926'
+    assert dc.prelaunch_rejection_case(r.row())
+    assert dc.ownership_pending(r.row())
+    evidence = hashed(r.tmp / 'prelaunch-rejection.json', dc.prelaunch_rejection_report(r.row()))
+    with r.guard.transaction() as rows:
+        rows[r.task['task']]['deliveries'] = [dict(status='delivered', message_id='new')]
+    assert dc.prelaunch_rejection_report(r.row()) == json.loads(
+        (r.tmp / 'prelaunch-rejection.json').read_text())
+    assert retire(r, evidence)
+    row = r.row()
+    assert dc.prelaunch_retirement_matches(row)
+    assert not dc.ownership_pending(row)
+    assert dc.worktree_reserved(row, row['worker_route']['worktree'])
+    assert not dc.ownership_pending(dc.Guard(r.guard.path).get(row['task']))
+    with pytest.raises(ValueError, match='replay'):
+        retire(r, evidence)
+    with r.guard.transaction() as rows:
+        current = rows[row['task']]
+        current['deliveries'] = [dict(status='delivered', message_id='later')]
+        current['coordinator_turns'] = {'3': dict(status='response_produced')}
+        current['policy']['revoked'] = True
+    assert dc.prelaunch_retirement_matches(r.row())
+    assert not dc.ownership_pending(r.row())
+    with r.guard.transaction() as rows:
+        rows[row['task']]['action'] = 'changed after retirement'
+    assert dc.ownership_pending(r.row())
+
+
+def test_prelaunch_retirement_refuses_changed_diagnostic_or_effect(rig):
+    r = rig
+    row = r.row()
+    assert not dc.prelaunch_rejection_case(row)
+    forged = dict(row, reservation_retirement=dict(kind='gateway_lifecycle_rejection_before_execute',
+        row_sha256=dc.object_hash(row), evidence=hashed(r.tmp / 'false-report.json',
+            dict(kind='gateway_lifecycle_rejection_before_execute'))))
+    assert not dc.prelaunch_retirement_matches(forged)
 
 
 @pytest.mark.parametrize('change', ['owner', 'generation', 'action_id', 'effect_id', 'hash', 'missing',
@@ -509,6 +748,97 @@ def test_recovery_retains_original_launcher_proof_and_history(rig):
         assert row['history'][0][key] == before[key]
     assert row['claim_phase'] == 'reserved'
     assert row['claim_deadline'] == r.clock[0] + 60
+
+
+def test_recovered_first_call_survives_pre_api_compression_without_duplicate_send(rig):
+    r = rig
+    coding_prompt_fixture(r)
+    ticket = recover(r)
+    session = coding_prompt_fixture(r, ticket, r.clock[0] + 10)
+    # The real Coding turn spent 71.5 seconds compacting before its first tool call.
+    r.clock[0] += 72
+    assert json.loads(send(r))['sent'] is True
+    assert r.row()['coding_prompt_receipt']['session'] == session
+    assert r.row()['claim_deadline'] == r.clock[0] + 30
+    assert dc.cmux_send.call_count == 1
+    assert json.loads(send(r))['already_registered'] is True
+    assert dc.cmux_send.call_count == 1
+
+
+@pytest.mark.parametrize('change', ['late', 'wrong_ticket', 'old_session', 'changed_process'])
+def test_recovery_rejects_unbound_or_late_coding_prompt(rig, change):
+    r = rig
+    coding_prompt_fixture(r)
+    ticket = recover(r)
+    delivered = dict(ticket)
+    if change == 'wrong_ticket':
+        delivered['ticket_nonce'] = 'other-generation-nonce'
+    coding_prompt_fixture(r, delivered, r.clock[0] + (61 if change == 'late' else 10))
+    if change == 'old_session':
+        with sqlite3.connect(r.tmp.parent / 'diggr-coding' / 'state.db') as connection:
+            connection.execute('UPDATE messages SET session_id=? WHERE session_id=?',
+                               ('old-session', 'coding-' + r.tmp.name))
+    if change == 'changed_process':
+        changed = dict(workspace=r.binding['target']['workspace'],
+                       surface=r.binding['target']['surface'],
+                       process=dict(identity=dict(r.processes[101], start='new-process'),
+                                    argv=['hermes', '--resume', 'coding-' + r.tmp.name]))
+        r.monkeypatch.setattr(dc, 'preflight_coding_coordinator', lambda: changed)
+    r.clock[0] += 72
+    with pytest.raises(ValueError, match='UNREGISTERED'):
+        send(r)
+    assert r.row().get('coding_prompt_receipt') is None
+    dc.cmux_send.assert_not_called()
+
+
+def test_received_prompt_does_not_override_owner_stop(rig):
+    r = rig
+    coding_prompt_fixture(r)
+    ticket = recover(r)
+    coding_prompt_fixture(r, ticket, r.clock[0] + 10)
+    r.guard.control(r.identity, 'cancelled')
+    r.clock[0] += 72
+    with pytest.raises(ValueError, match='UNREGISTERED'):
+        send(r)
+    dc.cmux_send.assert_not_called()
+
+
+def test_last_technical_recovery_budget_covers_received_prompt_and_one_claim(rig):
+    r = rig
+    with r.guard.transaction() as rows:
+        row = rows[r.task['task']]
+        row['wake_budget'] = 10
+        row['wakes'] = 7
+        row['policy']['recoveries'] = 1
+    coding_prompt_fixture(r)
+    ticket = recover(r)
+    coding_prompt_fixture(r, ticket, r.clock[0] + 10)
+    r.clock[0] += 72
+    assert json.loads(send(r))['sent'] is True
+    assert r.row()['wakes'] <= 10
+    assert r.row()['policy']['recoveries'] == 2
+    spawn = claim_without_spawn(r, ticket)
+    dc.main(['--home', str(r.tmp), 'worker', '--payload-json', json.dumps(ticket)])
+    assert spawn.call_count == 1
+    assert r.row()['claim_phase'] == 'claimed'
+
+
+def test_launcher_prompt_receipt_extends_only_after_original_handoff(rig):
+    r = rig
+    coding_prompt_fixture(r)
+    ticket = r.ticket()
+    coding_prompt_fixture(r, ticket, r.clock[0] + 10)
+    r.clock[0] += 120
+    dc.observe_processes(r.guard)
+    r.clock[0] += 120
+    dc.observe_processes(r.guard)
+    assert r.row()['status'] == 'running'
+    assert r.row()['coding_prompt_receipt']['session'] == 'coding-' + r.tmp.name
+    assert r.row()['handoff_deadline'] == 1010 + dc.RECEIVED_PROMPT_CLAIM_SECONDS
+    send(r)
+    assert dc.cmux_send.call_count == 1
+    assert json.loads(send(r))['already_registered'] is True
+    assert dc.cmux_send.call_count == 1
 
 
 @pytest.mark.parametrize('change', ['owner', 'start', 'pid', 'code', 'scope', 'handle'])
