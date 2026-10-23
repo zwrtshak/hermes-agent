@@ -29,7 +29,8 @@ RECEIVED_PROMPT_CLAIM_SECONDS = 660
 def worker_supervision_binding(row, generation=None):
     """The native Item supervisor binds observations to one started attempt."""
     return {key: row.get(key) for key in
-            ('task', 'action_id', 'effect_id', 'worker_pid', 'worker_identity', 'child_identity')} | {
+            ('task', 'action_id', 'effect_id', 'worker_pid', 'worker_identity', 'child_identity',
+             'worker_group')} | {
                 'generation': row.get('generation') if generation is None else generation}
 
 
@@ -38,7 +39,7 @@ def requires_worker_supervision(row):
     return bool(row.get('policy', {}).get('item_lifecycle') and
                 (row.get('claim_phase') == 'claimed' or any(row.get(key) for key in
                     ('worker_pid', 'worker_identity', 'worker_started_ns', 'child_identity',
-                     'child_exited', 'worker_result', 'worker_supervision'))))
+                     'child_exited', 'worker_result', 'worker_supervision', 'worker_group'))))
 
 
 def worker_operational_exit(row, generation=None):
@@ -50,6 +51,9 @@ def worker_operational_exit(row, generation=None):
         generation = (proof.get('binding') or {}).get('generation')
     return bool(isinstance(proof, dict) and proof.get('state') == 'exited' and
                 proof.get('binding') == worker_supervision_binding(row, generation) and
+                (not row.get('policy', {}).get('item_lifecycle') or
+                 (isinstance(row.get('worker_group'), dict) and
+                  proof.get('owned_group_empty') is True)) and
                 isinstance(row.get('worker_identity'), dict) and row.get('worker_pid') and
                 isinstance(row.get('child_identity'), dict) and
                 row['child_identity'].get('pid') and
@@ -361,6 +365,10 @@ class Guard:
             if not valid:
                 row['evidence'] = evidence
                 self.schedule_recovery(row, now, 'unknown or invalid worker outcome')
+                return True
+            if (row.get('policy', {}).get('item_lifecycle') and known_exit and
+                    worker_result.get('artifact_status') == 'missing'):
+                self.schedule_recovery(row, now, 'observed native worker exit without result')
                 return True
             self.checkpoint(row)
             row.update(owner=delivery.coordinator(row['identity']), gate='main_validation',
@@ -1068,7 +1076,7 @@ class Guard:
                 reconciliation_sha256=evidence['sha256'], effect_status=report['outcome']))
             for key in ('worker_pid', 'worker_identity', 'worker_started_ns', 'child_identity', 'child_exited',
                         'visible_sent', 'visible_sent_at', 'send_request_sha256', 'receipt_sha256', 'non_cmm_receipt_sha256', 'maintenance',
-                        'worker_result', 'worker_descendants', 'worker_supervision'):
+                        'worker_result', 'worker_descendants', 'worker_supervision', 'worker_group'):
                 row.pop(key, None)
             if row.get('logical_contract'):
                 row['launcher_command'] = logical_launcher_command(row['logical_contract'], route)
@@ -1901,7 +1909,7 @@ def process_observation_key(row):
     # A copied observer must not invalidate a newer send/claim in the same generation.
     return object_hash({k: row.get(k) for k in (
         'worker_pid', 'worker_identity', 'worker_started_ns', 'child_identity', 'child_exited',
-        'worker_supervision', 'worker_descendants', 'worker_result',
+        'worker_supervision', 'worker_descendants', 'worker_result', 'worker_group',
         'visible_sent', 'visible_sent_at', 'claim_phase', 'claim_deadline',
         'process_id', 'process_started_at', 'receipt_sha256', 'non_cmm_receipt_sha256',
         'handoff_generation', 'handoff_deadline')})
@@ -3028,7 +3036,7 @@ def register_assigned_worker(reference, session_id, coding_home, prompt):
                 worker_result=copy.deepcopy(current['worker_result']),
                 logical_contract=copy.deepcopy(current['logical_contract'])))
             for key in ('worker_pid', 'worker_identity', 'worker_started_ns', 'child_identity',
-                        'child_exited', 'worker_result', 'worker_descendants', 'worker_supervision', 'visible_sent',
+                        'child_exited', 'worker_result', 'worker_descendants', 'worker_supervision', 'worker_group', 'visible_sent',
                         'visible_sent_at', 'send_request_sha256', 'receipt_sha256',
                         'non_cmm_receipt_sha256', 'coordinator_delivery', 'evidence',
                         'late_evidence', 'recovery_kind', 'reason'):
@@ -4073,6 +4081,7 @@ def main(argv=None):
             if generation is not None:
                 guard.observe(payload['task'], generation, 'unknown')
             raise
+        group_handle = None
         try:
             print('SYSTEM167_VISIBLE_WORKER_START ' + json.dumps(dict(task=row['task'], pid=os.getpid(),
                   binding=row['visible_binding'])), flush=True)
@@ -4087,8 +4096,16 @@ def main(argv=None):
                     raise ValueError('worker authority revoked before spawn')
                 item_worker = current['policy'].get('item_lifecycle', False)
                 verify_assigned_prompt(tasks, current, claimed=row)
-                child = subprocess.Popen(command, cwd=row['worker_route']['worktree'])
-                work_started = time.monotonic()
+                if item_worker:
+                    from hermes_cli.diggr_item import spawn_item_child
+                    child, group_handle = spawn_item_child(
+                        command, row['worker_route']['worktree'], current)
+                    current['worker_group'] = group_handle['binding']
+                    row['worker_group'] = group_handle['binding']
+                else:
+                    child = subprocess.Popen(command, cwd=row['worker_route']['worktree'])
+                    group_handle = None
+                work_started = group_handle['started'] if item_worker else time.monotonic()
             # OS identity inspection may involve an external command: keep it out
             # of the stop lock. Missing identity after a crash blocks replay.
             try:
@@ -4102,7 +4119,7 @@ def main(argv=None):
                 current['child_identity'] = child_identity
             if item_worker:
                 from hermes_cli.diggr_item import wait_worker
-                returncode = wait_worker(guard, row, child, work_started)
+                returncode = wait_worker(guard, row, child, work_started, group_handle)
             else:
                 wait_until = claim_deadline(row, time.time(), row['epoch_seconds'])
                 returncode = child.wait(timeout=max(0, wait_until - time.time()))
@@ -4113,8 +4130,20 @@ def main(argv=None):
                           artifact_status=worker_result['artifact_status'])
             print('SYSTEM167_VISIBLE_WORKER_END ' + json.dumps(result), flush=True)
         except BaseException:
-            guard.observe(row['task'], row['generation'], 'unknown')
+            try:
+                if group_handle is not None and group_handle.get('started') is not None:
+                    from hermes_cli.diggr_item import close_item_group, account_item_unknown
+                    try:
+                        close_item_group(group_handle)
+                    finally:
+                        account_item_unknown(guard, row, group_handle)
+            finally:
+                guard.observe(row['task'], row['generation'], 'unknown')
             raise
+        finally:
+            if group_handle is not None:
+                from hermes_cli.diggr_item import close_item_group
+                close_item_group(group_handle)
     elif args.operation == 'retry':
         result = guard.retry(payload['identity'], payload, payload['report'])
         if not result:

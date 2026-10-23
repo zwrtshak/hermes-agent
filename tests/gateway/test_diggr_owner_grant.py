@@ -32,14 +32,15 @@ from tests.gateway.test_telegram_reply_quote import _make_adapter, _make_message
 
 
 def test_full_onboarding_fixture_does_not_read_host_source(tmp_path, monkeypatch):
-    import builtins
-    import io
+    import importlib.machinery
     import shutil
     import yaml
     from pathlib import Path
-    from tests.diggr_owner_fixtures import bind_full_onboarding_fixture
+    from tests.diggr_owner_fixtures import (bind_full_onboarding_fixture,
+                                            deny_external_onboarding_sources,
+                                            TEST_REQUIRED_SKILLS_MANIFEST, TEST_REQUIRED_SKILLS)
+    from hermes_cli import diggr_item as item
 
-    host_source = Path('/Users/diggr/Projects/diggr_claw/docs/skills/diggr-coding-loop-onboarding/SKILL.md').resolve()
     fixture_source = Path(__file__).resolve().parents[1] / 'fixtures' / 'diggr-coding-loop-onboarding' / 'SKILL.md'
     home = tmp_path / 'diggr-main'
     home.mkdir()
@@ -50,24 +51,18 @@ def test_full_onboarding_fixture_does_not_read_host_source(tmp_path, monkeypatch
                        ('CODEX_HOME', str(home / 'codex')), ('HERMES_PLATFORM', 'telegram')):
         monkeypatch.setenv(key, value)
 
-    original_builtin_open = builtins.open
-    original_io_open = io.open
-
-    def deny_host_source(opener):
-        def guarded(path, *args, **kwargs):
-            if isinstance(path, (str, bytes, Path)) and Path(path).resolve() == host_source:
-                raise PermissionError('host onboarding source denied in test process')
-            return opener(path, *args, **kwargs)
-        return guarded
-
-    monkeypatch.setattr(builtins, 'open', deny_host_source(original_builtin_open))
-    monkeypatch.setattr(io, 'open', deny_host_source(original_io_open))
-    with pytest.raises(PermissionError, match='host onboarding source denied'):
-        host_source.read_text(encoding='utf-8')
-    with pytest.raises(PermissionError, match='host onboarding source denied'):
-        shutil.copyfile(host_source, home / 'denied-copy')
+    forbidden = deny_external_onboarding_sources(monkeypatch)
+    for source in forbidden:
+        with pytest.raises(PermissionError, match='external onboarding source denied'):
+            source.read_bytes()
+        with pytest.raises(PermissionError, match='external onboarding source denied'):
+            importlib.machinery.SourceFileLoader('denied', str(source)).get_data(str(source))
+        with pytest.raises(PermissionError, match='external onboarding source denied'):
+            shutil.copyfile(source, home / 'denied-copy')
 
     bind_full_onboarding_fixture(monkeypatch, home)
+    assert item.REQUIRED_SKILLS_MANIFEST == TEST_REQUIRED_SKILLS_MANIFEST
+    assert item.required_profile_skills() == TEST_REQUIRED_SKILLS
     assert (home / 'skills' / 'diggr-coding-loop-onboarding' / 'SKILL.md').read_bytes() == fixture_source.read_bytes()
 
 
@@ -84,6 +79,8 @@ def route(tmp_path, monkeypatch, request):
     full_onboarding = request.node.name in {
         'test_native_v2_review_recovery_preserves_changes_and_passes_real_route_preflight[False]',
         'test_native_v2_review_recovery_preserves_changes_and_passes_real_route_preflight[True]',
+        'test_observed_missing_result_native_recovery_route[0]',
+        'test_observed_missing_result_native_recovery_route[1]',
     }
     if full_onboarding:
         import yaml
@@ -623,7 +620,17 @@ async def test_executor_proposal_cannot_dispatch_or_approve(route, monkeypatch):
     invoke.assert_not_called()
 
 
-def test_exported_logical_schema_matches_native_sol_proposal(route, monkeypatch):
+@pytest.mark.parametrize('version,mode,kinds,publication', [
+    ('logical-v1', None, None, None),
+    ('logical-v2', None, None, None),
+    ('logical-v2', 'manual', None, 'test_only'),
+    ('logical-v2', 'manual', None, 'allowed'),
+    ('logical-v2', 'automatic', ['ui'], 'allowed'),
+    ('logical-v2', 'automatic', ['track_playback'], None),
+    ('logical-v2', 'automatic', ['ui', 'track_playback'], 'allowed'),
+])
+def test_exported_logical_schema_matches_native_sol_proposal(route, monkeypatch,
+                                                              version, mode, kinds, publication):
     import hashlib
     from jsonschema import Draft7Validator
     from tools.terminal_tool import TERMINAL_SCHEMA
@@ -631,6 +638,16 @@ def test_exported_logical_schema_matches_native_sol_proposal(route, monkeypatch)
 
     r = route
     contract, _ = prepare(r, monkeypatch)
+    contract['version'] = version
+    if version == 'logical-v2':
+        contract['acceptance']['owner'] = 'user'
+        contract['actions']['main'] = sorted(owner.MAIN_ACTIONS)
+    if mode is not None:
+        contract['acceptance']['mode'] = mode
+    if kinds is not None:
+        contract['acceptance']['required_test_kinds'] = kinds
+    if publication is not None:
+        contract['acceptance']['publication'] = publication
     proposal = manifest(r.task)
     proposal['todos'][0]['contract'] = contract
     model = proposal['todos'][0]['contract']['model']
@@ -643,7 +660,9 @@ def test_exported_logical_schema_matches_native_sol_proposal(route, monkeypatch)
     identity = dict(r.identity, home=str(profiles / 'diggr-main'))
     schema = TERMINAL_SCHEMA['parameters']['properties']['continuation_proposal']
     validator = Draft7Validator(schema)
-    assert validator.is_valid(proposal)
+    assert list(validator.iter_errors(proposal)) == []
+    logical_schema = schema['properties']['todos']['items']['properties']['contract']['anyOf'][1]
+    assert list(Draft7Validator(logical_schema).iter_errors(contract)) == []
     from tests.diggr_owner_fixtures import bind_native_transport_fixture
     from unittest.mock import Mock
     transport_token = bind_native_transport_fixture(identity)
@@ -663,7 +682,77 @@ def test_exported_logical_schema_matches_native_sol_proposal(route, monkeypatch)
     assert digest == hashlib.sha256(owner.canonical(stored).encode()).hexdigest()
     assert native['preview']['digest'] == digest
     assert owner.canonical(model) in native['preview']['text']
+    assert owner.canonical(contract['acceptance']) in native['preview']['text']
     assert stored['todos'][0]['contract']['model'] == model
+    assert stored['todos'][0]['contract']['acceptance'] == contract['acceptance']
+
+
+@pytest.mark.parametrize('version,updates', [
+    ('logical-v2', {'mode': 'automatic'}),
+    ('logical-v2', {'mode': 'automatic', 'required_test_kinds': []}),
+    ('logical-v2', {'mode': 'automatic', 'required_test_kinds': ['ui', 'ui']}),
+    ('logical-v2', {'mode': 'automatic', 'required_test_kinds': ['other']}),
+    ('logical-v2', {'mode': 'manual', 'required_test_kinds': ['ui']}),
+    ('logical-v2', {'required_test_kinds': ['ui']}),
+    ('logical-v2', {'mode': 'automatic', 'required_test_kinds': ['ui'], 'publication': 'test_only'}),
+    ('logical-v2', {'mode': 'unknown'}),
+    ('logical-v2', {'publication': 'unknown'}),
+    ('logical-v2', {'unconfirmed': True}),
+    ('logical-v1', {'mode': 'manual'}),
+    ('logical-v1', {'required_test_kinds': ['ui']}),
+])
+def test_exported_acceptance_schema_and_native_reject_same_invalid_contract(route, monkeypatch,
+                                                                             version, updates):
+    from jsonschema import Draft7Validator
+    from tools.terminal_tool import TERMINAL_SCHEMA
+    from tests.gateway.test_diggr_logical_admission import prepare
+
+    r = route
+    contract, _ = prepare(r, monkeypatch)
+    contract['version'] = version
+    if version == 'logical-v2':
+        contract['acceptance']['owner'] = 'user'
+        contract['actions']['main'] = sorted(owner.MAIN_ACTIONS)
+    schema = TERMINAL_SCHEMA['parameters']['properties']['continuation_proposal']
+    logical_schema = schema['properties']['todos']['items']['properties']['contract']['anyOf'][1]
+    assert list(Draft7Validator(logical_schema).iter_errors(contract)) == []
+    contract['acceptance'].update(updates)
+    proposal = manifest(r.task)
+    proposal['todos'][0]['contract'] = contract
+    errors = list(Draft7Validator(logical_schema).iter_errors(contract))
+    assert errors, (version, updates)
+    assert not Draft7Validator(schema).is_valid(proposal)
+    with pytest.raises((ValueError, KeyError)):
+        owner.propose(r.guard, r.identity, proposal)
+
+
+def test_v2_automatic_schema_does_not_grant_wrong_native_owner(route, monkeypatch):
+    from jsonschema import Draft7Validator
+    from tools.terminal_tool import TERMINAL_SCHEMA
+    from tests.gateway.test_diggr_logical_admission import prepare
+
+    r = route
+    contract, _ = prepare(r, monkeypatch)
+    contract['version'] = 'logical-v2'
+    contract['actions']['main'] = sorted(owner.MAIN_ACTIONS)
+    contract['acceptance'].update(mode='automatic', required_test_kinds=['ui'])
+    proposal = manifest(r.task)
+    proposal['todos'][0]['contract'] = contract
+    schema = TERMINAL_SCHEMA['parameters']['properties']['continuation_proposal']
+    assert Draft7Validator(schema).is_valid(proposal)
+    with pytest.raises(ValueError, match='logical-v2 requires Main publishing and owner acceptance'):
+        owner.propose(r.guard, r.identity, proposal)
+
+
+def test_exact_contract_schema_and_native_proposal_remain_valid(route):
+    from jsonschema import Draft7Validator
+    from tools.terminal_tool import TERMINAL_SCHEMA
+
+    r = route
+    proposal = manifest(r.task)
+    schema = TERMINAL_SCHEMA['parameters']['properties']['continuation_proposal']
+    assert Draft7Validator(schema).is_valid(proposal)
+    assert owner.propose(r.guard, r.identity, proposal)
 
 
 @pytest.mark.parametrize('value', ['', 'GPT-6-sol', 'gpt-6-sol\n', 'gpt..6', 'gpt-6/sol'])

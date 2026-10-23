@@ -3919,6 +3919,10 @@ _logical_properties = {
         'owner': {'type': 'string', 'enum': ['main', 'user']},
         'criteria': {'type': 'array', 'minItems': 1, 'items': {'type': 'string'}},
         'main_live_required': {'type': 'boolean'},
+        'publication': {'type': 'string', 'enum': ['allowed', 'test_only']},
+        'mode': {'type': 'string', 'enum': ['manual', 'automatic']},
+        'required_test_kinds': {'type': 'array', 'minItems': 1, 'uniqueItems': True,
+                                'items': {'type': 'string', 'enum': ['ui', 'track_playback']}},
     }, 'required': ['owner', 'criteria', 'main_live_required'], 'additionalProperties': False},
     'model': {'type': 'object', 'properties': {
         'executor': {'type': 'string', 'enum': ['codex']},
@@ -3935,6 +3939,17 @@ _todo_properties = TERMINAL_SCHEMA['parameters']['properties']['continuation_pro
 _todo_properties['contract'] = {'anyOf': [_todo_properties['contract'], {
     'type': 'object', 'properties': _logical_properties,
     'required': list(_logical_properties), 'additionalProperties': False,
+    'allOf': [
+        {'if': {'properties': {'version': {'const': 'logical-v1'}}},
+         'then': {'properties': {'acceptance': {
+             'not': {'anyOf': [{'required': ['mode']}, {'required': ['required_test_kinds']}]}}}}},
+        {'if': {'properties': {'acceptance': {'properties': {'mode': {'const': 'automatic'}},
+                                               'required': ['mode']}}},
+         'then': {'properties': {'version': {'const': 'logical-v2'},
+                                 'acceptance': {'required': ['required_test_kinds'],
+                                                'properties': {'publication': {'not': {'const': 'test_only'}}}}}},
+         'else': {'properties': {'acceptance': {'not': {'required': ['required_test_kinds']}}}}},
+    ],
 }], 'description': 'Existing unversioned exact grants stay exact. New logical-v1/logical-v2 grants bind repo/resource roots, literal relative path scope/no-touch, role actions, acceptance and an explicit Codex model/provider. Prompt and attempt paths are concretized later within this authenticated envelope; no new personal hash confirmation for technical binding.'}
 
 TERMINAL_SCHEMA['parameters']['properties']['continuation_control'] = {

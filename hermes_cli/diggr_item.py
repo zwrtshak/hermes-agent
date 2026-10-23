@@ -5,7 +5,7 @@ acceptance is written only by an authenticated owner event. Legacy grants keep
 their original semantics.
 """
 import copy
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 import fcntl
 import hashlib
 import json
@@ -13,6 +13,7 @@ import math
 import os
 import re
 import secrets
+import select
 import signal
 import sqlite3
 import sys
@@ -139,14 +140,231 @@ def preparation_lock(guard):
             fcntl.flock(handle, fcntl.LOCK_UN)
 
 
-def wait_worker(guard, attempt, child, started):
+def _group_state(pgid):
+    """Only ESRCH is absence; EPERM can also mean a zombie-only group."""
+    try:
+        os.killpg(pgid, 0)
+        return 'present'
+    except ProcessLookupError:
+        return 'absent'
+    except PermissionError:
+        return 'ambiguous'
+
+
+def _owned_group_pinned(handle):
+    """Prove the original isolated group is still bound to our unreaped child."""
+    import psutil
+    child = handle['child']
+    binding = handle['binding']
+    try:
+        if child.returncode is not None or child.pid != binding['pgid']:
+            return False
+        leader = psutil.Process(child.pid)
+        if leader.create_time() != binding['leader_created']:
+            return False
+        try:
+            return os.getpgid(child.pid) == binding['pgid']
+        except ProcessLookupError:
+            # macOS reports ESRCH for an exited, unreaped leader. Keep the
+            # original child unreaped and identity-matched: its PID (which is
+            # also the exclusive PGID we created) cannot be reassigned while
+            # it is still a zombie. A successful group probe then confirms
+            # that this original group still has a signalable member, even
+            # when a late inherited helper escaped descendant capture.
+            if leader.status() != psutil.STATUS_ZOMBIE:
+                return False
+            return _group_state(binding['pgid']) == 'present'
+    except (OSError, psutil.Error):
+        return False
+
+
+def _same_owned_item_leader(expected, actual, handle):
+    """Compare lifetime and group identity across this held child's exec."""
+    if not isinstance(expected, dict) or not isinstance(actual, dict):
+        return False
+    for identity in (expected, actual):
+        if (any(type(identity.get(key)) is not int for key in
+                ('pid', 'ppid', 'pgid', 'tpgid')) or
+                any(not isinstance(identity.get(key), str) or not identity[key] for key in
+                    ('tty', 'start', 'executable'))):
+            return False
+    return (all(expected[key] == actual[key] for key in
+                ('pid', 'ppid', 'pgid', 'tty', 'start')) and
+            expected['pid'] == handle['binding']['pgid'] and
+            _owned_group_pinned(handle))
+
+
+def _leader_exited(handle):
+    if handle['kqueue'] is not None:
+        return bool(handle['kqueue'].control(None, 1, 0))
+    return os.waitid(os.P_PID, handle['child'].pid,
+                     os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
+
+
+def _signal_owned_group(handle, signum):
+    if not _owned_group_pinned(handle):
+        raise ValueError('owned worker group identity no longer pinned')
+    if _group_state(handle['binding']['pgid']) == 'present':
+        os.killpg(handle['binding']['pgid'], signum)
+
+
+_ITEM_START_GATE = (
+    'import os,sys; '
+    'fd=int(sys.argv[1]); ready=os.read(fd,1); os.close(fd); '
+    'os._exit(127) if ready!=b"\\x01" else None; '
+    'os.execvpe(sys.argv[2],sys.argv[2:],os.environ)'
+)
+
+
+def spawn_item_child(command, cwd, attempt, **popen_kwargs):
+    """Pin the isolated group and exit watch before its command can run."""
+    import psutil
+    kqueue = select.kqueue() if hasattr(select, 'kqueue') else None
+    child = None
+    handle = None
+    read_fd = write_fd = None
+    try:
+        foreground = os.tcgetpgrp(0) if os.isatty(0) else None
+        if foreground is not None and foreground != os.getpgrp():
+            raise ValueError('visible wrapper lost foreground TTY before spawn')
+        read_fd, write_fd = os.pipe()
+        pass_fds = tuple(popen_kwargs.pop('pass_fds', ())) + (read_fd,)
+        child = subprocess.Popen(
+            [sys.executable, '-B', '-c', _ITEM_START_GATE, str(read_fd),
+             *map(os.fspath, command)], cwd=cwd, process_group=0,
+            pass_fds=pass_fds, **popen_kwargs)
+        os.close(read_fd)
+        read_fd = None
+        if os.getpgid(child.pid) != child.pid or child.pid == os.getpgrp():
+            raise ValueError('Item child did not create an exclusive group')
+        created = psutil.Process(child.pid).create_time()
+        binding = dict(task=attempt['task'], generation=attempt['generation'],
+                       action_id=attempt['action_id'], effect_id=attempt['effect_id'],
+                       worker_pid=os.getpid(), wrapper_pgid=os.getpgrp(),
+                       pgid=child.pid, leader_created=created)
+        handle = dict(child=child, binding=binding, kqueue=kqueue,
+                      foreground=foreground, handed_off=False, released=False)
+        if kqueue is not None:
+            kqueue.control([select.kevent(child.pid, filter=select.KQ_FILTER_PROC,
+                flags=select.KQ_EV_ADD | select.KQ_EV_ENABLE,
+                fflags=select.KQ_NOTE_EXIT)], 0, 0)
+        elif not hasattr(os, 'waitid') or not hasattr(os, 'WNOWAIT'):
+            raise ValueError('non-reaping leader exit observation unavailable')
+        if foreground is not None:
+            os.tcsetpgrp(0, child.pid)
+            handle['handed_off'] = True
+            # A very early TTY read may have stopped the child before handoff.
+            _signal_owned_group(handle, signal.SIGCONT)
+        if _leader_exited(handle) or not _owned_group_pinned(handle):
+            raise ValueError('Item start gate exited before ownership handoff')
+        handle['started'] = time.monotonic()
+        try:
+            if os.write(write_fd, b'\x01') != 1:
+                raise ValueError('Item start gate release was incomplete')
+        except BaseException:
+            handle['started'] = None
+            raise
+        return child, handle
+    except BaseException:
+        if handle is not None:
+            close_item_group(handle)
+        elif child is not None:
+            # No positive group ownership proof: signal only our direct child.
+            try:
+                child.terminate()
+            except ProcessLookupError:
+                pass
+            child.wait(timeout=5)
+        raise
+    finally:
+        if read_fd is not None:
+            with suppress(OSError):
+                os.close(read_fd)
+        if write_fd is not None:
+            with suppress(OSError):
+                os.close(write_fd)
+        if handle is None and kqueue is not None:
+            kqueue.close()
+
+
+def close_item_group(handle):
+    """Bounded cleanup and foreground restoration, including exceptional exits."""
+    if handle.get('closed'):
+        return
+    child = handle['child']
+    try:
+        if not handle['released'] and _owned_group_pinned(handle):
+            _signal_owned_group(handle, signal.SIGTERM)
+            deadline = time.monotonic() + 1
+            while time.monotonic() < deadline and _group_state(child.pid) == 'present':
+                time.sleep(.05)
+            if _group_state(child.pid) == 'present':
+                _signal_owned_group(handle, signal.SIGKILL)
+            child.wait(timeout=5)
+        elif not handle['released'] and child.returncode is None:
+            try:
+                child.terminate()
+            except ProcessLookupError:
+                pass
+            child.wait(timeout=5)
+    finally:
+        try:
+            if handle['handed_off']:
+                previous = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTTOU})
+                try:
+                    os.tcsetpgrp(0, handle['foreground'])
+                finally:
+                    signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+        finally:
+            if handle['kqueue'] is not None:
+                handle['kqueue'].close()
+            handle['closed'] = True
+
+
+def account_item_unknown(guard, attempt, handle):
+    """Charge a released child once if the wrapper fails before supervision."""
+    from hermes_cli import diggr_continuation as dc
+    started = handle.get('started')
+    if started is None:
+        return
+    elapsed = max(0, time.monotonic() - started)
+    with guard.transaction() as rows:
+        row = rows[attempt['task']]
+        if (any(row.get(key) != attempt.get(key) for key in
+                ('task', 'action_id', 'effect_id', 'worker_pid', 'worker_identity')) or
+                (row.get('generation') != attempt.get('generation') and
+                 row.get('limit_generation') != attempt.get('generation'))):
+            return
+        group = row.get('worker_group')
+        if group is not None and group != handle['binding']:
+            return
+        if group is None:
+            row['worker_group'] = handle['binding']
+        proof = row.get('worker_supervision')
+        if proof is None:
+            proof = row['worker_supervision'] = dict(
+                binding=dc.worker_supervision_binding(row, attempt['generation']),
+                state='unknown', reason='worker failed after start before supervision')
+        if proof.get('binding', {}).get('worker_group') != handle['binding']:
+            return
+        if proof.get('state') != 'exited':
+            proof.update(state='unknown', reason=proof.get('reason') or
+                         'worker failed after start before result publication')
+        if 'accounted_seconds' not in proof:
+            rows.grants['batches'][row['policy']['batch']]['item']['work_seconds'] += elapsed
+            proof['accounted_seconds'] = elapsed
+
+
+def wait_worker(guard, attempt, child, started, group_handle=None):
     """Supervise the native child while preserving its foreground terminal.
 
     Idle item time is free. Actual child execution consumes the cumulative
-    allowance; stop/revocation terminates only captured child identities.
+    allowance; stop/revocation terminates the bound isolated Item group.
     """
     import psutil
     from hermes_cli import diggr_continuation as dc
+    if group_handle is None:
+        raise ValueError('Item group ownership unavailable')
 
     def same_attempt(row):
         return (row.get('task') == attempt.get('task') and
@@ -170,13 +388,14 @@ def wait_worker(guard, attempt, child, started):
     leader_code = None
     reason = None
     binding = None
+    leader_done = False
     try:
         start_error = None
         with guard.transaction() as rows:
             row = rows[attempt['task']]
             if not same_attempt(row):
                 raise ValueError('worker attempt changed before supervision')
-            if child.poll() is None and not row.get('child_identity'):
+            if child.returncode is None and not row.get('child_identity'):
                 try:
                     row['child_identity'] = dc.process_identity(child.pid)
                 except (OSError, ValueError, subprocess.SubprocessError):
@@ -184,12 +403,25 @@ def wait_worker(guard, attempt, child, started):
             binding = dc.worker_supervision_binding(row, attempt['generation'])
             if row.get('worker_supervision'):
                 raise ValueError('worker supervision already recorded')
+            if (row.get('worker_group') != group_handle['binding'] or
+                    group_handle.get('child') is not child or
+                    child.pid != group_handle['binding'].get('pgid') or
+                    any(group_handle['binding'].get(k) != attempt.get(k) for k in
+                        ('task', 'generation', 'action_id', 'effect_id'))):
+                raise ValueError('Item group ownership is not bound to this attempt')
             row['worker_supervision'] = dict(binding=binding, state='unobserved')
             observed = {entry['pid']: entry['created'] for entry in row.get('worker_descendants', [])}
-            if child.poll() is not None:
+            if child.returncode is not None or _leader_exited(group_handle):
+                leader_done = True
                 start_error = 'worker leader exited before first successful scan; exit unknown'
             elif not row.get('child_identity') or row['child_identity'].get('pid') != child.pid:
                 start_error = 'worker exit unknown: child identity unavailable'
+            elif not _owned_group_pinned(group_handle):
+                if child.returncode is not None or _leader_exited(group_handle):
+                    leader_done = True
+                    start_error = 'worker leader exited before first successful scan; exit unknown'
+                else:
+                    start_error = 'Item group ownership unavailable before first successful scan'
         if start_error:
             raise ValueError(start_error)
 
@@ -201,18 +433,19 @@ def wait_worker(guard, attempt, child, started):
                 permitted, remaining = authority_remaining(rows, row)
                 state = row['worker_supervision']['state']
 
-            leader_alive = child.poll() is None
-            if not leader_alive and leader_code is None:
-                leader_code = child.returncode
+            leader_done = leader_done or _leader_exited(group_handle)
+            leader_alive = not leader_done
             additions = {}
             try:
                 if leader_alive:
                     try:
                         leader = psutil.Process(child.pid)
                         actual = dc.process_identity(child.pid)
-                        if actual != binding['child_identity']:
-                            if child.poll() is None:
+                        if not _same_owned_item_leader(binding['child_identity'], actual,
+                                                       group_handle):
+                            if not _leader_exited(group_handle):
                                 raise ValueError('worker leader identity changed')
+                            leader_done = True
                             leader_alive = False
                         else:
                             additions.update({p.pid: p.create_time() for p in leader.children(recursive=True)})
@@ -224,11 +457,10 @@ def wait_worker(guard, attempt, child, started):
                                     row['worker_supervision']['state'] = 'observing'
                                 state = 'observing'
                     except (psutil.NoSuchProcess, subprocess.CalledProcessError):
-                        if child.poll() is None:
+                        if not _leader_exited(group_handle):
                             raise ValueError('worker leader identity unavailable while running') from None
+                        leader_done = True
                         leader_alive = False
-                    if not leader_alive:
-                        leader_code = child.returncode
                 if not leader_alive and state == 'unobserved':
                     raise ValueError('worker leader exited before first successful scan')
                 live = {}
@@ -256,7 +488,19 @@ def wait_worker(guard, attempt, child, started):
                                 raise ValueError('worker attempt changed during descendant capture')
                             row['worker_descendants'] = [dict(pid=pid, created=created)
                                                          for pid, created in observed.items()]
-                if not leader_alive and not live and not additions:
+                group_state = _group_state(group_handle['binding']['pgid'])
+                if not leader_alive and not live and not additions and group_state != 'present':
+                    # EPERM is ambiguous while the unreaped leader pins the PGID.
+                    # Reap only at this point; never signal this numeric group again.
+                    leader_code = child.wait(timeout=0)
+                    group_state = _group_state(group_handle['binding']['pgid'])
+                    if group_state == 'present':
+                        raise ValueError('owned worker group absence unavailable after leader exit')
+                    if group_state == 'ambiguous':
+                        if not permitted:
+                            raise ValueError('worker authority ended before group absence proof')
+                        time.sleep(.05)
+                        continue
                     if not permitted:
                         raise ValueError('worker authority ended before operational exit')
                     if not row.get('worker_identity') or not row.get('worker_pid'):
@@ -267,64 +511,19 @@ def wait_worker(guard, attempt, child, started):
                             raise ValueError('worker attempt changed before operational exit')
                         if not authority_remaining(rows, row)[0]:
                             raise ValueError('worker authority ended before operational exit')
-                        row['worker_supervision'].update(state='exited', leader_exit_code=leader_code)
+                        row['worker_supervision'].update(state='exited', leader_exit_code=leader_code,
+                                                         owned_group_empty=True)
+                    group_handle['released'] = True
                     return leader_code
                 if not permitted:
-                    # Only identities captured and checked in this attempt may be signalled.
-                    for pid, created in observed.items():
-                        try:
-                            process = psutil.Process(pid)
-                            if process.create_time() != created:
-                                raise ValueError('captured worker PID reused during stop')
-                            if process.status() != psutil.STATUS_ZOMBIE:
-                                process.terminate()
-                        except psutil.NoSuchProcess:
-                            pass
-                    if leader_alive:
-                        child.terminate()
-                    deadline = time.monotonic() + 5
-                    while time.monotonic() < deadline:
-                        if child.poll() is None:
-                            try:
-                                child.wait(timeout=.1)
-                            except subprocess.TimeoutExpired:
-                                pass
-                        alive = []
-                        for pid, created in observed.items():
-                            try:
-                                process = psutil.Process(pid)
-                                if process.create_time() != created:
-                                    raise ValueError('captured worker PID reused during stop')
-                                if process.status() != psutil.STATUS_ZOMBIE:
-                                    alive.append(process)
-                            except psutil.NoSuchProcess:
-                                pass
-                        if child.poll() is not None and not alive:
-                            raise ValueError('worker stopped by budget or revocation')
-                        time.sleep(.05)
-                    for process in alive:
-                        process.kill()
-                    if child.poll() is None:
-                        child.kill()
-                    try:
-                        child.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        raise ValueError('worker leader remained alive after bounded stop') from None
-                    _, remaining_alive = psutil.wait_procs(alive, timeout=5)
-                    if remaining_alive:
-                        raise ValueError('captured worker remained alive after bounded stop')
+                    close_item_group(group_handle)
                     raise ValueError('worker stopped by budget or revocation')
             except (psutil.Error, OSError) as exc:
                 raise ValueError('worker process inspection unavailable') from exc
-            if leader_alive:
-                try:
-                    child.wait(timeout=min(.25, max(.01, remaining - (time.monotonic() - started))))
-                except subprocess.TimeoutExpired:
-                    pass
-            else:
-                time.sleep(.1)
+            time.sleep(min(.1, max(.01, remaining - (time.monotonic() - started))))
     except BaseException as exc:
         reason = str(exc) or type(exc).__name__
+        close_item_group(group_handle)
         raise
     finally:
         elapsed = max(0, time.monotonic() - started)
@@ -2630,7 +2829,9 @@ def review(guard, identity, payload):
         report=payload['evidence'], completion_receipt=skill_receipt,
         resolved_run=run.get('resolved_run'), raw_jsonl=run.get('raw_jsonl'),
         model=run['model'], provider=run['provider'], reasoning_effort=run['reasoning_effort'],
-        score_required=scored))
+        score_required=scored,
+        **{key: run[key] for key in ('evidence_kind', 'evidence_version',
+                                    'source', 'child_cleanup') if key in run}))
     direct_result_flow = batch.get('flow_version') == 3 and direct_worker and not bounded
     if (validation.get('qualified') if bounded or direct_result_flow else validation.get('passed')) is not True:
         raise ValueError('existing required-skills and semantic reviewer gate failed: ' +
